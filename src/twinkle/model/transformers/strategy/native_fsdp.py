@@ -46,7 +46,7 @@ class NativeFSDPStrategy:
                 if ep_fsdp_mesh is None:
                     raise RuntimeError(
                         'Implicit EP_FSDP requires dp dim with size > 1, but could not build an ep_fsdp mesh from dp.')
-                sharded_blocks = _maybe_shard_ep_expert_blocks(
+                _maybe_shard_ep_expert_blocks(
                     model,
                     mesh=ep_fsdp_mesh,
                     reshard_after_forward=reshard_after_forward,

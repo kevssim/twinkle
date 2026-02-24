@@ -127,7 +127,6 @@ def patch_forward(block: nn.Module, device_mesh: DeviceMesh, cfg: ExpertParallel
     ep_group = device_mesh.get_dim_group('ep')
 
     def forward(hidden_states: torch.Tensor, *args, **kwargs):
-        ep_rank = block._ep_rank
         if args or kwargs:
             raise RuntimeError('Expert parallel patch only supports forward(hidden_states).')
 

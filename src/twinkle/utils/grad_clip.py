@@ -150,7 +150,7 @@ def _ep_aware_clip_grad_norm(
 
     - non-EP params: all-reduce over fsdp_group
     - EP params: all-reduce over ep_fsdp_group, then ep_group
-    - Unified clip coefficient applied to both groups
+    - Unified clip coefficient applied to both groups via clip_grads_with_norm_
     """
     import math
     import torch
@@ -161,71 +161,84 @@ def _ep_aware_clip_grad_norm(
 
     norm_type = float(norm_type)
 
-    # non-EP: reduce over fsdp_group
-    non_ep_val = _local_norm_stat(non_ep_params, norm_type)
-    if fsdp_group is not None:
-        op = dist.ReduceOp.MAX if math.isinf(norm_type) else dist.ReduceOp.SUM
-        dist.all_reduce(non_ep_val, op=op, group=fsdp_group)
+    with torch.no_grad():
+        # non-EP: reduce over fsdp_group
+        non_ep_val = _local_norm_stat(non_ep_params, norm_type)
+        if fsdp_group is not None:
+            op = dist.ReduceOp.MAX if math.isinf(norm_type) else dist.ReduceOp.SUM
+            dist.all_reduce(non_ep_val, op=op, group=fsdp_group)
 
-    # EP: reduce over ep_fsdp_group, then ep_group
-    ep_val = _local_norm_stat(ep_params, norm_type)
-    if ep_fsdp_group is not None:
-        op = dist.ReduceOp.MAX if math.isinf(norm_type) else dist.ReduceOp.SUM
-        dist.all_reduce(ep_val, op=op, group=ep_fsdp_group)
-    if ep_group is not None:
-        op = dist.ReduceOp.MAX if math.isinf(norm_type) else dist.ReduceOp.SUM
-        dist.all_reduce(ep_val, op=op, group=ep_group)
+        # EP: reduce over ep_fsdp_group, then ep_group
+        ep_val = _local_norm_stat(ep_params, norm_type)
+        if ep_fsdp_group is not None:
+            op = dist.ReduceOp.MAX if math.isinf(norm_type) else dist.ReduceOp.SUM
+            dist.all_reduce(ep_val, op=op, group=ep_fsdp_group)
+        if ep_group is not None:
+            op = dist.ReduceOp.MAX if math.isinf(norm_type) else dist.ReduceOp.SUM
+            dist.all_reduce(ep_val, op=op, group=ep_group)
 
-    # Combine
-    if math.isinf(norm_type):
-        total_norm = torch.maximum(non_ep_val, ep_val)
-    else:
-        total_norm = (non_ep_val + ep_val) ** (1.0 / norm_type)
+        # Combine into total_norm tensor
+        if math.isinf(norm_type):
+            total_norm = torch.maximum(non_ep_val, ep_val)
+        else:
+            total_norm = (non_ep_val + ep_val) ** (1.0 / norm_type)
 
-    # Clip both groups with the same coefficient
-    clip_coef = float(max_grad_norm) / (float(total_norm.item()) + 1e-6)
-    if clip_coef < 1.0:
-        all_params = ep_params + non_ep_params
-        for p in all_params:
-            if p.grad is not None:
-                p.grad.mul_(clip_coef)
+    # Clip both groups with the same coefficient via PyTorch builtin (foreach-accelerated)
+    torch.nn.utils.clip_grads_with_norm_(ep_params, max_grad_norm, total_norm)
+    torch.nn.utils.clip_grads_with_norm_(non_ep_params, max_grad_norm, total_norm)
 
     return float(total_norm.item())
 
 
 def _local_norm_stat(params, norm_type: float):
-    """Compute local norm statistic: sum of p-th powers (finite p) or max (inf)."""
+    """Compute local norm statistic: sum of p-th powers (finite p) or max (inf).
+
+    Uses torch._foreach_* batch kernels for finite p to reduce kernel launch overhead.
+    """
     import math
     import torch
     from torch.distributed._tensor import DTensor
+    from torch.utils._foreach_utils import (
+        _device_has_foreach_support,
+        _group_tensors_by_device_and_dtype,
+        _has_foreach_support,
+    )
 
-    device = None
+    grads_local = []
+    default_device = None
     for p in params:
-        if p.grad is not None:
-            g = p.grad.to_local() if isinstance(p.grad, DTensor) else p.grad
-            if g.is_cuda or getattr(g, 'is_npu', False):
-                device = g.device
-                break
-    if device is None:
-        device = torch.device(Platform.get_local_device())
+        if p.grad is None:
+            continue
+        g = p.grad.to_local() if isinstance(p.grad, DTensor) else p.grad
+        if default_device is None and (g.is_cuda or getattr(g, 'is_npu', False)):
+            default_device = g.device
+        grads_local.append(g.detach().to(torch.float32))
+
+    if default_device is None:
+        default_device = torch.device(Platform.get_local_device())
 
     if math.isinf(norm_type):
-        val = torch.tensor(0.0, device=device, dtype=torch.float32)
-        for p in params:
-            if p.grad is None:
-                continue
-            g = p.grad.to_local() if isinstance(p.grad, DTensor) else p.grad
+        val = torch.tensor(0.0, device=default_device, dtype=torch.float32)
+        for g in grads_local:
             if g.numel() == 0:
                 continue
-            val = torch.maximum(val, g.detach().to(torch.float32).abs().max())
+            val = torch.maximum(val, g.abs().max())
         return val
-    else:
-        val = torch.tensor(0.0, device=device, dtype=torch.float32)
-        for p in params:
-            if p.grad is None:
-                continue
-            g = p.grad.to_local() if isinstance(p.grad, DTensor) else p.grad
-            if g.numel() == 0:
-                continue
-            val += g.detach().to(torch.float32).pow(norm_type).sum()
+
+    p = float(norm_type)
+    val = torch.tensor(0.0, device=default_device, dtype=torch.float32)
+    if not grads_local:
         return val
+    non_empty = [g for g in grads_local if g.numel() > 0]
+    if not non_empty:
+        return val
+    grouped = _group_tensors_by_device_and_dtype([non_empty])
+    for (device, _), ([device_grads], _) in grouped.items():
+        if _has_foreach_support(device_grads, device) or _device_has_foreach_support(device):
+            # Batch: compute ||g||_p for each grad, raise to p-th power, then sum
+            out = torch._foreach_pow_(torch._foreach_norm(device_grads, p), p)
+            val += torch.sum(torch.stack(out)).to(default_device)
+        else:
+            for g in device_grads:
+                val += (torch.norm(g, p=p) ** p).to(default_device)
+    return val

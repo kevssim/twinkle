@@ -51,7 +51,7 @@ class NativeFSDPStrategy:
                     experts_mod = _find_experts_in_layer(layer_mod, experts_map)
                     layer_pairs.append((layer_mod, experts_mod))
 
-            # FSDP2 wrapping per layer (mirrors VeOmni parallelize_model_fsdp2)
+            # FSDP2 wrapping per layer
             world_size = self.device_mesh.world_size
             ep_fsdp_mesh_1d = self.ep_fsdp_device_mesh['ep_fsdp'] if ep_enabled else None
 
@@ -71,7 +71,7 @@ class NativeFSDPStrategy:
                         mp_policy=ep_mp_policy,
                         shard_placement_fn=lambda param: Shard(1),
                     )
-                    # gradient_divide_factor = world_size (VeOmni convention)
+                    # gradient_divide_factor = world_size
                     experts_mod.set_gradient_divide_factor(world_size)
                     layer_mod._fsdp_modules.append(experts_mod)
 
@@ -93,7 +93,7 @@ class NativeFSDPStrategy:
                 ignored_params=expert_params,
             )
 
-            # Manual prefetch (mirrors VeOmni lines 396-411)
+            # Manual prefetch
             if ep_enabled and layer_pairs:
                 _setup_manual_prefetch([lp[0] for lp in layer_pairs])
 
@@ -214,7 +214,7 @@ def _find_experts_in_layer(layer_mod: nn.Module, experts_map: Dict[str, nn.Modul
 
 
 def _setup_manual_prefetch(blocks: list) -> None:
-    """Configure forward/backward prefetch for FSDP modules (mirrors VeOmni)."""
+    """Configure forward/backward prefetch for FSDP modules."""
     for i, block in enumerate(blocks):
         if i + 1 < len(blocks):
             next_fsdp_modules = getattr(blocks[i + 1], '_fsdp_modules', [])

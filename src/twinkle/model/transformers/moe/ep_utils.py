@@ -1,6 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 #
-# Adapted from VeOmni (https://github.com/volcengine/VeOmni)
 # Copyright 2025 Bytedance Ltd. and/or its affiliates
 # Licensed under the Apache License, Version 2.0
 
@@ -11,9 +10,6 @@ import torch.distributed as dist
 
 
 # ========================== comm ==========================
-# Ported from veomni/distributed/moe/comm.py
-
-
 class _AllToAll(torch.autograd.Function):
     @staticmethod
     def forward(ctx, group, input, output_split_sizes, input_split_sizes):
@@ -98,9 +94,6 @@ def all_to_all_async(group, input, output_split_size, input_split_size):
 
 
 # ========================== moe_utils ==========================
-# Ported from veomni/distributed/moe/moe_utils.py
-
-
 def permute(tokens: torch.Tensor, routing_map: torch.Tensor):
     """
     Permutes the tokens according to the routing map.
@@ -185,8 +178,7 @@ def sort_chunks_by_idxs(input: torch.Tensor, split_sizes: torch.Tensor, sorted_i
 
 
 # ========================== moe_layer ==========================
-# Ported from veomni/distributed/moe/moe_layer.py (preprocess, token_pre_all2all, tokens_post_all2all)
-# EPGroupGemm is NOT ported (requires triton group_gemm); Twinkle uses F.linear loop instead.
+# EPGroupGemm is not included here; Twinkle uses an F.linear loop instead.
 
 
 def preprocess(

@@ -162,7 +162,7 @@ def patch_forward(
 ) -> None:
     """Replace the MoE block forward with EP-aware communication flow.
 
-    Communication pattern follows VeOmni:
+    Communication pattern:
         preprocess → token_pre_all2all → expert_compute → tokens_post_all2all
 
     For tensor experts (gate_up_proj/down_proj), the expert compute is delegated
@@ -227,7 +227,7 @@ def patch_forward(
         if routing_weights.dtype != hidden_states_2d.dtype:
             routing_weights = routing_weights.to(hidden_states_2d.dtype)
 
-        # Build expert_mask: [num_experts, top_k, num_tokens] (VeOmni convention)
+        # Build expert_mask: [num_experts, top_k, num_tokens]
         expert_mask = torch.nn.functional.one_hot(
             selected_experts, num_classes=num_experts
         ).permute(2, 1, 0)  # [num_experts, top_k, num_tokens]

@@ -41,7 +41,7 @@ def normalize_and_clip_grad_norm(parameters: Iterable[torch.nn.Parameter],
     if not grads:
         return 0.0
 
-    # EP-aware path (mirrors VeOmni ep_fsdp2_clip_grad_norm)
+    # EP-aware path
     if ep_param_groups is not None:
         return _ep_aware_clip_grad_norm(
             ep_param_groups=ep_param_groups,
@@ -146,7 +146,7 @@ def _ep_aware_clip_grad_norm(
     ep_group=None,
     ep_fsdp_group=None,
 ) -> float:
-    """EP-aware gradient clipping (mirrors VeOmni ep_fsdp2_clip_grad_norm).
+    """EP-aware gradient clipping.
 
     - non-EP params: all-reduce over fsdp_group
     - EP params: all-reduce over ep_fsdp_group, then ep_group

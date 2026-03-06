@@ -362,9 +362,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             return obj.item()
         if isinstance(obj, Mapping):
             return {key: TransformersModel._to_cpu_safe_output(value) for key, value in obj.items()}
-        if isinstance(obj, tuple):
-            return [TransformersModel._to_cpu_safe_output(value) for value in obj]
-        if isinstance(obj, list):
+        if isinstance(obj, (list, tuple)):
             return [TransformersModel._to_cpu_safe_output(value) for value in obj]
         return obj
 

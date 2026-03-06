@@ -1,6 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from __future__ import annotations
 
+import logging
+import os
 from typing import TYPE_CHECKING, Iterable
 
 from twinkle import Platform
@@ -8,6 +10,8 @@ from twinkle.utils import torch_util
 
 if TYPE_CHECKING:
     import torch
+
+_LOGGER = logging.getLogger(__name__)
 
 
 def normalize_and_clip_grad_norm(parameters: Iterable[torch.nn.Parameter],
@@ -158,6 +162,7 @@ def _ep_aware_clip_grad_norm(
 
     ep_params = [p for p in ep_param_groups.get('ep', []) if p.grad is not None]
     non_ep_params = [p for p in ep_param_groups.get('non_ep', []) if p.grad is not None]
+    _maybe_log_ep_clip_mesh_debug(ep_params, non_ep_params)
 
     norm_type = float(norm_type)
 
@@ -183,12 +188,70 @@ def _ep_aware_clip_grad_norm(
         else:
             total_norm = (non_ep_val + ep_val)**(1.0 / norm_type)
 
-    # Clip both groups with the same coefficient via PyTorch builtin (foreach-accelerated)
-    torch.nn.utils.clip_grads_with_norm_(ep_params, max_grad_norm, total_norm)
-    torch.nn.utils.clip_grads_with_norm_(non_ep_params, max_grad_norm, total_norm)
+    torch.nn.utils.clip_grads_with_norm_(ep_params, max_grad_norm, total_norm,foreach=False)
+    torch.nn.utils.clip_grads_with_norm_(non_ep_params, max_grad_norm, total_norm,foreach=False)
 
     return float(total_norm.item())
 
+
+
+def _maybe_log_ep_clip_mesh_debug(ep_params, non_ep_params) -> None:
+    if os.environ.get('TWINKLE_EP_CLIP_DEBUG', '0') != '1':
+        return
+
+    ep_ids = {id(p) for p in ep_params}
+    non_ep_ids = {id(p) for p in non_ep_params}
+    overlap = len(ep_ids & non_ep_ids)
+
+    ep_mesh_stats = _collect_grad_mesh_stats(ep_params)
+    non_ep_mesh_stats = _collect_grad_mesh_stats(non_ep_params)
+
+    non_ep_on_ep_fsdp = sum(
+        count
+        for dims, count in non_ep_mesh_stats.items()
+        if dims is not None and 'ep_fsdp' in dims
+    )
+    ep_on_plain_fsdp = sum(
+        count
+        for dims, count in ep_mesh_stats.items()
+        if dims is not None and 'ep_fsdp' not in dims and 'fsdp' in dims
+    )
+    suspicious = (overlap > 0 or non_ep_on_ep_fsdp > 0 or ep_on_plain_fsdp > 0)
+    _LOGGER.warning(
+        'EP clip debug | suspicious=%s | ep_grads=%d non_ep_grads=%d overlap=%d | ep_mesh=%s | non_ep_mesh=%s | '
+        'non_ep_on_ep_fsdp=%d ep_on_plain_fsdp=%d',
+        suspicious,
+        len(ep_params),
+        len(non_ep_params),
+        overlap,
+        ep_mesh_stats,
+        non_ep_mesh_stats,
+        non_ep_on_ep_fsdp,
+        ep_on_plain_fsdp,
+    )
+
+
+def _collect_grad_mesh_stats(params) -> dict:
+    mesh_stats = {}
+    for p in params:
+        grad = getattr(p, 'grad', None)
+        if grad is None:
+            continue
+        dims = _get_grad_mesh_dims(grad)
+        mesh_stats[dims] = mesh_stats.get(dims, 0) + 1
+    return mesh_stats
+
+
+def _get_grad_mesh_dims(grad):
+    mesh = getattr(grad, 'device_mesh', None)
+    if mesh is None:
+        return None
+    try:
+        if mesh.mesh_dim_names is None:
+            return ('<unnamed>', )
+        return tuple(mesh.mesh_dim_names)
+    except Exception:
+        return ('<unknown>', )
 
 def _local_norm_stat(params, norm_type: float):
     """Compute local norm statistic: sum of p-th powers (finite p) or max (inf).
@@ -239,3 +302,6 @@ def _local_norm_stat(params, norm_type: float):
             for g in device_grads:
                 val += (torch.norm(g, p=p)**p).to(default_device)
     return val
+
+
+

@@ -6,13 +6,7 @@ from typing import Any, List, Union
 
 from twinkle import remote_class, remote_function
 from twinkle.data_format import InputFeature, Trajectory
-from twinkle.infra import _collect_func
 from twinkle.model import MultiLoraTransformersModel
-
-
-def collect_forward_backward_http_output(result, device_mesh=None):
-    aggregated = _collect_func('mean', result, device_mesh=device_mesh)
-    return TwinkleCompatTransformersModel._to_cpu_safe_output(aggregated)
 
 
 @remote_class()
@@ -40,7 +34,8 @@ class TwinkleCompatTransformersModel(MultiLoraTransformersModel):
             return [TwinkleCompatTransformersModel._to_cpu_safe_output(value) for value in obj]
         return obj
 
-    @remote_function(dispatch='slice_dp', collect=collect_forward_backward_http_output)
+    @remote_function(dispatch='slice_dp', collect='mean')
     def forward_backward(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
                          **kwargs):
-        return super().forward_backward(inputs=inputs, **kwargs)
+        output = super().forward_backward(inputs=inputs, **kwargs)
+        return self._to_cpu_safe_output(output)

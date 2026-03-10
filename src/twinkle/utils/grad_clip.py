@@ -183,8 +183,8 @@ def _ep_aware_clip_grad_norm(
         else:
             total_norm = (non_ep_val + ep_val)**(1.0 / norm_type)
 
-    torch.nn.utils.clip_grads_with_norm_(ep_params, max_grad_norm, total_norm, foreach=False)
-    torch.nn.utils.clip_grads_with_norm_(non_ep_params, max_grad_norm, total_norm, foreach=False)
+    torch.nn.utils.clip_grads_with_norm_(ep_params, max_grad_norm, total_norm, foreach=True)
+    torch.nn.utils.clip_grads_with_norm_(non_ep_params, max_grad_norm, total_norm, foreach=True)
 
     return float(total_norm.item())
 

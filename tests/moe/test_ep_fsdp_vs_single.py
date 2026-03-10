@@ -4,6 +4,20 @@ Test EP+FSDP vs single-GPU precision:
 1. Forward Logits & Loss
 2. Gradients (non-expert and expert layers)
 3. Updated Weights after optimizer step
+
+Requirements:
+  - 4 CUDA GPUs
+  - Model weights accessible via QWEN3_MOE_MODEL_ID (default: Qwen/Qwen3-30B-A3B-Instruct-2507)
+
+Launch (requires 4 CUDA GPUs; skipped automatically if fewer GPUs are available):
+
+    pytest tests/moe/test_ep_fsdp_vs_single.py -v -s
+
+    # To use a local model:
+    QWEN3_MOE_MODEL_ID=/path/to/model pytest tests/moe/test_ep_fsdp_vs_single.py -v -s
+
+Note: nproc_per_node=1 is intentional — the test internally spawns 4 worker processes via
+mp.spawn (1 for the single-GPU baseline and 4 for the EP+FSDP run).
 """
 
 import numpy as np
@@ -48,7 +62,7 @@ def _load_model(model_id: str, local_only: bool, device: torch.device, num_layer
     if hasattr(config, '_experts_implementation'):
         config._experts_implementation = 'eager'
 
-    # 关闭 Dropout，确保确定性
+    # Disable dropout to ensure determinism
     dropout_attrs = ['attention_dropout', 'hidden_dropout', 'classifier_dropout', 'resid_pdrop', 'embd_pdrop']
     for attr in dropout_attrs:
         if hasattr(config, attr):
@@ -66,14 +80,14 @@ def _load_model(model_id: str, local_only: bool, device: torch.device, num_layer
 
 
 def _clean_name(name: str) -> str:
-    """清洗参数名，去掉 FSDP wrapper 等前缀"""
+    """Strip FSDP wrapper prefixes from parameter names."""
     name = name.replace('_fsdp_wrapped_module.', '')
     name = name.replace('module.', '')
     return name
 
 
 def _get_full_tensor(tensor_obj):
-    """处理 DTensor 还原，普通 Tensor 直接返回"""
+    """Reconstruct a DTensor to a plain CPU tensor; pass through plain tensors unchanged."""
     if tensor_obj is None:
         return None
     if hasattr(tensor_obj, 'full_tensor'):
@@ -97,7 +111,7 @@ def _split_range(total: int, rank: int, world_size: int) -> tuple[int, int]:
 
 def _match_single_tensor_for_compare(mapped_name: str, multi_tensor: torch.Tensor, single_dict: dict, ep_rank: int,
                                      fsdp_rank: int, fsdp_world_size: int):
-    """返回和 multi_tensor 对齐后的 single tensor；expert 参数支持 dim0(ep)+dim1(fsdp) 切片。"""
+    """Return the single-GPU tensor sliced to match multi_tensor; expert params support dim0(ep)+dim1(fsdp) sharding."""
     single_tensor = single_dict.get(mapped_name)
     if single_tensor is None:
         return None
@@ -105,9 +119,9 @@ def _match_single_tensor_for_compare(mapped_name: str, multi_tensor: torch.Tenso
     if multi_tensor.shape == single_tensor.shape:
         return single_tensor
 
-    # EP/FSDP 下 expert 参数切片规则：
-    # - dim0 按 EP 切片：single=[num_experts,...] -> local experts
-    # - dim1 按 FSDP 切片：local experts 后再切 dim1
+    # EP/FSDP expert parameter sharding rules:
+    # - dim0 sharded by EP: single=[num_experts,...] -> local experts
+    # - dim1 sharded by FSDP: local experts slice then cut dim1
     if 'experts.' not in mapped_name:
         return None
     if multi_tensor.ndim < 1 or single_tensor.ndim < 1:
@@ -180,7 +194,7 @@ def _run_single_gpu(rank, world_size, port, model_id, local_only):
     opt.step()
     new_weight_dict = {n: p.detach().cpu() for n, p in model.named_parameters()}
 
-    # 保存输入数据，确保多卡使用相同输入
+    # Save inputs so multi-GPU run uses identical data
     torch.save(
         {
             'input_ids': input_ids.cpu(),
@@ -237,7 +251,7 @@ def _run_multi_gpu(rank, world_size, port, model_id, local_only):
         model = _load_model(model_id, local_only, device, num_layers=1)
         model.train()
 
-        # 加载单卡的输入数据
+        # Load inputs saved by the single-GPU run
         single_data = torch.load(_single_snapshot_path(port), weights_only=True)
         input_ids = single_data['input_ids'].to(device)
         position_ids = single_data['position_ids'].to(device)
@@ -273,7 +287,7 @@ def _run_multi_gpu(rank, world_size, port, model_id, local_only):
         loss = outputs.loss
         loss.backward()
 
-        # 提取梯度 - 使用 full_tensor() 还原 DTensor
+        # Collect gradients — reconstruct DTensors via full_tensor()
         grad_dict = {}
         for n, p in model.named_parameters():
             if p.grad is not None:
@@ -283,12 +297,12 @@ def _run_multi_gpu(rank, world_size, port, model_id, local_only):
         opt = torch.optim.AdamW(model.parameters(), lr=1e-5, foreach=False)
         opt.step()
 
-        # 优化后的权重
+        # Weights after optimizer step
         new_weight_dict = {}
         for n, p in model.named_parameters():
             new_weight_dict[n] = _get_full_tensor(p)
 
-        # 对比 - 所有 rank 都参与
+        # Compare — all ranks participate
         single_grads = single_data['grad_dict']
         single_weights = single_data['new_weight_dict']
 
@@ -297,7 +311,7 @@ def _run_multi_gpu(rank, world_size, port, model_id, local_only):
         fsdp_rank = device_mesh.fsdp_rank or 0
         fsdp_world_size = device_mesh.fsdp_world_size or 1
 
-        # Forward 对比只在 rank 0 计算，再广播结果，避免其余 rank 卡在 barrier
+        # Forward comparison is computed only on rank 0, then broadcast to avoid other ranks hanging at barrier
         forward_err = None
         if rank == 0:
             single_logits = single_data['logits']
@@ -323,7 +337,7 @@ def _run_multi_gpu(rank, world_size, port, model_id, local_only):
         if obj[0] is not None:
             raise AssertionError(obj[0])
 
-        # 对比非专家层梯度
+        # Compare non-expert gradients
         print(f'\n=== Rank {rank}: Gradients (non-expert) ===')
         verified = 0
         seen_mapped = set()
@@ -353,7 +367,7 @@ def _run_multi_gpu(rank, world_size, port, model_id, local_only):
             verified += 1
         assert verified > 0, f"Error: No non-expert gradients were verified on rank {rank}!"
 
-        # 对比专家层梯度
+        # Compare expert gradients
         print(f'\n=== Rank {rank}: Gradients (expert) ===')
         verified = 0
         ratio_list = []
@@ -395,7 +409,7 @@ def _run_multi_gpu(rank, world_size, port, model_id, local_only):
             print(f'  [INFO] expert grad norm ratio(ep/single): '
                   f'min={ratio_t.min().item():.4f}, max={ratio_t.max().item():.4f}, mean={ratio_t.mean().item():.4f}')
 
-        # 对比更新后的权重
+        # Compare updated weights
         print(f'\n=== Rank {rank}: Updated Weights ===')
         verified = 0
         seen_mapped = set()

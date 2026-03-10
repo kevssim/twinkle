@@ -363,9 +363,9 @@ def _run_multi_gpu(rank, world_size, port, model_id, local_only):
             is_close = torch.allclose(s_grad, m_grad, rtol=REL_TOL, atol=ABS_TOL)
             status = 'PASS' if is_close else 'FAIL'
             print(f'  [{status}] {mapped_n}: max_diff={grad_max_diff:.2e}, mean_diff={grad_mean_diff:.2e}')
-            assert is_close, f"Grad mismatch for {mapped_n}! Max diff: {grad_max_diff}, Mean diff: {grad_mean_diff}"
+            assert is_close, f'Grad mismatch for {mapped_n}! Max diff: {grad_max_diff}, Mean diff: {grad_mean_diff}'
             verified += 1
-        assert verified > 0, f"Error: No non-expert gradients were verified on rank {rank}!"
+        assert verified > 0, f'Error: No non-expert gradients were verified on rank {rank}!'
 
         # Compare expert gradients
         print(f'\n=== Rank {rank}: Gradients (expert) ===')
@@ -438,7 +438,7 @@ def _run_multi_gpu(rank, world_size, port, model_id, local_only):
             assert is_close, (
                 f'Weight mismatch for {mapped_n}! Max diff: {weight_max_diff}, Mean diff: {weight_mean_diff}')
             verified += 1
-        assert verified > 0, f"Error: No weights were verified on rank {rank}!"
+        assert verified > 0, f'Error: No weights were verified on rank {rank}!'
 
         dist.barrier()
     except Exception as e:

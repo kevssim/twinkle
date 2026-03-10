@@ -23,11 +23,11 @@ LR = float(os.environ.get('LR', '1e-5'))
 MAX_GRAD_NORM = float(os.environ.get('MAX_GRAD_NORM', '1.0'))
 KEEP_ROUTER_LOGITS = os.environ.get('KEEP_ROUTER_LOGITS', '0') == '1'
 
-# 4 gpus, dp=1, fsdp=4 (data parallel), ep_size=2 (expert parallel)
+# 8 gpus, dp=1, fsdp=8 (data parallel), ep_size=8 (expert parallel)
 # The main mesh does NOT include 'ep' dimension - EP is handled by separate ep_fsdp_device_mesh
 dp_size = 1
-fsdp_size = 4
-ep_size = 2
+fsdp_size = 8
+ep_size = 8
 
 device_mesh = DeviceMesh(
     device_type=Platform.get_platform().device_prefix(),

@@ -24,9 +24,9 @@ GRAD_ACCUM_STEPS = int(os.environ.get('GRAD_ACCUM_STEPS', '4'))
 LR = float(os.environ.get('LR', '1e-5'))
 MAX_GRAD_NORM = float(os.environ.get('MAX_GRAD_NORM', '1.0'))
 
-# Pure FSDP topology (no EP): default 4 GPUs -> fsdp=2, dp=2.
-fsdp_size = int(os.environ.get('FSDP_SIZE', '2'))
-dp_size = int(os.environ.get('DP_SIZE', '2'))
+# Pure FSDP topology (no EP): default 8 GPUs -> fsdp=8, dp=1.
+fsdp_size = int(os.environ.get('FSDP_SIZE', '8'))
+dp_size = int(os.environ.get('DP_SIZE', '1'))
 device_mesh = DeviceMesh.from_sizes(fsdp_size=fsdp_size, dp_size=dp_size)
 twinkle.initialize(mode='local', global_device_mesh=device_mesh)
 

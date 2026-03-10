@@ -188,11 +188,10 @@ def _ep_aware_clip_grad_norm(
         else:
             total_norm = (non_ep_val + ep_val)**(1.0 / norm_type)
 
-    torch.nn.utils.clip_grads_with_norm_(ep_params, max_grad_norm, total_norm,foreach=False)
-    torch.nn.utils.clip_grads_with_norm_(non_ep_params, max_grad_norm, total_norm,foreach=False)
+    torch.nn.utils.clip_grads_with_norm_(ep_params, max_grad_norm, total_norm, foreach=False)
+    torch.nn.utils.clip_grads_with_norm_(non_ep_params, max_grad_norm, total_norm, foreach=False)
 
     return float(total_norm.item())
-
 
 
 def _maybe_log_ep_clip_mesh_debug(ep_params, non_ep_params) -> None:
@@ -206,16 +205,10 @@ def _maybe_log_ep_clip_mesh_debug(ep_params, non_ep_params) -> None:
     ep_mesh_stats = _collect_grad_mesh_stats(ep_params)
     non_ep_mesh_stats = _collect_grad_mesh_stats(non_ep_params)
 
-    non_ep_on_ep_fsdp = sum(
-        count
-        for dims, count in non_ep_mesh_stats.items()
-        if dims is not None and 'ep_fsdp' in dims
-    )
-    ep_on_plain_fsdp = sum(
-        count
-        for dims, count in ep_mesh_stats.items()
-        if dims is not None and 'ep_fsdp' not in dims and 'fsdp' in dims
-    )
+    non_ep_on_ep_fsdp = sum(count for dims, count in non_ep_mesh_stats.items()
+                            if dims is not None and 'ep_fsdp' in dims)
+    ep_on_plain_fsdp = sum(count for dims, count in ep_mesh_stats.items()
+                           if dims is not None and 'ep_fsdp' not in dims and 'fsdp' in dims)
     suspicious = (overlap > 0 or non_ep_on_ep_fsdp > 0 or ep_on_plain_fsdp > 0)
     _LOGGER.warning(
         'EP clip debug | suspicious=%s | ep_grads=%d non_ep_grads=%d overlap=%d | ep_mesh=%s | non_ep_mesh=%s | '
@@ -252,6 +245,7 @@ def _get_grad_mesh_dims(grad):
         return tuple(mesh.mesh_dim_names)
     except Exception:
         return ('<unknown>', )
+
 
 def _local_norm_stat(params, norm_type: float):
     """Compute local norm statistic: sum of p-th powers (finite p) or max (inf).
@@ -302,6 +296,3 @@ def _local_norm_stat(params, norm_type: float):
             for g in device_grads:
                 val += (torch.norm(g, p=p)**p).to(default_device)
     return val
-
-
-

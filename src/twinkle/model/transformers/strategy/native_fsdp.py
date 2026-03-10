@@ -99,13 +99,9 @@ class NativeFSDPStrategy:
             if ep_enabled and layer_pairs:
                 _setup_manual_prefetch([lp[0] for lp in layer_pairs])
 
-            # Tag ep_param_groups for EP-aware grad clip
-            if ep_enabled and expert_params:
-                all_params = set(model.parameters())
-                model._ep_param_groups = {
-                    'ep': list(expert_params),
-                    'non_ep': [p for p in all_params if p not in expert_params],
-                }
+            # Rebuild groups after wrapping so grad clip sees the live Parameter objects.
+            if ep_enabled:
+                _rebuild_ep_param_groups(model)
 
         if optimizer is not None:
             optimizer = _rebind_optimizer(optimizer, model)
@@ -192,6 +188,20 @@ def _collect_expert_params(model: nn.Module) -> Optional[Set[nn.Parameter]]:
     if not ep_patched:
         return None
     return ignored or None
+
+
+def _rebuild_ep_param_groups(model: nn.Module) -> None:
+    expert_params = _collect_expert_params(model)
+    if not expert_params:
+        if hasattr(model, '_ep_param_groups'):
+            delattr(model, '_ep_param_groups')
+        return
+
+    all_params = set(model.parameters())
+    model._ep_param_groups = {
+        'ep': list(expert_params),
+        'non_ep': [p for p in all_params if p not in expert_params],
+    }
 
 
 def _collect_ep_experts_map(model: nn.Module) -> Dict[str, nn.Module]:

@@ -34,8 +34,10 @@ def get_base_url() -> Optional[str]:
 
 
 def clear_base_url():
-    """Clear the base URL context, falling back to environment variable."""
+    """Clear the base URL context and global fallback, falling back to environment variable."""
+    global _global_base_url
     _base_url_context.set(None)
+    _global_base_url = None
 
 
 def set_api_key(api_key: str):

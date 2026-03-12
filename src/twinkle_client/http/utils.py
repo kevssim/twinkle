@@ -11,19 +11,26 @@ TWINKLE_SERVER_TOKEN = os.environ.get('TWINKLE_SERVER_TOKEN', 'EMPTY_TOKEN')
 _base_url_context: ContextVar[Optional[str]] = ContextVar('base_url', default=None)
 _api_key_context: ContextVar[Optional[str]] = ContextVar('api_key', default=None)
 
+# Global fallback for base_url, accessible from all threads (including heartbeat daemon threads).
+# ContextVar is thread-local and invisible to background threads, so we also store the URL here.
+_global_base_url: Optional[str] = None
+
 # Global static request ID shared across all threads
 # This ensures heartbeat threads use the same request ID as the main training thread
 _global_request_id: Optional[str] = None
 
 
 def set_base_url(url: str):
-    """Set the base URL for HTTP requests in the current context."""
-    _base_url_context.set(url.rstrip('/'))
+    """Set the base URL for HTTP requests in the current context and globally."""
+    global _global_base_url
+    stripped = url.rstrip('/')
+    _base_url_context.set(stripped)
+    _global_base_url = stripped
 
 
 def get_base_url() -> Optional[str]:
-    """Get the current base URL from context or environment variable."""
-    return _base_url_context.get() or TWINKLE_SERVER_URL
+    """Get the current base URL from context, global fallback, or environment variable."""
+    return _base_url_context.get() or _global_base_url or TWINKLE_SERVER_URL
 
 
 def clear_base_url():

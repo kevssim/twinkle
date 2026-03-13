@@ -28,7 +28,18 @@ class NativeFSDPStrategy:
     def _build_ep_fsdp_device_mesh(self, ep_size: Optional[int] = None) -> Optional[TorchDeviceMesh]:
         if self.device_mesh is None:
             return None
-        return self.device_mesh.build_ep_fsdp_device_mesh(ep_size=ep_size)
+        ep_size = ep_size or self.device_mesh.ep_size or 1
+        if ep_size <= 1:
+            return None
+        import numpy as np
+        world_size = self.device_mesh.world_size
+        ep_fsdp_size = self.device_mesh.ep_fsdp_size or (world_size // ep_size)
+        ep_mesh = DeviceMesh(
+            mesh=np.arange(world_size).reshape(ep_size, ep_fsdp_size),
+            mesh_dim_names=('ep', 'ep_fsdp'),
+            device_type=self.device_mesh.device_type,
+        )
+        return ep_mesh.to_torch_device_mesh()
 
     def wrap_model(self, model, optimizer=None):
         if self.device_mesh is None:

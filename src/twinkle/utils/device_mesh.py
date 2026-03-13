@@ -32,6 +32,7 @@ class DeviceMesh:
     mesh_dim_names: Optional[tuple[str, ...]]
     ep_size: Optional[int] = None
     etp_size: Optional[int] = None
+    ep_fsdp_size: Optional[int] = None
     # megatron only
     vpp_size: Optional[int] = None
     # transformers only
@@ -51,6 +52,7 @@ class DeviceMesh:
                    cp_size: int = None,
                    ep_size: int = None,
                    etp_size: int = 1,
+                   ep_fsdp_size: int = None,
                    vpp_size: int = None,
                    device_type: str = 'cuda',
                    sequence_parallel: bool = False) -> 'DeviceMesh':
@@ -66,6 +68,7 @@ class DeviceMesh:
             cp_size: The context parallel size
             ep_size: The expert parallel size
             etp_size: The expert tensor parallel size
+            ep_fsdp_size: The expert FSDP parallel size, auto-computed as world_size // ep_size if not provided
             vpp_size: The virtual pipeline parallel size
             device_type: The device type
             sequence_parallel: Use sequence parallel or not, default false
@@ -103,6 +106,8 @@ class DeviceMesh:
             mesh_dim_names.append('tp')
             if origin_world_size == 1:
                 world_size *= tp_size
+        if ep_size is not None and ep_size > 1 and ep_fsdp_size is None:
+            ep_fsdp_size = world_size // ep_size
         return DeviceMesh(
             device_type=device_type,
             mesh=np.arange(world_size).reshape(mesh_dim_sizes),
@@ -110,6 +115,7 @@ class DeviceMesh:
             vpp_size=vpp_size,
             ep_size=ep_size,
             etp_size=etp_size,
+            ep_fsdp_size=ep_fsdp_size,
             ulysses_size=ulysses_size,
             sequence_parallel=sequence_parallel,
         )
@@ -180,21 +186,6 @@ class DeviceMesh:
         coord = self._get_coord()
         key = tuple(c for i, c in enumerate(coord) if i != dim_idx)
         return group_map[key]
-
-    def build_ep_fsdp_device_mesh(self, ep_size: int = None):
-        ep_size = ep_size or self.ep_size or 1
-        if ep_size <= 1:
-            return None
-        world_size = self.world_size
-        assert world_size % ep_size == 0, (f'world_size ({world_size}) must be divisible by ep_size ({ep_size})')
-        ep_fsdp_size = world_size // ep_size
-
-        ep_mesh = DeviceMesh(
-            mesh=np.arange(world_size).reshape(ep_size, ep_fsdp_size),
-            mesh_dim_names=('ep', 'ep_fsdp'),
-            device_type=self.device_type,
-        )
-        return ep_mesh.to_torch_device_mesh()
 
     @property
     def order(self):

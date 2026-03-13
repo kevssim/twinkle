@@ -1,5 +1,4 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import numpy as np
 import os
 from transformers import AutoConfig
 
@@ -24,16 +23,11 @@ MAX_GRAD_NORM = float(os.environ.get('MAX_GRAD_NORM', '1.0'))
 KEEP_ROUTER_LOGITS = os.environ.get('KEEP_ROUTER_LOGITS', '0') == '1'
 
 # 8 gpus, dp=1, fsdp=8 (data parallel), ep_size=8 (expert parallel)
-# The main mesh does NOT include 'ep' dimension - EP is handled by separate ep_fsdp_device_mesh
-dp_size = 1
-fsdp_size = 8
-ep_size = 8
-
-device_mesh = DeviceMesh(
+device_mesh = DeviceMesh.from_sizes(
+    fsdp_size=8,
+    dp_size=1,
+    ep_size=8,
     device_type=Platform.get_platform().device_prefix(),
-    mesh=np.arange(fsdp_size * dp_size).reshape(fsdp_size, dp_size),
-    mesh_dim_names=('fsdp', 'dp'),
-    ep_size=ep_size,
 )
 
 twinkle.initialize(

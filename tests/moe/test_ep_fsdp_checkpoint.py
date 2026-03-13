@@ -35,6 +35,7 @@ from twinkle.model.transformers.moe import apply_expert_parallel
 from twinkle.model.transformers.strategy import NativeFSDPStrategy
 from twinkle.utils import DeviceMesh
 from twinkle.utils.framework import Torch as torch_util
+from twinkle.utils.platforms import Platform
 
 ABS_TOL = 1e-5
 REL_TOL = 1e-5
@@ -114,7 +115,7 @@ def _gather_full_state_dict(model, ep_fsdp_mesh):
     for name, param in model.named_parameters():
         local_full = torch_util.to_local_tensor(param)
         if name in ep_expert_names and ep_ws > 1 and ep_group is not None:
-            local_full = local_full.contiguous().cuda()
+            local_full = local_full.contiguous().to(Platform.get_local_device())
             gathered = [torch.empty_like(local_full) for _ in range(ep_ws)]
             dist.all_gather(gathered, local_full, group=ep_group)
             local_full = torch.cat(gathered, dim=0)

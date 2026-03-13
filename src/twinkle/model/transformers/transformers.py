@@ -999,7 +999,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             if name in ep_expert_names and ep_world_size > 1 and ep_group is not None:
                 # All-gather expert shards across EP group on dim-0
                 # local_full shape: [local_experts, ...], need [num_experts, ...]
-                local_full = local_full.contiguous().cuda()
+                local_full = local_full.contiguous().to(Platform.get_local_device())
                 gathered = [torch.empty_like(local_full) for _ in range(ep_world_size)]
                 dist.all_gather(gathered, local_full, group=ep_group)
                 local_full = torch.cat(gathered, dim=0)

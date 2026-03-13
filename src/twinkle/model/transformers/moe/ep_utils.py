@@ -2,6 +2,7 @@
 #
 # Copyright 2025 Bytedance Ltd. and/or its affiliates
 # Licensed under the Apache License, Version 2.0
+# Adapted from https://github.com/ByteDance-Seed/VeOmni/tree/main/veomni/distributed/moe
 
 import torch
 import torch.distributed as dist

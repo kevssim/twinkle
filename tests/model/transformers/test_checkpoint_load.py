@@ -6,7 +6,16 @@ import torch
 from peft import LoraConfig
 from transformers import GPT2Config, GPT2LMHeadModel
 
+from twinkle import Platform
 from twinkle.model.transformers import TransformersModel
+
+
+def _get_test_device() -> torch.device:
+    if hasattr(torch, 'npu') and torch.npu.is_available():
+        return torch.device(Platform.get_local_device(platform='npu'))
+    if torch.cuda.is_available():
+        return torch.device(Platform.get_local_device(platform='gpu'))
+    return torch.device('cpu')
 
 
 def _build_tiny_model() -> TransformersModel:
@@ -22,6 +31,7 @@ def _build_tiny_model() -> TransformersModel:
         ),
         strategy='accelerate',
     )
+    model.model.to(_get_test_device())
     model._save_tokenizer = lambda *args, **kwargs: None
     return model
 
@@ -59,7 +69,7 @@ def _assert_tensor_dict_equal(actual: dict, expected: dict) -> None:
         elif isinstance(expected_value, (list, tuple)):
             assert actual_value == expected_value
         elif torch.is_tensor(expected_value):
-            assert torch.equal(actual_value, expected_value)
+            assert torch.equal(actual_value.detach().cpu(), expected_value.detach().cpu())
         else:
             assert actual_value == expected_value
 

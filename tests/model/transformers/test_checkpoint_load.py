@@ -11,7 +11,7 @@ import twinkle
 from twinkle import Platform
 from twinkle.model.transformers import TransformersModel
 
-TEST_MODEL_ID = os.environ.get('TEST_MODEL_ID', 'ms://Qwen/Qwen3-0.6B')
+TEST_MODEL_ID = os.environ.get('TEST_MODEL_ID', 'ms://Qwen/Qwen3.5-0.8B')
 
 
 def _get_test_device() -> torch.device:

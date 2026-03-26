@@ -1,17 +1,15 @@
 import os
 from pathlib import Path
 from copy import deepcopy
-from functools import lru_cache
 
 import pytest
 import torch
 from peft import LoraConfig
-from transformers import AutoConfig, AutoModelForCausalLM
 
 from twinkle import Platform
 from twinkle.model.transformers import TransformersModel
 
-TEST_MODEL_ID = os.environ.get('TEST_MODEL_ID', 'Qwen/Qwen3.5-0.8B')
+TEST_MODEL_ID = os.environ.get('TEST_MODEL_ID', 'ms://Qwen/Qwen3-0.6B')
 
 
 def _get_test_device() -> torch.device:
@@ -21,29 +19,9 @@ def _get_test_device() -> torch.device:
         return torch.device(Platform.get_local_device(platform='gpu'))
     return torch.device('cpu')
 
-
-@lru_cache(maxsize=1)
-def _build_tiny_qwen_config():
-    config = AutoConfig.from_pretrained(TEST_MODEL_ID, trust_remote_code=True)
-    config.num_hidden_layers = 1
-    config.hidden_size = 128
-    config.intermediate_size = 256
-    config.num_attention_heads = 2
-    if hasattr(config, 'num_key_value_heads'):
-        config.num_key_value_heads = 2
-    if hasattr(config, 'head_dim'):
-        config.head_dim = config.hidden_size // config.num_attention_heads
-    if hasattr(config, 'max_position_embeddings'):
-        config.max_position_embeddings = 64
-    if hasattr(config, 'vocab_size'):
-        config.vocab_size = 256
-    return config
-
-
 def _build_tiny_model() -> TransformersModel:
     model = TransformersModel(
-        model_cls=AutoModelForCausalLM,
-        config=deepcopy(_build_tiny_qwen_config()),
+        model_id=TEST_MODEL_ID,
         strategy='accelerate',
         trust_remote_code=True,
     )

@@ -191,7 +191,11 @@ class NativeFSDPStrategy:
         return state_dict
 
     def load_full_state_dict(self, model, checkpoint_dir) -> None:
-        from transformers.modeling_utils import load_sharded_checkpoint, load_state_dict
+        from transformers.modeling_utils import load_state_dict
+        try:
+            from transformers.trainer_utils import load_sharded_checkpoint
+        except ImportError:
+            from transformers.modeling_utils import load_sharded_checkpoint
 
         checkpoint_dir = os.fspath(checkpoint_dir)
         unwrapped = self.unwrap_model(model)

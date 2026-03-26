@@ -1,11 +1,13 @@
 import os
+import tempfile
+import traceback
 from pathlib import Path
 from copy import deepcopy
 
-import pytest
 import torch
 from peft import LoraConfig
 
+import twinkle
 from twinkle import Platform
 from twinkle.model.transformers import TransformersModel
 
@@ -68,86 +70,135 @@ def _assert_tensor_dict_equal(actual: dict, expected: dict) -> None:
             assert actual_value == expected_value
 
 
-def test_load_full_checkpoint_restores_weights(tmp_path: Path):
-    model = _build_tiny_model()
-    before = _snapshot_named_parameters(model)
-    checkpoint_dir = Path(model.save('full-ckpt', output_dir=str(tmp_path)))
-
-    assert (checkpoint_dir / 'model.safetensors').exists()
-
-    with torch.no_grad():
-        for param in model.strategy.unwrap_model(model.model).parameters():
-            param.add_(1.0)
-
-    model.load(str(checkpoint_dir))
-    after = _snapshot_named_parameters(model)
-
-    assert after.keys() == before.keys()
-    for name in before:
-        assert torch.equal(after[name], before[name])
+def _assert_missing_artifact_raises(model: TransformersModel, checkpoint_dir: Path, filename: str) -> None:
+    try:
+        model.load(str(checkpoint_dir), load_optimizer=True)
+    except FileNotFoundError as exc:
+        assert filename in str(exc)
+        return
+    raise AssertionError(f'Expected FileNotFoundError for {filename}')
 
 
-def test_load_lora_checkpoint_still_restores_adapter_weights(tmp_path: Path):
-    model = _build_tiny_model()
-    model.add_adapter_to_model(
-        'resume_lora',
-        LoraConfig(task_type='CAUSAL_LM', r=2, lora_alpha=4, target_modules=['q_proj']),
-    )
-    before = _snapshot_lora_state(model, 'resume_lora')
-    checkpoint_dir = Path(model.save('lora-ckpt', output_dir=str(tmp_path), adapter_name='resume_lora'))
+def test_load_full_checkpoint_restores_weights():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        model = _build_tiny_model()
+        before = _snapshot_named_parameters(model)
+        checkpoint_dir = Path(model.save('full-ckpt', output_dir=str(tmp_path)))
 
-    with torch.no_grad():
-        for name, param in model.strategy.unwrap_model(model.model).named_parameters():
-            if 'resume_lora' in name:
+        assert (checkpoint_dir / 'model.safetensors').exists()
+
+        with torch.no_grad():
+            for param in model.strategy.unwrap_model(model.model).parameters():
                 param.add_(1.0)
 
-    model.load(str(checkpoint_dir), adapter_name='resume_lora')
-    after = _snapshot_lora_state(model, 'resume_lora')
+        model.load(str(checkpoint_dir))
+        after = _snapshot_named_parameters(model)
 
-    assert after.keys() == before.keys()
-    for name in before:
-        assert torch.equal(after[name], before[name])
-
-
-def test_load_full_checkpoint_with_optimizer_restores_optimizer_and_scheduler(tmp_path: Path):
-    model = _build_tiny_model()
-    _seed_optimizer_state(model)
-    optimizer = model.optimizer_group[''].optimizer
-    scheduler = model.optimizer_group[''].lr_scheduler
-    expected_optimizer_state = deepcopy(optimizer.state_dict())
-    expected_scheduler_state = deepcopy(scheduler.state_dict())
-    checkpoint_dir = Path(model.save('optim-ckpt', output_dir=str(tmp_path), save_optimizer=True))
-
-    for state in optimizer.state.values():
-        for value in state.values():
-            if torch.is_tensor(value):
-                value.add_(2.0)
-
-    scheduler.step()
-
-    model.load(str(checkpoint_dir), load_optimizer=True)
-
-    _assert_tensor_dict_equal(optimizer.state_dict(), expected_optimizer_state)
-    _assert_tensor_dict_equal(scheduler.state_dict(), expected_scheduler_state)
+        assert after.keys() == before.keys()
+        for name in before:
+            assert torch.equal(after[name], before[name])
 
 
-def test_load_full_checkpoint_with_optimizer_requires_optimizer_artifact(tmp_path: Path):
-    model = _build_tiny_model()
-    _seed_optimizer_state(model)
-    checkpoint_dir = Path(model.save('missing-optimizer', output_dir=str(tmp_path), save_optimizer=True))
+def test_load_lora_checkpoint_still_restores_adapter_weights():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        model = _build_tiny_model()
+        model.add_adapter_to_model(
+            'resume_lora',
+            LoraConfig(task_type='CAUSAL_LM', r=2, lora_alpha=4, target_modules=['q_proj']),
+        )
+        before = _snapshot_lora_state(model, 'resume_lora')
+        checkpoint_dir = Path(model.save('lora-ckpt', output_dir=str(tmp_path), adapter_name='resume_lora'))
 
-    (checkpoint_dir / 'optimizer.pt').unlink()
+        with torch.no_grad():
+            for name, param in model.strategy.unwrap_model(model.model).named_parameters():
+                if 'resume_lora' in name:
+                    param.add_(1.0)
 
-    with pytest.raises(FileNotFoundError, match='optimizer.pt'):
+        model.load(str(checkpoint_dir), adapter_name='resume_lora')
+        after = _snapshot_lora_state(model, 'resume_lora')
+
+        assert after.keys() == before.keys()
+        for name in before:
+            assert torch.equal(after[name], before[name])
+
+
+def test_load_full_checkpoint_with_optimizer_restores_optimizer_and_scheduler():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        model = _build_tiny_model()
+        _seed_optimizer_state(model)
+        optimizer = model.optimizer_group[''].optimizer
+        scheduler = model.optimizer_group[''].lr_scheduler
+        expected_optimizer_state = deepcopy(optimizer.state_dict())
+        expected_scheduler_state = deepcopy(scheduler.state_dict())
+        checkpoint_dir = Path(model.save('optim-ckpt', output_dir=str(tmp_path), save_optimizer=True))
+
+        for state in optimizer.state.values():
+            for value in state.values():
+                if torch.is_tensor(value):
+                    value.add_(2.0)
+
+        scheduler.step()
+
         model.load(str(checkpoint_dir), load_optimizer=True)
 
+        _assert_tensor_dict_equal(optimizer.state_dict(), expected_optimizer_state)
+        _assert_tensor_dict_equal(scheduler.state_dict(), expected_scheduler_state)
 
-def test_load_full_checkpoint_with_optimizer_requires_scheduler_artifact(tmp_path: Path):
-    model = _build_tiny_model()
-    _seed_optimizer_state(model)
-    checkpoint_dir = Path(model.save('missing-scheduler', output_dir=str(tmp_path), save_optimizer=True))
 
-    (checkpoint_dir / 'scheduler.pt').unlink()
+def test_load_full_checkpoint_with_optimizer_requires_optimizer_artifact():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        model = _build_tiny_model()
+        _seed_optimizer_state(model)
+        checkpoint_dir = Path(model.save('missing-optimizer', output_dir=str(tmp_path), save_optimizer=True))
 
-    with pytest.raises(FileNotFoundError, match='scheduler.pt'):
-        model.load(str(checkpoint_dir), load_optimizer=True)
+        (checkpoint_dir / 'optimizer.pt').unlink()
+        _assert_missing_artifact_raises(model, checkpoint_dir, 'optimizer.pt')
+
+
+def test_load_full_checkpoint_with_optimizer_requires_scheduler_artifact():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp_path = Path(tmpdir)
+        model = _build_tiny_model()
+        _seed_optimizer_state(model)
+        checkpoint_dir = Path(model.save('missing-scheduler', output_dir=str(tmp_path), save_optimizer=True))
+
+        (checkpoint_dir / 'scheduler.pt').unlink()
+        _assert_missing_artifact_raises(model, checkpoint_dir, 'scheduler.pt')
+
+
+def main() -> int:
+    twinkle.initialize(mode='local')
+    cases = [
+        test_load_full_checkpoint_restores_weights,
+        test_load_lora_checkpoint_still_restores_adapter_weights,
+        test_load_full_checkpoint_with_optimizer_restores_optimizer_and_scheduler,
+        test_load_full_checkpoint_with_optimizer_requires_optimizer_artifact,
+        test_load_full_checkpoint_with_optimizer_requires_scheduler_artifact,
+    ]
+
+    failed = []
+    for case in cases:
+        print(f'[RUN ] {case.__name__}')
+        try:
+            case()
+        except Exception as exc:
+            failed.append(case.__name__)
+            print(f'[FAIL] {case.__name__}: {exc}')
+            traceback.print_exc()
+        else:
+            print(f'[PASS] {case.__name__}')
+
+    if failed:
+        print(f'\nFailed {len(failed)} case(s): {failed}')
+        return 1
+
+    print(f'\nPassed {len(cases)} case(s).')
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

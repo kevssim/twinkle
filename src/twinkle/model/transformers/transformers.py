@@ -892,7 +892,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 adapter_name: Adapter to load.
                 load_optimizer: Whether to load optimizer and scheduler states.
         """
-        load_optimizer = kwargs.get('load_optimizer', False)
+        load_optimizer = kwargs.pop('load_optimizer', False)
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
 
         if output_dir is None:
@@ -924,12 +924,12 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
 
                 set_peft_model_state_dict(model, converted_weights, adapter_name=adapter_name)
 
-            if self.device_mesh.fsdp_world_size > 1:
+            if self.device_mesh is not None and self.device_mesh.fsdp_world_size > 1:
                 load_peft_weights_for_fsdp2(model, adapter_weights, adapter_name=adapter_name)
             else:
                 set_peft_model_state_dict(model, adapter_weights, adapter_name=adapter_name)
         else:
-            raise NotImplementedError
+            self.strategy.load_full_state_dict(self.model, checkpoint_dir)
 
         if load_optimizer:
             self._load_optimizer(checkpoint_dir, adapter_name=adapter_name)
@@ -942,11 +942,16 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         optimizer_path = os.path.join(checkpoint_dir, 'optimizer.pt')
         scheduler_path = os.path.join(checkpoint_dir, 'scheduler.pt')
 
-        if os.path.exists(optimizer_path) and optimizer_config.optimizer is not None:
+        if not os.path.exists(optimizer_path):
+            raise FileNotFoundError(f'Missing optimizer checkpoint: {optimizer_path}')
+        if not os.path.exists(scheduler_path):
+            raise FileNotFoundError(f'Missing scheduler checkpoint: {scheduler_path}')
+
+        if optimizer_config.optimizer is not None:
             state_dict = torch.load(optimizer_path, map_location='cpu')
             optimizer_config.optimizer.load_state_dict(state_dict)
 
-        if os.path.exists(scheduler_path) and optimizer_config.lr_scheduler is not None:
+        if optimizer_config.lr_scheduler is not None:
             state_dict = torch.load(scheduler_path, map_location='cpu')
             optimizer_config.lr_scheduler.load_state_dict(state_dict)
 

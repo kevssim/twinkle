@@ -130,3 +130,29 @@ class AccelerateStrategy:
             state_dict[name] = local.cpu()
             del local
         return state_dict
+
+    def load_full_state_dict(self, model, checkpoint_dir) -> None:
+        from transformers.modeling_utils import load_sharded_checkpoint, load_state_dict
+
+        checkpoint_dir = os.fspath(checkpoint_dir)
+        unwrapped = self.unwrap_model(model)
+        safe_index = os.path.join(checkpoint_dir, 'model.safetensors.index.json')
+        bin_index = os.path.join(checkpoint_dir, 'pytorch_model.bin.index.json')
+        safe_file = os.path.join(checkpoint_dir, 'model.safetensors')
+        bin_file = os.path.join(checkpoint_dir, 'pytorch_model.bin')
+
+        if os.path.exists(safe_index) or os.path.exists(bin_index):
+            try:
+                load_sharded_checkpoint(unwrapped, checkpoint_dir, strict=True, prefer_safe=True)
+            except TypeError:
+                load_sharded_checkpoint(unwrapped, checkpoint_dir, strict=True)
+            return
+
+        if os.path.exists(safe_file):
+            state_dict = load_state_dict(safe_file)
+        elif os.path.exists(bin_file):
+            state_dict = load_state_dict(bin_file)
+        else:
+            raise FileNotFoundError(f'No full model checkpoint found under {checkpoint_dir}')
+
+        unwrapped.load_state_dict(state_dict, strict=True)

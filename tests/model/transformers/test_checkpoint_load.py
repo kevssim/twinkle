@@ -1,13 +1,17 @@
+import os
 from pathlib import Path
 from copy import deepcopy
+from functools import lru_cache
 
 import pytest
 import torch
 from peft import LoraConfig
-from transformers import GPT2Config, GPT2LMHeadModel
+from transformers import AutoConfig, AutoModelForCausalLM
 
 from twinkle import Platform
 from twinkle.model.transformers import TransformersModel
+
+TEST_MODEL_ID = os.environ.get('TEST_MODEL_ID', 'Qwen/Qwen3.5-0.8B')
 
 
 def _get_test_device() -> torch.device:
@@ -18,18 +22,30 @@ def _get_test_device() -> torch.device:
     return torch.device('cpu')
 
 
+@lru_cache(maxsize=1)
+def _build_tiny_qwen_config():
+    config = AutoConfig.from_pretrained(TEST_MODEL_ID, trust_remote_code=True)
+    config.num_hidden_layers = 1
+    config.hidden_size = 128
+    config.intermediate_size = 256
+    config.num_attention_heads = 2
+    if hasattr(config, 'num_key_value_heads'):
+        config.num_key_value_heads = 2
+    if hasattr(config, 'head_dim'):
+        config.head_dim = config.hidden_size // config.num_attention_heads
+    if hasattr(config, 'max_position_embeddings'):
+        config.max_position_embeddings = 64
+    if hasattr(config, 'vocab_size'):
+        config.vocab_size = 256
+    return config
+
+
 def _build_tiny_model() -> TransformersModel:
     model = TransformersModel(
-        model_cls=GPT2LMHeadModel,
-        config=GPT2Config(
-            n_layer=1,
-            n_head=1,
-            n_embd=8,
-            n_positions=16,
-            n_ctx=16,
-            vocab_size=32,
-        ),
+        model_cls=AutoModelForCausalLM,
+        config=deepcopy(_build_tiny_qwen_config()),
         strategy='accelerate',
+        trust_remote_code=True,
     )
     model.model.to(_get_test_device())
     model._save_tokenizer = lambda *args, **kwargs: None
@@ -97,7 +113,7 @@ def test_load_lora_checkpoint_still_restores_adapter_weights(tmp_path: Path):
     model = _build_tiny_model()
     model.add_adapter_to_model(
         'resume_lora',
-        LoraConfig(task_type='CAUSAL_LM', r=2, lora_alpha=4, target_modules=['c_attn']),
+        LoraConfig(task_type='CAUSAL_LM', r=2, lora_alpha=4, target_modules=['q_proj']),
     )
     before = _snapshot_lora_state(model, 'resume_lora')
     checkpoint_dir = Path(model.save('lora-ckpt', output_dir=str(tmp_path), adapter_name='resume_lora'))

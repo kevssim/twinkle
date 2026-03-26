@@ -11,6 +11,7 @@ def load_full_state_dict(model, checkpoint_dir) -> None:
     checkpoint_files = _resolve_checkpoint_files(checkpoint_dir)
     state_dict = _load_checkpoint_state_dict(checkpoint_files)
     state_dict = _apply_hf_weight_conversion(model, state_dict)
+    state_dict = _materialize_tied_weights(model, state_dict)
     model.load_state_dict(state_dict, strict=True)
 
 
@@ -111,3 +112,21 @@ def _format_incompatible_keys(model, missing_keys: Iterable[str] = (), unexpecte
     if unexpected_keys:
         error_message += '\n\tUnexpected key(s) in state_dict: ' + ', '.join(f'"{key}"' for key in unexpected_keys) + '.'
     return error_message
+
+
+def _materialize_tied_weights(model, state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    tied_weights = getattr(model, 'all_tied_weights_keys', None)
+    if not tied_weights:
+        return state_dict
+
+    materialized_state_dict = dict(state_dict)
+    for target_name, source_name in tied_weights.items():
+        source_tensor = materialized_state_dict.get(source_name)
+        target_tensor = materialized_state_dict.get(target_name)
+
+        if source_tensor is not None and target_tensor is None:
+            materialized_state_dict[target_name] = source_tensor
+        elif source_tensor is None and target_tensor is not None:
+            materialized_state_dict[source_name] = target_tensor
+
+    return materialized_state_dict

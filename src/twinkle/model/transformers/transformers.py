@@ -271,8 +271,6 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             if self.sp_strategy is not None:
                 self.sp_strategy.initialize()
 
-            self._log_cuda_memory('before_wrap')
-            self._log_fsdp_debug_info('before_wrap')
             if len(optimizer_groups) == 1:
                 optimizer_group = optimizer_groups[0]
                 optimizer = optimizer_group.optimizer
@@ -288,248 +286,6 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 else:
                     self.model = result
             self._model_wrapped = True
-            self._log_fsdp_debug_info('after_wrap')
-            self._log_cuda_memory('after_wrap')
-
-    def _log_cuda_memory(self, stage: str):
-        if not self._fsdp_debug_enabled() or not torch.cuda.is_available():
-            return
-        rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else None
-        local_rank = os.environ.get('LOCAL_RANK')
-        device = torch.cuda.current_device()
-        torch.cuda.synchronize(device)
-        allocated = torch.cuda.memory_allocated(device) / 1024**3
-        reserved = torch.cuda.memory_reserved(device) / 1024**3
-        peak_allocated = torch.cuda.max_memory_allocated(device) / 1024**3
-        peak_reserved = torch.cuda.max_memory_reserved(device) / 1024**3
-        free, total = torch.cuda.mem_get_info(device)
-        logger.info(
-            f'CUDA memory [{stage}]: '
-            f'pid={os.getpid()}, rank={rank}, local_rank={local_rank}, device={device}, '
-            f'allocated={allocated:.2f}GiB, reserved={reserved:.2f}GiB, '
-            f'peak_allocated={peak_allocated:.2f}GiB, peak_reserved={peak_reserved:.2f}GiB, '
-            f'free={free / 1024**3:.2f}GiB, total={total / 1024**3:.2f}GiB'
-        )
-
-    @staticmethod
-    def _fsdp_debug_enabled() -> bool:
-        return os.environ.get('TWINKLE_FSDP_DEBUG', '').lower() in {'1', 'true', 'yes', 'on'}
-
-    def _log_fsdp_debug_info(self, stage: str):
-        if not self._fsdp_debug_enabled():
-            return
-        if self.device_mesh is None:
-            logger.info(f'FSDP debug [{stage}]: device_mesh=None, model_wrapped={self._model_wrapped}')
-            return
-
-        fsdp_plugin = None
-        if hasattr(self.strategy, '_get_fsdp_plugin'):
-            try:
-                fsdp_plugin = self.strategy._get_fsdp_plugin()
-            except Exception as exc:  # pragma: no cover - diagnostic only
-                fsdp_plugin_name = f'unavailable: {exc}'
-            else:
-                fsdp_plugin_name = type(fsdp_plugin).__name__ if fsdp_plugin is not None else None
-        else:
-            fsdp_plugin_name = None
-
-        param_summary, sample_params = self._summarize_model_params_for_fsdp_debug()
-        optimizer_summary = self._summarize_optimizers_for_fsdp_debug()
-        fsdp_module_summary = self._summarize_fsdp_modules_for_debug()
-
-        logger.info(
-            f'FSDP debug [{stage}]: '
-            f'strategy={type(self.strategy).__name__}, '
-            f'model_wrapped={self._model_wrapped}, '
-            f'dp_size={self.device_mesh.dp_world_size}, '
-            f'fsdp_size={self.device_mesh.fsdp_world_size}, '
-            f'tp_size={self.device_mesh.tp_world_size}, '
-            f'fsdp_plugin={fsdp_plugin_name}, '
-            f'fsdp_module_summary={fsdp_module_summary}, '
-            f'param_summary={param_summary}, '
-            f'optimizer_summary={optimizer_summary}, '
-            f'sample_params={sample_params}'
-        )
-
-    def _log_fsdp_debug_info_once(self, stage: str):
-        marker = f'_fsdp_debug_logged_{stage}'
-        if getattr(self, marker, False):
-            return
-        self._log_fsdp_debug_info(stage)
-        setattr(self, marker, True)
-
-    @staticmethod
-    def _tensor_local_view_for_fsdp_debug(tensor: torch.Tensor):
-        return tensor.to_local() if hasattr(tensor, 'to_local') else tensor
-
-    @staticmethod
-    def _tensor_nbytes_for_fsdp_debug(tensor: torch.Tensor) -> int:
-        if tensor is None:
-            return 0
-        return tensor.numel() * tensor.element_size()
-
-    @classmethod
-    def _tensor_local_nbytes_for_fsdp_debug(cls, tensor: torch.Tensor) -> int:
-        if tensor is None:
-            return 0
-        return cls._tensor_nbytes_for_fsdp_debug(cls._tensor_local_view_for_fsdp_debug(tensor))
-
-    @staticmethod
-    def _fsdp_debug_param_bucket(name: str, param: torch.Tensor) -> str:
-        if '.lora_' in name or 'lora_' in name:
-            return 'lora_trainable' if param.requires_grad else 'lora_frozen'
-        return 'base_trainable' if param.requires_grad else 'base_frozen'
-
-    @staticmethod
-    def _gib_for_fsdp_debug(num_bytes: int) -> str:
-        return f'{num_bytes / 1024**3:.3f}GiB'
-
-    def _summarize_model_params_for_fsdp_debug(self):
-        summary = {}
-        sample_params = []
-        lora_sample_added = False
-        base_sample_added = False
-
-        for name, param in self.model.named_parameters():
-            bucket = self._fsdp_debug_param_bucket(name, param)
-            local_param = self._tensor_local_view_for_fsdp_debug(param)
-            placements = getattr(param, 'placements', None)
-            has_device_mesh = getattr(param, 'device_mesh', None) is not None
-            is_sharded = local_param.numel() != param.numel() or (
-                placements is not None and 'Shard' in str(placements))
-
-            entry = summary.setdefault(bucket, {
-                'params': 0,
-                'dtensor_params': 0,
-                'sharded_params': 0,
-                'global_numel': 0,
-                'local_numel': 0,
-                'global_bytes': 0,
-                'local_bytes': 0,
-                'grad_local_bytes': 0,
-            })
-            entry['params'] += 1
-            entry['dtensor_params'] += int(has_device_mesh)
-            entry['sharded_params'] += int(is_sharded)
-            entry['global_numel'] += param.numel()
-            entry['local_numel'] += local_param.numel()
-            entry['global_bytes'] += self._tensor_nbytes_for_fsdp_debug(param)
-            entry['local_bytes'] += self._tensor_nbytes_for_fsdp_debug(local_param)
-            entry['grad_local_bytes'] += self._tensor_local_nbytes_for_fsdp_debug(param.grad)
-
-            should_sample = (
-                len(sample_params) < 4
-                or (not lora_sample_added and 'lora_' in name)
-                or (not base_sample_added and 'lora_' not in name))
-            if should_sample:
-                sample_params.append({
-                    'name': name,
-                    'type': type(param).__name__,
-                    'shape': tuple(param.shape),
-                    'local_shape': tuple(local_param.shape),
-                    'requires_grad': param.requires_grad,
-                    'has_device_mesh': has_device_mesh,
-                    'placements': str(placements) if placements is not None else None,
-                })
-                lora_sample_added = lora_sample_added or 'lora_' in name
-                base_sample_added = base_sample_added or 'lora_' not in name
-
-        for entry in summary.values():
-            entry['global_bytes'] = self._gib_for_fsdp_debug(entry['global_bytes'])
-            entry['local_bytes'] = self._gib_for_fsdp_debug(entry['local_bytes'])
-            entry['grad_local_bytes'] = self._gib_for_fsdp_debug(entry['grad_local_bytes'])
-        return summary, sample_params
-
-    def _summarize_optimizers_for_fsdp_debug(self):
-        summary = {}
-        for adapter_name, optimizer_group in self.optimizer_group.items():
-            optimizer = optimizer_group.optimizer
-            if optimizer is None:
-                summary[adapter_name] = None
-                continue
-
-            param_local_bytes = 0
-            param_global_bytes = 0
-            state_local_bytes = 0
-            group_summaries = []
-            for group_index, group in enumerate(optimizer.param_groups):
-                group_params = group.get('params', [])
-                group_local_bytes = sum(self._tensor_local_nbytes_for_fsdp_debug(param) for param in group_params)
-                group_global_bytes = sum(self._tensor_nbytes_for_fsdp_debug(param) for param in group_params)
-                param_local_bytes += group_local_bytes
-                param_global_bytes += group_global_bytes
-                group_summaries.append({
-                    'index': group_index,
-                    'params': len(group_params),
-                    'param_names': len(group.get('param_names', [])),
-                    'local_bytes': self._gib_for_fsdp_debug(group_local_bytes),
-                    'global_bytes': self._gib_for_fsdp_debug(group_global_bytes),
-                })
-
-            for state in optimizer.state.values():
-                for value in state.values():
-                    if isinstance(value, torch.Tensor):
-                        state_local_bytes += self._tensor_local_nbytes_for_fsdp_debug(value)
-
-            summary[adapter_name] = {
-                'class': optimizer.__class__.__name__,
-                'groups': group_summaries,
-                'state_entries': len(optimizer.state),
-                'param_local_bytes': self._gib_for_fsdp_debug(param_local_bytes),
-                'param_global_bytes': self._gib_for_fsdp_debug(param_global_bytes),
-                'state_local_bytes': self._gib_for_fsdp_debug(state_local_bytes),
-            }
-        return summary
-
-    def _summarize_fsdp_modules_for_debug(self):
-        fsdp_modules = []
-        decoder_layers = self._find_decoder_layers_for_fsdp_debug()
-
-        for name, module in self.model.named_modules():
-            if self._is_fsdp_module_for_debug(module):
-                fsdp_modules.append({
-                    'name': name or '<root>',
-                    'class': type(module).__name__,
-                })
-
-        no_split_modules = []
-        for label, module in self._iter_model_wrappers_for_fsdp_debug():
-            value = getattr(module, '_no_split_modules', None)
-            if value:
-                no_split_modules.append((label, list(value) if isinstance(value, (list, set, tuple)) else value))
-
-        return {
-            'fsdp_module_count': len(fsdp_modules),
-            'fsdp_module_samples': fsdp_modules[:12],
-            'decoder_layer_count': len(decoder_layers) if decoder_layers is not None else None,
-            'no_split_modules': no_split_modules,
-        }
-
-    @staticmethod
-    def _is_fsdp_module_for_debug(module) -> bool:
-        fsdp_markers = ('reshard', 'unshard', 'set_modules_to_forward_prefetch', '_fsdp_state')
-        return any(hasattr(module, marker) for marker in fsdp_markers)
-
-    def _iter_model_wrappers_for_fsdp_debug(self):
-        seen = set()
-        labels = ('model', 'model.model', 'model.model.model', 'model.base_model', 'model.base_model.model')
-        for label in labels:
-            module = self.model
-            for attr in label.split('.')[1:]:
-                module = getattr(module, attr, None)
-                if module is None:
-                    break
-            if module is None or id(module) in seen:
-                continue
-            seen.add(id(module))
-            yield label, module
-
-    def _find_decoder_layers_for_fsdp_debug(self):
-        for _, module in self._iter_model_wrappers_for_fsdp_debug():
-            layers = getattr(module, 'layers', None)
-            if isinstance(layers, torch.nn.ModuleList):
-                return layers
-        return None
 
     def register_mm_forward_hook(self, optimizer_group: OptimizerGroup):
         model = self.strategy.unwrap_model(self.model)
@@ -615,12 +371,16 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         loss_instance = optimizer_config.loss_instance
         loss_require_logits = (hasattr(loss_instance, 'require_logits') and loss_instance.require_logits)
         assert isinstance(processor, InputProcessor), 'Set a correct `InputProcessor` before forwarding'
-        inputs: Dict[str, Any] = processor(inputs, sp_strategy=self.sp_strategy)
+        inputs: Dict[str, Any] = processor(
+            inputs,
+            sp_strategy=self.sp_strategy,
+            model=self.model,
+            hf_config=self.hf_config,
+            enable_sp=getattr(self, '_enable_sp', False),
+        )
         labels: torch.Tensor = inputs.pop('labels', None)
         optimizer_config.accumulate_metrics(True)
-        self._log_cuda_memory('before_model_forward')
         outputs = self.model(**inputs)
-        self._log_cuda_memory('after_model_forward')
         inputs['labels'] = labels
         if labels is not None:
             loss_mask = (labels != -100).bool()
@@ -629,11 +389,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             logits = outputs['logits']
             logits.div_(temperature)
             outputs['logps'] = selective_log_softmax(logits, masked_labels)
-            self._log_cuda_memory('after_logps')
+            del logits
         outputs['past_key_values'] = None
-        _outputs = copy(outputs)
-        logits = outputs['logits']
-        if not loss_require_logits:
+        if not (return_logits or loss_require_logits):
             outputs['logits'] = None
         inputs, outputs = processor.postprocess_tensor_sp(inputs, outputs, sp_strategy=self.sp_strategy)
         inputs, outputs = processor.unpack_packed_sequences(inputs, outputs)
@@ -641,14 +399,10 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         optimizer_config.train_status.outputs = outputs
         optimizer_config.train_status.forward_kwargs = kwargs
         optimizer_config.train_status.loss_value = outputs.get('aux_loss', 0)
-        if return_logits:
-            _outputs['logits'] = logits
-        else:
-            _outputs['logits'] = None
-        if not return_logits and not loss_require_logits:
-            del logits
-        self._log_cuda_memory('after_forward_store')
-        return _outputs
+        return_outputs = copy(outputs)
+        if not return_logits:
+            return_outputs['logits'] = None
+        return return_outputs
 
     @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
     def forward_only(self, *, inputs: Union[InputFeature, List[InputFeature], List[Trajectory]], **kwargs):
@@ -684,17 +438,21 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             assert isinstance(processor, InputProcessor), 'Set InputProcessor correctly before forwarding'
             loss_instance = optimizer_config.loss_instance
             loss_require_logits = (hasattr(loss_instance, 'require_logits') and loss_instance.require_logits)
-            inputs: Dict[str, Any] = processor(inputs, sp_strategy=self.sp_strategy)
+            inputs: Dict[str, Any] = processor(
+                inputs,
+                sp_strategy=self.sp_strategy,
+                model=self.model,
+                hf_config=self.hf_config,
+                enable_sp=getattr(self, '_enable_sp', False),
+            )
             labels = inputs.pop('labels', None)
             optimizer_config.accumulate_metrics(False)
             unwrapped_model = self.strategy.unwrap_model(self.model)
-            self._log_cuda_memory('before_forward_only_model_forward')
             if disable_lora and isinstance(unwrapped_model, PeftModel):
                 with unwrapped_model.disable_adapter():
                     outputs = self.model(**inputs)
             else:
                 outputs = self.model(**inputs)
-            self._log_cuda_memory('after_forward_only_model_forward')
             inputs['labels'] = labels
             if labels is not None:
                 loss_mask = (labels != -100).bool()
@@ -703,11 +461,9 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                 logits = outputs['logits']
                 logits.div_(temperature)
                 outputs['logps'] = selective_log_softmax(logits, masked_labels)
-                self._log_cuda_memory('after_forward_only_logps')
+                del logits
             outputs['past_key_values'] = None
-            _outputs = copy(outputs)
-            logits = outputs['logits']
-            if not loss_require_logits:
+            if not (return_logits or loss_require_logits):
                 outputs['logits'] = None
             inputs, outputs = processor.postprocess_tensor_sp(inputs, outputs, sp_strategy=self.sp_strategy)
             inputs, outputs = processor.unpack_packed_sequences(inputs, outputs)
@@ -715,14 +471,10 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             optimizer_config.eval_status.outputs = outputs
             optimizer_config.eval_status.forward_kwargs = kwargs
             optimizer_config.eval_status.loss_value = outputs.get('aux_loss', 0)
-            if return_logits:
-                _outputs['logits'] = logits
-            else:
-                _outputs['logits'] = None
-            if not return_logits and not loss_require_logits:
-                del logits
-            self._log_cuda_memory('after_forward_only_store')
-            return _outputs
+            return_outputs = copy(outputs)
+            if not return_logits:
+                return_outputs['logits'] = None
+            return return_outputs
 
     @remote_function(collect='mean')
     def calculate_loss(self, **kwargs):
@@ -746,9 +498,7 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         inputs = status.inputs
         outputs = status.outputs
         assert inputs is not None and outputs is not None, 'Cannot calculate loss of empty inputs and outputs'
-        self._log_cuda_memory('before_calculate_loss')
         result = loss_instance(inputs, outputs, **kwargs)
-        self._log_cuda_memory('after_loss_instance')
         loss_value = result['loss']
         raw_counts = result['num_tokens']
         counts = raw_counts
@@ -774,7 +524,6 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
         status.loss_value += loss_value
         outputs['loss'] = status.loss_value
         outputs['num_tokens'] = raw_counts.detach() if hasattr(raw_counts, 'detach') else raw_counts
-        self._log_cuda_memory('after_calculate_loss_store')
         return status.loss_value.item()
 
     @remote_function()
@@ -805,12 +554,10 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
             no_sync_ctx = self.model.no_sync()
 
         with no_sync_ctx:
-            self._log_cuda_memory('before_backward')
             if scaler is not None:
                 scaler.scale(loss_value).backward()
             else:
                 loss_value.backward()
-        self._log_cuda_memory('after_backward')
 
         optimizer_config.train_status.loss_value = None
 
@@ -973,7 +720,6 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                     group['betas'] = optim_params['betas']
 
         with context():
-            self._log_cuda_memory('before_optimizer_step')
             if scaler is not None:
                 scaler.step(optimizer, **kwargs)
                 scaler.update()
@@ -981,8 +727,6 @@ class TransformersModel(TwinkleModel, PreTrainedModel, CheckpointEngineMixin):
                                                       for v in scaler._found_inf_per_device(optimizer).values()) > 0
             else:
                 optimizer.step(**kwargs)
-            self._log_cuda_memory('after_optimizer_step')
-            self._log_fsdp_debug_info_once('after_optimizer_step')
 
     @remote_function()
     def zero_grad(self, **kwargs):

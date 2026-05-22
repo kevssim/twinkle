@@ -76,6 +76,21 @@ class TwinkleClient:
         self._heartbeat_thread.start()
         atexit.register(self.close)
 
+    def get_capacity_info(self) -> dict:
+        """
+        Get the server's global LoRA capacity information.
+
+        Returns:
+            dict: Containing 'max_loras', 'used_loras', and 'free_loras'.
+
+        Raises:
+            TwinkleClientError: If the request fails.
+        """
+        from twinkle_client.types.server import CapacityInfoResponse
+        response = http_get(self._get_url('/capacity_info'))
+        data = self._handle_response(response)
+        return CapacityInfoResponse(**data).model_dump()
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------

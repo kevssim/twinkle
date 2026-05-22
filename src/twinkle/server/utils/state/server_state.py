@@ -57,6 +57,9 @@ class ServerState:
         self._metrics_running = False
         self._metrics_update_interval: float = float(kwargs.get('metrics_update_interval', 15.0))
 
+    async def get_capacity_info(self) -> dict[str, int]:
+        return self._model_mgr.get_capacity_info()
+
     # ----- Session Management -----
 
     async def create_session(self, payload: dict[str, Any]) -> str:
@@ -373,6 +376,9 @@ class ServerStateProxy:
 
     def __init__(self, actor_handle) -> None:
         self._actor = actor_handle
+
+    async def get_capacity_info(self) -> dict[str, int]:
+        return await self._actor.get_capacity_info.remote()
 
     # ----- Session Management -----
 

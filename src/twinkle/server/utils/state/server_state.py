@@ -411,6 +411,9 @@ class ServerStateProxy:
     async def register_replica(self, replica_id: str, max_loras: int) -> None:
         await self._actor.register_replica.remote(replica_id, max_loras)
 
+    def register_replica_blocking(self, replica_id: str, max_loras: int) -> None:
+        ray.get(self._actor.register_replica.remote(replica_id, max_loras))
+
     async def unregister_replica(self, replica_id: str) -> None:
         await self._actor.unregister_replica.remote(replica_id)
 

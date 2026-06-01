@@ -12,6 +12,7 @@ from typing import Any, Callable, Dict, List, Optional, Union
 from twinkle import torch_util
 from twinkle.data_format import InputFeature
 from twinkle.utils import get_logger
+from .multi_lora_target_parameters import TargetParameterLoraManager
 
 logger = get_logger()
 
@@ -36,6 +37,7 @@ class MultiLora:
         self.module: PeftModel
         self._active_adapters = []
         self.max_length = max_length
+        self.target_parameter_manager = TargetParameterLoraManager(max_loras=max_loras, max_r=max_r)
 
     def _get_available_lora(self) -> Optional[LoraTenant]:
         for _lora in self.loras:
@@ -49,6 +51,10 @@ class MultiLora:
     @staticmethod
     def _is_distributed_param(parameter):
         return hasattr(parameter, 'device_mesh') and hasattr(parameter, 'placements')
+
+    @staticmethod
+    def _is_target_parameter_lora_name(name: str) -> bool:
+        return '._twinkle_lora_' in name
 
     def _write_param_tensor(self, parameter, value):
         if value is None:
@@ -142,15 +148,19 @@ class MultiLora:
         else:
             self.module.disable_adapter_layers()
 
+    def patch_target_parameters(self, module, target_parameters):
+        self.target_parameter_manager.patch(module, target_parameters)
+
     @contextmanager
     def adapter(self, tenant_adapter_name: str, disable_lora: bool = False):
         self.activate_adapter(tenant_adapter_name)
-        if disable_lora:
-            # Temporarily disable all adapters while keeping optimizer_group active
-            with self._disable_lora_context(tenant_adapter_name):
+        with self.target_parameter_manager.adapter(tenant_adapter_name, disable_lora=disable_lora):
+            if disable_lora:
+                # Temporarily disable all adapters while keeping optimizer_group active
+                with self._disable_lora_context(tenant_adapter_name):
+                    yield self.find_lora_by_tenant(tenant_adapter_name).adapter_name
+            else:
                 yield self.find_lora_by_tenant(tenant_adapter_name).adapter_name
-        else:
-            yield self.find_lora_by_tenant(tenant_adapter_name).adapter_name
 
     @contextmanager
     def _disable_lora_context(self, tenant_adapter_name):
@@ -206,6 +216,12 @@ class MultiLora:
             raise RuntimeError(f'Too big rank for lora: {config.r}')
         _available_lora.tenant_config = config
         _available_lora.tenant_adapter_name = tenant_adapter_name
+        if getattr(config, 'target_parameters', None):
+            self.target_parameter_manager.acquire(
+                tenant_adapter_name=tenant_adapter_name,
+                slot_name=_available_lora.adapter_name,
+                config=config,
+            )
         logger.info(f'Lora count: {len(self.loras)}, available lora: {self._count_available_loras()}')
         return _available_lora.adapter_name
 
@@ -215,6 +231,7 @@ class MultiLora:
             _lora.tenant_config = None
             _lora.tenant_adapter_name = None
             self._load_initial_weights(_lora.adapter_name)
+            self.target_parameter_manager.release(tenant_adapter_name)
             logger.info(f'Lora count: {len(self.loras)}, available lora: {self._count_available_loras()}')
         except ValueError:
             return
@@ -533,10 +550,12 @@ class MultiLora:
             lora_tenant = self.loras[i]
             pattern = re.compile(rf'\.lora_(?:A|embedding_A)\.{re.escape(lora_tenant.adapter_name)}\.')
 
-            def _store_weights(_module):
-                for name, parameter in _module.named_parameters():
-                    if pattern.search(name):
-                        lora_tenant.lora_A_weights[name] = self._read_param_tensor(parameter).clone().to('cpu')
+        def _store_weights(_module):
+            for name, parameter in _module.named_parameters():
+                if self._is_target_parameter_lora_name(name):
+                    continue
+                if pattern.search(name):
+                    lora_tenant.lora_A_weights[name] = self._read_param_tensor(parameter).clone().to('cpu')
 
             if isinstance(self.module, list):
                 for _module in self.module:
@@ -696,6 +715,8 @@ class MultiLora:
 
         def _load_initial_weights(_module):
             for name, parameter in _module.named_parameters():
+                if self._is_target_parameter_lora_name(name):
+                    continue
                 if pattern_A.search(name):
                     local_param = self._read_param_tensor(parameter)
                     if local_param is not None:
@@ -794,3 +815,9 @@ class MultiLora:
         trainable_param_names = trainable_param_names[:5] + ['...'] + trainable_param_names[-5:]
         trainable_param_names = '\n'.join(trainable_param_names)
         return trainable_param_names
+
+    def get_target_parameter_trainable_parameters(self, tenant_adapter_name):
+        return {
+            name: parameter
+            for name, parameter in self.target_parameter_manager.named_slot_parameters(tenant_adapter_name)
+        }

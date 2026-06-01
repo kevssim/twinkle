@@ -92,3 +92,37 @@ def test_target_parameter_multi_lora_updates_only_active_adapter():
 
     for name, param in manager.named_slot_parameters("adapter_b"):
         assert torch.equal(param.detach(), params_before[name])
+
+
+def test_multilora_releases_target_parameter_slot_to_initial_weights():
+    from twinkle.model.multi_lora import LoraTenant, MultiLora
+
+    torch.manual_seed(0)
+    model = FakeModel()
+    multi_lora = MultiLora(max_loras=2, max_r=4)
+    multi_lora.module = model
+    multi_lora.loras = [
+        LoraTenant(index=0, adapter_name="lora_0", config=_make_target_cfg(r=4)),
+        LoraTenant(index=1, adapter_name="lora_1", config=_make_target_cfg(r=4)),
+    ]
+    multi_lora.patch_target_parameters(model, _make_target_cfg().target_parameters)
+    multi_lora.acquire_lora("adapter_a", _make_target_cfg(r=2))
+
+    initial_a = {
+        name: param.detach().clone()
+        for name, param in multi_lora.target_parameter_manager.named_slot_parameters("adapter_a")
+        if ".lora_A." in name
+    }
+
+    with torch.no_grad():
+        for _, param in multi_lora.target_parameter_manager.named_slot_parameters("adapter_a"):
+            param.add_(1.0)
+
+    multi_lora.release_lora("adapter_a")
+
+    for wrapper in multi_lora.target_parameter_manager.wrappers:
+        for name, param in wrapper.named_slot_parameters("lora_0"):
+            if ".lora_A." in name:
+                assert torch.equal(param.detach(), initial_a[name])
+            else:
+                assert torch.count_nonzero(param.detach()) == 0

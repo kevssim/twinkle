@@ -46,6 +46,7 @@ class TargetParameterLoraWrapper(nn.Module):
         self.lora_B = nn.ModuleDict()
         self.scaling: dict[str, float] = {}
         self.r: dict[str, int] = {}
+        self._initial_lora_A: dict[str, torch.Tensor] = {}
         self._init_slots()
 
     @property
@@ -94,7 +95,15 @@ class TargetParameterLoraWrapper(nn.Module):
             self.reset_slot(slot_name)
 
     def reset_slot(self, slot_name: str) -> None:
-        nn.init.kaiming_uniform_(self.lora_A[slot_name].weight, a=math.sqrt(5))
+        if slot_name not in self._initial_lora_A:
+            nn.init.kaiming_uniform_(self.lora_A[slot_name].weight, a=math.sqrt(5))
+            self._initial_lora_A[slot_name] = self.lora_A[slot_name].weight.detach().clone().cpu()
+        else:
+            initial = self._initial_lora_A[slot_name].to(
+                device=self.lora_A[slot_name].weight.device,
+                dtype=self.lora_A[slot_name].weight.dtype,
+            )
+            self.lora_A[slot_name].weight.data.copy_(initial)
         nn.init.zeros_(self.lora_B[slot_name].weight)
 
     def configure_slot(self, slot_name: str, config: LoraConfig) -> None:

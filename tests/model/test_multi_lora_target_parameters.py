@@ -58,3 +58,37 @@ def test_peft_target_parameter_key_shapes_for_3d_experts():
         "base_model.model.mlp.experts.lora_A.default.weight": (4, 6),
         "base_model.model.mlp.experts.lora_B.default.weight": (4, 4),
     }
+
+
+def _make_target_cfg(r=2):
+    return LoraConfig(
+        r=r,
+        lora_alpha=r * 2,
+        target_modules=[],
+        target_parameters=["mlp.experts.gate_up_proj", "mlp.experts.down_proj"],
+    )
+
+
+def test_target_parameter_multi_lora_updates_only_active_adapter():
+    from twinkle.model.multi_lora_target_parameters import TargetParameterLoraManager
+
+    torch.manual_seed(0)
+    model = FakeModel()
+    manager = TargetParameterLoraManager(max_loras=2, max_r=4)
+    manager.patch(model, target_parameters=_make_target_cfg().target_parameters)
+    manager.acquire("adapter_a", "lora_0", _make_target_cfg(r=2))
+    manager.acquire("adapter_b", "lora_1", _make_target_cfg(r=2))
+
+    params_before = {
+        name: param.detach().clone()
+        for name, param in manager.named_slot_parameters("adapter_b")
+    }
+
+    opt = torch.optim.SGD(manager.parameters_for_tenant("adapter_a"), lr=0.1)
+    with manager.adapter("adapter_a"):
+        loss = model(torch.randn(3, 4), expert_idx=0).pow(2).mean()
+    loss.backward()
+    opt.step()
+
+    for name, param in manager.named_slot_parameters("adapter_b"):
+        assert torch.equal(param.detach(), params_before[name])

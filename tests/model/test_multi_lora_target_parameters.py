@@ -58,10 +58,10 @@ def test_peft_target_parameter_key_shapes_for_3d_experts():
     lora_shapes = {key: tuple(state[key].shape) for key in state if "lora_" in key}
 
     assert lora_shapes == {
-        "base_model.model.mlp.experts.base_layer.lora_A.default.weight": (4, 4),
-        "base_model.model.mlp.experts.base_layer.lora_B.default.weight": (12, 4),
-        "base_model.model.mlp.experts.lora_A.default.weight": (4, 6),
-        "base_model.model.mlp.experts.lora_B.default.weight": (4, 4),
+        "base_model.model.mlp.experts.base_layer.lora_A.default.weight": (4, 12),
+        "base_model.model.mlp.experts.base_layer.lora_B.default.weight": (4, 4),
+        "base_model.model.mlp.experts.lora_A.default.weight": (4, 4),
+        "base_model.model.mlp.experts.lora_B.default.weight": (6, 4),
     }
 
 

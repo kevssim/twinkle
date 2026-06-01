@@ -55,6 +55,10 @@ class TargetParameterLoraWrapper(nn.Module):
         return getattr(self.record.module, self.record.parameter_name)
 
     @property
+    def did_swap_in_out_features(self) -> bool:
+        return self.base_parameter.ndim == 3 and not getattr(self.record.module, 'is_transposed', False)
+
+    @property
     def num_experts(self) -> int:
         parameter = self.base_parameter
         return parameter.shape[0] if parameter.ndim == 3 else 1
@@ -62,12 +66,16 @@ class TargetParameterLoraWrapper(nn.Module):
     @property
     def in_features(self) -> int:
         parameter = self.base_parameter
-        return parameter.shape[-2] if parameter.ndim == 3 else parameter.shape[1]
+        if parameter.ndim == 3:
+            return parameter.shape[-1] if self.did_swap_in_out_features else parameter.shape[-2]
+        return parameter.shape[1]
 
     @property
     def out_features(self) -> int:
         parameter = self.base_parameter
-        return parameter.shape[-1] if parameter.ndim == 3 else parameter.shape[0]
+        if parameter.ndim == 3:
+            return parameter.shape[-2] if self.did_swap_in_out_features else parameter.shape[-1]
+        return parameter.shape[0]
 
     def _init_slots(self) -> None:
         parameter = self.base_parameter
@@ -143,6 +151,8 @@ class TargetParameterLoraWrapper(nn.Module):
 
         weight_A = weight_A.reshape(num_experts, r, self.in_features)
         weight_B = weight_B.reshape(self.out_features, r, num_experts)
+        if self.did_swap_in_out_features:
+            return torch.einsum('o r e, e r i -> e o i', weight_B, weight_A) * self.scaling[slot_name]
         return torch.einsum('o r e, e r i -> e i o', weight_B, weight_A) * self.scaling[slot_name]
 
     @contextmanager

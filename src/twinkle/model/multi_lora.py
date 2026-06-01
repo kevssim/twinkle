@@ -669,6 +669,8 @@ class MultiLora:
 
         def _load_weights(_module):
             for name, parameter in _module.named_parameters():
+                if self._is_target_parameter_lora_name(name):
+                    continue
                 if pattern.search(name) and self.match_target_modules(name, _lora.tenant_config.target_modules):
                     state_key = name.replace(f'.{_lora.adapter_name}.', '.')
                     target_tensor = self._read_param_tensor(parameter)
@@ -684,6 +686,7 @@ class MultiLora:
                 _load_weights(_module)
         else:
             _load_weights(self.module)
+        self.target_parameter_manager.set_state_dict(tenant_adapter_name, state_dict)
 
     def get_state_dict(self, tenant_adapter_name):
         state_dict = {}
@@ -693,6 +696,8 @@ class MultiLora:
         def _get_weights(_module):
             state_dict = {}
             for name, parameter in _module.named_parameters():
+                if self._is_target_parameter_lora_name(name):
+                    continue
                 if pattern.search(name) and self.match_target_modules(name, _lora.tenant_config.target_modules):
                     _param = self._slice_rank_tensor(name, self._read_param_tensor(parameter), _lora.tenant_config.r)
                     if _param is None:
@@ -706,6 +711,11 @@ class MultiLora:
                 state_dict.update(_get_weights(_module))
         else:
             state_dict = _get_weights(self.module)
+        target_state_dict = self.target_parameter_manager.get_state_dict(tenant_adapter_name)
+        overlap = state_dict.keys() & target_state_dict.keys()
+        if overlap:
+            raise ValueError(f'Duplicate LoRA state keys: {sorted(overlap)[:5]}')
+        state_dict.update(target_state_dict)
         return state_dict
 
     def _load_initial_weights(self, origin_adapter_name):

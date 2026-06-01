@@ -1,5 +1,8 @@
+import copy
+
 import torch
 from peft import LoraConfig, get_peft_model
+from peft.utils import set_peft_model_state_dict
 from torch import nn
 
 
@@ -126,3 +129,78 @@ def test_multilora_releases_target_parameter_slot_to_initial_weights():
                 assert torch.equal(param.detach(), initial_a[name])
             else:
                 assert torch.count_nonzero(param.detach()) == 0
+
+
+def test_target_parameter_state_dict_loads_with_peft():
+    from twinkle.model.multi_lora_target_parameters import TargetParameterLoraManager
+
+    torch.manual_seed(0)
+    model = FakeModel()
+    base_state = copy.deepcopy(model.state_dict())
+    cfg = _make_target_cfg(r=2)
+    manager = TargetParameterLoraManager(max_loras=2, max_r=4)
+    manager.patch(model, target_parameters=cfg.target_parameters)
+    manager.acquire("adapter_a", "lora_0", cfg)
+
+    with torch.no_grad():
+        for _, param in manager.named_slot_parameters("adapter_a"):
+            param.uniform_(-0.1, 0.1)
+
+    inputs = torch.randn(3, 4)
+    with manager.adapter("adapter_a"):
+        expected = model(inputs, expert_idx=0)
+    state = manager.get_state_dict("adapter_a")
+
+    peft_model = FakeModel()
+    peft_model.load_state_dict(base_state)
+    peft_model = get_peft_model(peft_model, cfg, adapter_name="default")
+    set_peft_model_state_dict(peft_model, state, adapter_name="default")
+
+    actual = peft_model(inputs, expert_idx=0)
+
+    assert torch.allclose(actual, expected, atol=1e-6)
+
+
+def _make_multilora_for_target_parameters(model):
+    from twinkle.model.multi_lora import LoraTenant, MultiLora
+
+    model.active_adapter = "lora_0"
+    model.set_adapter = lambda adapter_name: setattr(model, "active_adapter", adapter_name)
+    model.disable_adapter_layers = lambda: None
+    model.enable_adapter_layers = lambda: None
+    multi_lora = MultiLora(max_loras=2, max_r=4)
+    multi_lora.module = model
+    multi_lora.loras = [
+        LoraTenant(index=0, adapter_name="lora_0", config=_make_target_cfg(r=4)),
+        LoraTenant(index=1, adapter_name="lora_1", config=_make_target_cfg(r=4)),
+    ]
+    multi_lora.patch_target_parameters(model, _make_target_cfg().target_parameters)
+    return multi_lora
+
+
+def test_multilora_state_dict_round_trips_target_parameters():
+    torch.manual_seed(0)
+    model = FakeModel()
+    base_state = copy.deepcopy(model.state_dict())
+    multi_lora = _make_multilora_for_target_parameters(model)
+    multi_lora.acquire_lora("adapter_a", _make_target_cfg(r=2))
+
+    with torch.no_grad():
+        for _, param in multi_lora.target_parameter_manager.named_slot_parameters("adapter_a"):
+            param.uniform_(-0.1, 0.1)
+
+    inputs = torch.randn(3, 4)
+    with multi_lora.adapter("adapter_a"):
+        expected = model(inputs, expert_idx=0)
+    state = multi_lora.get_state_dict("adapter_a")
+
+    restored_model = FakeModel()
+    restored_model.load_state_dict(base_state)
+    restored = _make_multilora_for_target_parameters(restored_model)
+    restored.acquire_lora("adapter_a", _make_target_cfg(r=2))
+    restored.set_state_dict("adapter_a", state)
+
+    with restored.adapter("adapter_a"):
+        actual = restored_model(inputs, expert_idx=0)
+
+    assert torch.allclose(actual, expected, atol=1e-6)

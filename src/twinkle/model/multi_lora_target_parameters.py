@@ -47,6 +47,7 @@ class TargetParameterLoraWrapper(nn.Module):
         self.scaling: dict[str, float] = {}
         self.r: dict[str, int] = {}
         self._initial_lora_A: dict[str, torch.Tensor] = {}
+        self.peft_key_prefix = ''
         self._init_slots()
 
     @property
@@ -177,6 +178,37 @@ class TargetParameterLoraWrapper(nn.Module):
     def parameters_for_slot(self, slot_name: str) -> list[nn.Parameter]:
         return [parameter for _, parameter in self.named_slot_parameters(slot_name)]
 
+    def get_state_dict(self, slot_name: str) -> dict[str, torch.Tensor]:
+        r = self.r[slot_name]
+        rank_width = r * self.num_experts
+        return {
+            f'{self.peft_key_prefix}.lora_A.weight': self.lora_A[slot_name].weight[:rank_width, :].detach().clone(),
+            f'{self.peft_key_prefix}.lora_B.weight': self.lora_B[slot_name].weight[:, :rank_width].detach().clone(),
+        }
+
+    def set_state_dict(self, slot_name: str, state_dict: dict[str, torch.Tensor]) -> set[str]:
+        key_a = f'{self.peft_key_prefix}.lora_A.weight'
+        key_b = f'{self.peft_key_prefix}.lora_B.weight'
+        if key_a not in state_dict and key_b not in state_dict:
+            return set()
+        if key_a not in state_dict or key_b not in state_dict:
+            raise KeyError(f'Missing target-parameter LoRA pair for {self.peft_key_prefix}')
+
+        with torch.no_grad():
+            self.lora_A[slot_name].weight.zero_()
+            self.lora_B[slot_name].weight.zero_()
+            self.lora_A[slot_name].weight[:state_dict[key_a].shape[0], :].copy_(
+                state_dict[key_a].to(
+                    device=self.lora_A[slot_name].weight.device,
+                    dtype=self.lora_A[slot_name].weight.dtype,
+                ))
+            self.lora_B[slot_name].weight[:, :state_dict[key_b].shape[1]].copy_(
+                state_dict[key_b].to(
+                    device=self.lora_B[slot_name].weight.device,
+                    dtype=self.lora_B[slot_name].weight.dtype,
+                ))
+        return {key_a, key_b}
+
 
 class TargetParameterLoraManager:
 
@@ -215,7 +247,19 @@ class TargetParameterLoraManager:
             wrapper = TargetParameterLoraWrapper(record, max_loras=self.max_loras, max_r=self.max_r)
             record.module.add_module(f'_twinkle_lora_{record.parameter_name}', wrapper)
             self.wrappers.append(wrapper)
+        self._assign_peft_key_prefixes()
         self._target_parameters = target_parameters
+
+    def _assign_peft_key_prefixes(self) -> None:
+        wrappers_by_module: dict[str, list[TargetParameterLoraWrapper]] = {}
+        for wrapper in self.wrappers:
+            wrappers_by_module.setdefault(wrapper.record.module_name, []).append(wrapper)
+
+        for module_name, wrappers in wrappers_by_module.items():
+            module_prefix = f'base_model.model.{module_name}' if module_name else 'base_model.model'
+            for index, wrapper in enumerate(wrappers):
+                nested_prefix = '.'.join(['base_layer'] * (len(wrappers) - index - 1))
+                wrapper.peft_key_prefix = f'{module_prefix}.{nested_prefix}' if nested_prefix else module_prefix
 
     def acquire(self, tenant_adapter_name: str, slot_name: str, config: LoraConfig) -> None:
         if tenant_adapter_name in self.tenant_to_slot:
@@ -255,3 +299,17 @@ class TargetParameterLoraManager:
         slot_name = self.tenant_to_slot[tenant_adapter_name]
         for wrapper in self.wrappers:
             yield from wrapper.named_slot_parameters(slot_name)
+
+    def get_state_dict(self, tenant_adapter_name: str) -> dict[str, torch.Tensor]:
+        slot_name = self.tenant_to_slot[tenant_adapter_name]
+        state_dict = {}
+        for wrapper in self.wrappers:
+            state_dict.update(wrapper.get_state_dict(slot_name))
+        return state_dict
+
+    def set_state_dict(self, tenant_adapter_name: str, state_dict: dict[str, torch.Tensor]) -> set[str]:
+        slot_name = self.tenant_to_slot[tenant_adapter_name]
+        consumed_keys = set()
+        for wrapper in self.wrappers:
+            consumed_keys.update(wrapper.set_state_dict(slot_name, state_dict))
+        return consumed_keys

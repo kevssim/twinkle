@@ -160,6 +160,7 @@ Twinkle✨支持相同的算法接口运行在单GPU、torchrun多机、Ray、Cl
 |         | [deepseek-ai/DeepSeek-V4-Pro](https://modelscope.cn/models/deepseek-ai/DeepSeek-V4-Pro) | 1.6T| transformers>=5.8.0 | ✔  | [deepseek-ai/DeepSeek-V4-Pro](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro)|
 | Gemma4全系列 | [google/gemma-4-E2B](https://www.modelscope.cn/models/google/gemma-4-E2B) | 2.3B effective (5.1B with embeddings) | transformers>=5.8.0 | ✘ | [google/gemma-4-E2B · Hugging Face](https://huggingface.co/google/gemma-4-E2B) |
 |  | [google/gemma-4-E4B](https://www.modelscope.cn/models/google/gemma-4-E4B) | 4.5B effective (8B with embeddings) | transformers>=5.8.0 | ✘ | [google/gemma-4-E4B · Hugging Face](https://huggingface.co/google/gemma-4-E4B) |
+| | [google/gemma-4-12B](https://www.modelscope.cn/models/google/gemma-4-12B) | 11.95B | transformers>=5.10.1 | ✘ | [google/gemma-4-12B](https://huggingface.co/google/gemma-4-12B) |
 |  | [google/gemma-4-31B](https://www.modelscope.cn/models/google/gemma-4-31B) | 30.7B | transformers>=5.8.0 | ✘ | [google/gemma-4-31B · Hugging Face](https://huggingface.co/google/gemma-4-31B) |
 |  | [google/gemma-4-26B-A4B](https://www.modelscope.cn/models/google/gemma-4-26B-A4B) | 25.2B (Active 3.8B) | transformers>=5.8.0 | ✘ | [google/gemma-4-26B-A4B · Hugging Face](https://huggingface.co/google/gemma-4-26B-A4B) |
 

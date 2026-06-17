@@ -480,11 +480,14 @@ class MultiLora:
               *args,
               **kwargs):
         for i in range(self.max_loras):
-            config = LoraConfig(
-                r=self.max_r,
-                target_modules=target_modules,
-                lora_alpha=32,
-            )
+            config = kwargs.get("lora_config", None)
+            if config is None:
+                config = LoraConfig(
+                    r=self.max_r,
+                    target_modules=target_modules,
+                    lora_alpha=32,
+                    exclude_modules=['o_a_proj'],
+                )
             lora_tenant = LoraTenant(index=i, adapter_name=f'lora_{i}', config=config)
             self.loras.append(lora_tenant)
 

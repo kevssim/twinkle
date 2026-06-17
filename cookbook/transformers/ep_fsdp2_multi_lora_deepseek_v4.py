@@ -86,6 +86,8 @@ def train():
     dataset.encode(batched=True)
     dataloader = DataLoader(dataset=dataset, batch_size=BATCH_SIZE, device_mesh=device_mesh)
 
+    ep_lora_cfg = _build_lora_config(enable_ep=ENABLE_EP) # LoraConfig for target params
+    lora_cfg = _build_lora_config(enable_ep=False)  # LoraConfig for PEFT adapter
     model = MultiLoraTransformersModel(
         model_id=MODEL_ID,
         config=config,
@@ -101,10 +103,11 @@ def train():
                 'keep_router_logits': False,
             }
         },
+        lora_config=lora_cfg,
     )
-    lora_cfg = _build_lora_config(ENABLE_EP)
+    
     for adapter_name in ADAPTER_NAMES:
-        model.add_adapter_to_model(adapter_name, lora_cfg, gradient_accumulation_steps=GRAD_ACCUM_STEPS)
+        model.add_adapter_to_model(adapter_name, ep_lora_cfg, gradient_accumulation_steps=GRAD_ACCUM_STEPS)
         model.set_optimizer('AdamW', lr=LR, foreach=False, adapter_name=adapter_name)
         model.set_lr_scheduler(
             scheduler_cls='CosineWarmupScheduler',

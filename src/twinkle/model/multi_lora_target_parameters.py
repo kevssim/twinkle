@@ -93,14 +93,14 @@ class TargetParameterLoraWrapper(nn.Module):
                 self.in_features,
                 self.max_r * self.num_experts,
                 bias=False,
-                device=parameter.device,
+                device=device,
                 dtype=parameter.dtype,
             )
             self.lora_B[slot_name] = nn.Linear(
                 self.max_r * self.num_experts,
                 self.out_features,
                 bias=False,
-                device=parameter.device,
+                device=device,
                 dtype=parameter.dtype,
             )
             self.r[slot_name] = self.max_r

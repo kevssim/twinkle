@@ -32,6 +32,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
             strategy: Literal['accelerate', 'native_fsdp'] = 'accelerate',
             ddp_config: Dict[str, Any] = None,
             fsdp_config: Dict[str, Any] = None,
+            lora_config: Dict[str, Any] = None,
             grad_scaler_config: Dict[str, Any] = None,
             memory_efficient_init: bool = False,
             max_loras: int = 5,
@@ -49,6 +50,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         self._memory_efficient_init = memory_efficient_init
         self._decide_strategy(strategy)
         self.grad_scaler_config = grad_scaler_config
+        self.lora_config = lora_config or {}
         if model_id is not None:
             model_id = HubOperation.download_model(model_id)
         self.model_id = model_id
@@ -79,7 +81,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         self.optimizer_group: Dict[str, OptimizerGroup] = {}
         self.multi_adapter = MultiLora(max_loras=max_loras, max_r=max_r, max_length=max_length)
         self.model.gradient_checkpointing_enable()
-        self.model = self.multi_adapter.patch(self.model, target_modules=target_modules)
+        self.model = self.multi_adapter.patch(self.model, target_modules=target_modules, lora_config=self.lora_config)
         self.multi_adapter.save_initial_weights()
         # Active group for compatibility with single adapter
         self.active_group = None

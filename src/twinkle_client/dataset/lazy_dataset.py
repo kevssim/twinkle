@@ -91,7 +91,7 @@ class LazyDataset(Dataset):
         return response.json()["result"]
     
 
-    def encode(self, add_generation_prompt: bool = False, **kwargs):
+    def encode(self, add_generation_prompt: bool = False, timeout: int = 600, **kwargs):
         response = http_post(
             url=f'{self.server_url}/call',
             json_data={
@@ -99,7 +99,8 @@ class LazyDataset(Dataset):
                 'function': 'encode',
                 **{'add_generation_prompt': add_generation_prompt},
                 **kwargs
-            }
+            },
+            timeout=timeout
         )
         response.raise_for_status()
         return response.json()["result"]

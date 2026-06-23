@@ -261,15 +261,29 @@ def generate_processors():
             lines.append('')
             return lines, inheritance
 
+        def _inject_timeout(signature: str) -> str:
+            """Insert `timeout: int = 600` before any **kwargs in the signature."""
+            if ', **' in signature:
+                pre, post = signature.rsplit(', **', 1)
+                return f'{pre}, timeout: int = 600, **{post}'
+            if signature.startswith('**'):
+                return f'timeout: int = 600, {signature}'
+            if signature:
+                return f'{signature}, timeout: int = 600'
+            return 'timeout: int = 600'
+
         def build_method(name: str, signature: str) -> str:
             param_names = parse_params_from_signature(signature)
             kwargs_dict = '{' + ', '.join(f"'{p}': {p}" for p in param_names) + '}' if param_names else '{}'
-            sig_part = f', {signature}' if signature else ''
+            wants_timeout = name == 'encode'
+            effective_sig = _inject_timeout(signature) if wants_timeout else signature
+            sig_part = f', {effective_sig}' if effective_sig else ''
             if 'kwargs' in sig_part:
                 extra_args = '\n                **kwargs'
             else:
                 extra_args = ''
             ret = 'self' if name == '__iter__' else 'response.json()["result"]'
+            timeout_kwarg = ',\n            timeout=timeout' if wants_timeout else ''
 
             code = f'''
     def {name}(self{sig_part}):
@@ -279,7 +293,7 @@ def generate_processors():
                 'processor_id': self.processor_id,
                 'function': '{name}',
                 **{kwargs_dict},{extra_args}
-            }}
+            }}{timeout_kwarg}
         )
         response.raise_for_status()
         return {ret}

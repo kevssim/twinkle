@@ -12,12 +12,15 @@ from torch import nn
 
 class LoraParameterProxy(nn.Module):
 
-    def __init__(self, delta_weight: torch.Tensor):
+    def __init__(self, LoraWrapper, slot_name):
         super().__init__()
-        self.delta_weight = delta_weight
+        self.LoraWrapper = LoraWrapper
+        self.slot_name = slot_name
 
     def forward(self, weight: torch.Tensor) -> torch.Tensor:
-        return weight + self.delta_weight.to(device=weight.device, dtype=weight.dtype)
+        delta_weight = self.LoraWrapper.get_delta_weight(self.slot_name)
+        mix_weight = weight + delta_weight
+        return mix_weight 
 
 
 @dataclass
@@ -38,12 +41,23 @@ class TargetParameterLoraWrapper(nn.Module):
     def __init__(self, record: TargetParameterRecord, max_loras: int, max_r: int):
         super().__init__()
         self.record = record
+        # Unsharded original target parameter (pre-sharding snapshot)
+        parameter = getattr(self.record.module, self.record.parameter_name)
+        self.original_parameter = parameter.clone()
+        # Cache invariant attributes that won't change after initialization
+        self.did_swap_in_out_features = parameter.ndim == 3 and not getattr(self.record.module, 'is_transposed', False)
+        if parameter.ndim == 3:
+            self.in_features = parameter.shape[-1] if self.did_swap_in_out_features else parameter.shape[-2]
+            self.out_features = parameter.shape[-2] if self.did_swap_in_out_features else parameter.shape[-1]
+        else:
+            self.out_features, self.in_features = parameter.shape[0], parameter.shape[1]
+    
         self.max_loras = max_loras
         self.max_r = max_r
         self.active_adapter: str | None = None
         self.disable_adapters = False
-        self.lora_A = nn.ModuleDict()
-        self.lora_B = nn.ModuleDict()
+        self.lora_A = nn.ParameterDict()
+        self.lora_B = nn.ParameterDict()
         self.scaling: dict[str, float] = {}
         self.r: dict[str, int] = {}
         self._initial_lora_A: dict[str, torch.Tensor] = {}
@@ -55,27 +69,16 @@ class TargetParameterLoraWrapper(nn.Module):
         return getattr(self.record.module, self.record.parameter_name)
 
     @property
-    def did_swap_in_out_features(self) -> bool:
-        return self.base_parameter.ndim == 3 and not getattr(self.record.module, 'is_transposed', False)
-
-    @property
     def num_experts(self) -> int:
+        # Check if the module has EP sharding info (for tensor experts)
+        if hasattr(self.record.module, '_ep_local_end') and hasattr(self.record.module, '_ep_local_start'):
+            return self.record.module._ep_local_end - self.record.module._ep_local_start    # 在wrap_model的ep切分后会设置
+        # Check if the module has EP sharding info (for ModuleList experts)
+        if hasattr(self.record.module, '_ep_experts_per_rank'):
+            return self.record.module._ep_experts_per_rank
+        # Fallback to base parameter shape
         parameter = self.base_parameter
         return parameter.shape[0] if parameter.ndim == 3 else 1
-
-    @property
-    def in_features(self) -> int:
-        parameter = self.base_parameter
-        if parameter.ndim == 3:
-            return parameter.shape[-1] if self.did_swap_in_out_features else parameter.shape[-2]
-        return parameter.shape[1]
-
-    @property
-    def out_features(self) -> int:
-        parameter = self.base_parameter
-        if parameter.ndim == 3:
-            return parameter.shape[-2] if self.did_swap_in_out_features else parameter.shape[-1]
-        return parameter.shape[0]
 
     def _init_slots(self) -> None:
         parameter = self.base_parameter
@@ -89,19 +92,23 @@ class TargetParameterLoraWrapper(nn.Module):
             device = "cpu"
         for index in range(self.max_loras):
             slot_name = f'lora_{index}'
-            self.lora_A[slot_name] = nn.Linear(
-                self.in_features,
-                self.max_r * self.num_experts,
-                bias=False,
-                device=device,
-                dtype=parameter.dtype,
+            self.lora_A[slot_name] = nn.Parameter(
+                torch.empty(
+                    self.num_experts,
+                    self.max_r,        
+                    self.in_features, 
+                    device=device,
+                    dtype=parameter.dtype,
+                )
             )
-            self.lora_B[slot_name] = nn.Linear(
-                self.max_r * self.num_experts,
-                self.out_features,
-                bias=False,
-                device=device,
-                dtype=parameter.dtype,
+            self.lora_B[slot_name] = nn.Parameter(
+                torch.empty(
+                    self.num_experts,  
+                    self.out_features,
+                    self.max_r,
+                    device=device,
+                    dtype=parameter.dtype,
+                )
             )
             self.r[slot_name] = self.max_r
             self.scaling[slot_name] = 1.0
@@ -109,15 +116,15 @@ class TargetParameterLoraWrapper(nn.Module):
 
     def reset_slot(self, slot_name: str) -> None:
         if slot_name not in self._initial_lora_A:
-            nn.init.kaiming_uniform_(self.lora_A[slot_name].weight, a=math.sqrt(5))
-            self._initial_lora_A[slot_name] = self.lora_A[slot_name].weight.detach().clone().cpu()
+            nn.init.kaiming_uniform_(self.lora_A[slot_name], a=math.sqrt(5))
+            self._initial_lora_A[slot_name] = self.lora_A[slot_name].detach().clone().cpu()
         else:
             initial = self._initial_lora_A[slot_name].to(
-                device=self.lora_A[slot_name].weight.device,
-                dtype=self.lora_A[slot_name].weight.dtype,
+                device=self.lora_A[slot_name].device,
+                dtype=self.lora_A[slot_name].dtype,
             )
-            self.lora_A[slot_name].weight.data.copy_(initial)
-        nn.init.zeros_(self.lora_B[slot_name].weight)
+            self.lora_A[slot_name].data.copy_(initial)
+        nn.init.zeros_(self.lora_B[slot_name])
 
     def configure_slot(self, slot_name: str, config: LoraConfig) -> None:
         if slot_name not in self.lora_A:
@@ -147,17 +154,22 @@ class TargetParameterLoraWrapper(nn.Module):
 
         r = self.r[slot_name]
         num_experts = self.num_experts
-        weight_A = self.lora_A[slot_name].weight[:r * num_experts, :]
-        weight_B = self.lora_B[slot_name].weight[:, :r * num_experts]
+        if hasattr(self.record.module, '_ep_local_start'):
+            # EP sharded: use full sharded weights
+            weight_A = self.lora_A[slot_name][:, :r, :]
+            weight_B = self.lora_B[slot_name][:, :, :r]
+        else:
+            # Not sharded: slice to actual rank
+            weight_A = self.lora_A[slot_name][:num_experts, :r, :]
+            weight_B = self.lora_B[slot_name][:num_experts, :, :r]
 
-        if self.base_parameter.ndim == 2:
+        # Don't call base_parameter during LoRA injection (infinite recursion risk)
+        if self.original_parameter.ndim == 2:
             return (weight_B @ weight_A) * self.scaling[slot_name]
 
-        weight_A = weight_A.reshape(num_experts, r, self.in_features)
-        weight_B = weight_B.reshape(self.out_features, r, num_experts)
         if self.did_swap_in_out_features:
-            return torch.einsum('o r e, e r i -> e o i', weight_B, weight_A) * self.scaling[slot_name]
-        return torch.einsum('o r e, e r i -> e i o', weight_B, weight_A) * self.scaling[slot_name]
+            return torch.einsum('e o r, e r i -> e o i', weight_B, weight_A) * self.scaling[slot_name]
+        return torch.einsum('e o r, e r i -> e i o', weight_B, weight_A) * self.scaling[slot_name]
 
     @contextmanager
     def activate(self, slot_name: str | None, disable_lora: bool = False):
@@ -169,12 +181,13 @@ class TargetParameterLoraWrapper(nn.Module):
         param_name = self.record.parameter_name
         already_parametrized = nn.utils.parametrize.is_parametrized(module, param_name)
         if not already_parametrized:
-            delta_weight = self.get_delta_weight(slot_name) # lora_weight = B @ A * scaling
+            # LoRA weights change after EP + FSDP sharding, so they must be computed dynamically and cannot be pre-fixed.
+            # delta_weight = self.get_delta_weight(slot_name) # lora_weight = B @ A * scaling
             requires_grad_before = self.base_parameter.requires_grad
             nn.utils.parametrize.register_parametrization(
                 self.record.module,
                 self.record.parameter_name,
-                LoraParameterProxy(delta_weight),
+                LoraParameterProxy(self, slot_name),
             )
             module.parametrizations[param_name].original.requires_grad_(requires_grad_before)
         try:
@@ -191,8 +204,8 @@ class TargetParameterLoraWrapper(nn.Module):
     def named_slot_parameters(self, slot_name: str) -> Iterator[tuple[str, nn.Parameter]]:
         if slot_name not in self.lora_A:
             return
-        yield f'{self.record.key}.lora_A.{slot_name}.weight', self.lora_A[slot_name].weight
-        yield f'{self.record.key}.lora_B.{slot_name}.weight', self.lora_B[slot_name].weight
+        yield f'{self.record.key}.lora_A.{slot_name}.weight', self.lora_A[slot_name]
+        yield f'{self.record.key}.lora_B.{slot_name}.weight', self.lora_B[slot_name]
 
     def parameters_for_slot(self, slot_name: str) -> list[nn.Parameter]:
         return [parameter for _, parameter in self.named_slot_parameters(slot_name)]
@@ -201,8 +214,8 @@ class TargetParameterLoraWrapper(nn.Module):
         r = self.r[slot_name]
         rank_width = r * self.num_experts
         return {
-            f'{self.peft_key_prefix}.lora_A.weight': self.lora_A[slot_name].weight[:rank_width, :].detach().clone(),
-            f'{self.peft_key_prefix}.lora_B.weight': self.lora_B[slot_name].weight[:, :rank_width].detach().clone(),
+            f'{self.peft_key_prefix}.lora_A.weight': self.lora_A[slot_name][:rank_width, :].detach().clone(),
+            f'{self.peft_key_prefix}.lora_B.weight': self.lora_B[slot_name][:, :rank_width].detach().clone(),
         }
 
     def set_state_dict(self, slot_name: str, state_dict: dict[str, torch.Tensor]) -> set[str]:
@@ -214,17 +227,17 @@ class TargetParameterLoraWrapper(nn.Module):
             raise KeyError(f'Missing target-parameter LoRA pair for {self.peft_key_prefix}')
 
         with torch.no_grad():
-            self.lora_A[slot_name].weight.zero_()
-            self.lora_B[slot_name].weight.zero_()
-            self.lora_A[slot_name].weight[:state_dict[key_a].shape[0], :].copy_(
+            self.lora_A[slot_name].zero_()
+            self.lora_B[slot_name].zero_()
+            self.lora_A[slot_name][:state_dict[key_a].shape[0], :].copy_(
                 state_dict[key_a].to(
-                    device=self.lora_A[slot_name].weight.device,
-                    dtype=self.lora_A[slot_name].weight.dtype,
+                    device=self.lora_A[slot_name].device,
+                    dtype=self.lora_A[slot_name].dtype,
                 ))
-            self.lora_B[slot_name].weight[:, :state_dict[key_b].shape[1]].copy_(
+            self.lora_B[slot_name][:, :state_dict[key_b].shape[1]].copy_(
                 state_dict[key_b].to(
-                    device=self.lora_B[slot_name].weight.device,
-                    dtype=self.lora_B[slot_name].weight.dtype,
+                    device=self.lora_B[slot_name].device,
+                    dtype=self.lora_B[slot_name].dtype,
                 ))
         return {key_a, key_b}
 

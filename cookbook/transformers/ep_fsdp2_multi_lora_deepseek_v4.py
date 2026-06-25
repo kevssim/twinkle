@@ -134,6 +134,9 @@ def train():
         f'Total steps: {len(dataloader)}, batch_size={BATCH_SIZE}, grad_accum={GRAD_ACCUM_STEPS}, '
         f'enable_ep={ENABLE_EP}, adapters={ADAPTER_NAMES}, output_dir={OUTPUT_DIR}')
 
+    # After LoRA init, before forward (LoRA active): perform EP + FSDP broadcast & sharding.
+    model._lazy_wrap_model()
+    
     for batch_idx, batch in enumerate(dataloader):
         if callable(batch):
             batch = batch()

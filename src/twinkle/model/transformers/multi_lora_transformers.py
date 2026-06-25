@@ -113,6 +113,11 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
 
     def _lazy_wrap_model(self):
         return super()._lazy_wrap_model()
+    
+    def _maybe_apply_expert_parallel(self):
+        if self._memory_efficient_init:
+            raise NotImplementedError('Expert parallel is not supported with memory_efficient_init')
+        return super()._maybe_apply_expert_parallel()
 
     def _ensure_target_parameter_lora_installed(self, config: LoraConfig) -> None:
         target_parameters = getattr(config, 'target_parameters', None)
@@ -122,7 +127,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
             raise RuntimeError('target_parameters LoRA must be installed before FSDP/DDP wrapping')
         if getattr(self, '_enable_expert_parallel', False):
             self.strategy.capture_pre_ep_state_if_needed(self.model, enable_ep=True)
-            self._maybe_apply_expert_parallel()
+            # self._maybe_apply_expert_parallel()   # 各rank广播之前不能对moe层进行分片, 没有实际权重时不能分片
         self.multi_adapter.patch_target_parameters(self.model, target_parameters)
 
     @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)

@@ -113,3 +113,37 @@ def _load_hub_ref(ref: HubRef):
     if impl is None:
         raise ValueError(f'Layer {ref.layer_name!r} not found in {ref.repo_id!r}.')
     return impl
+
+
+def kernelize(model: nn.Module, mapping: dict) -> nn.Module:
+    """Apply ``mapping`` to ``model`` and return it (modified in place).
+
+    Keys:
+      - ``type[nn.Module]``: replace ``m.__class__`` for every module of the
+        exact type (no subclass walking).
+      - ``str`` (dotted path ``pkg.mod.attr``): ``setattr`` the impl onto the
+        identified module attribute.
+
+    Values:
+      - ``dict[str, V]``: device-conditional dispatch using
+        ``next(model.parameters()).device.type``; non-matching devices skip.
+      - ``HubRef``: lazy-resolved via the optional ``kernels`` package.
+      - anything else: used directly as the impl.
+    """
+    if not mapping:
+        return model
+
+    device = _infer_device(model)
+    for key, value in mapping.items():
+        impl = _resolve_value(value, device)
+        if impl is None:
+            continue
+        if isinstance(impl, HubRef):
+            impl = _load_hub_ref(impl)
+        if isinstance(key, type) and issubclass(key, nn.Module):
+            _replace_class(model, key, impl)
+        elif isinstance(key, str):
+            _replace_attr(key, impl)
+        else:
+            raise TypeError(f'Unsupported mapping key: {key!r}')
+    return model

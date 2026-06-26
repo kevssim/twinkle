@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import torch.nn as nn
+
 
 @dataclass(frozen=True)
 class HubRef:
@@ -41,3 +43,12 @@ def hub(
         raise ValueError(f"Hub ref must be 'repo_id:LayerName', got: {ref!r}")
     repo_id, layer_name = ref.rsplit(':', 1)
     return HubRef(repo_id, layer_name, revision, version, backend, trust_remote_code)
+
+
+def _infer_device(model: nn.Module) -> str:
+    """Infer the device type from the first parameter, then first buffer, else cpu."""
+    for p in model.parameters():
+        return p.device.type
+    for b in model.buffers():
+        return b.device.type
+    return 'cpu'

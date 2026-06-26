@@ -17,7 +17,7 @@ from twinkle.dataset import Dataset, DatasetMeta
 from twinkle.model import TransformersModel
 from twinkle.preprocessor import SelfCognitionProcessor
 from twinkle.utils.framework import Torch
-from twinkle.kernel import kernelize_model
+from twinkle.kernel import kernelize, npu_builtin
 
 logger = get_logger()
 
@@ -106,7 +106,7 @@ def train():
     )
     # npu patch
     if Torch.is_npu_available():
-        model = kernelize_model(model, mode='train', device='npu')
+        model = kernelize(model, npu_builtin(model))
     lora_cfg = _build_lora_config(ENABLE_EP)
     model.add_adapter_to_model(ADAPTER_NAME, lora_cfg, gradient_accumulation_steps=GRAD_ACCUM_STEPS)
     model.set_optimizer('AdamW', lr=LR, foreach=False)

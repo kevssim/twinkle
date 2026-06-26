@@ -6,6 +6,7 @@ Public API: ``kernelize``, ``hub`` (re-exported from ``twinkle.kernel``).
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import torch.nn as nn
 
@@ -52,3 +53,16 @@ def _infer_device(model: nn.Module) -> str:
     for b in model.buffers():
         return b.device.type
     return 'cpu'
+
+
+def _resolve_value(value: Any, device: str) -> Any | None:
+    """Resolve a mapping value against the inferred device.
+
+    - ``dict``: device-conditional; recurse into ``value[device]`` or return None.
+    - anything else (including ``HubRef``): pass through.
+    """
+    if isinstance(value, dict):
+        if device not in value:
+            return None
+        return _resolve_value(value[device], device)
+    return value

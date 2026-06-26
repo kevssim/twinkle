@@ -48,12 +48,12 @@ from transformers.models.qwen2.modeling_qwen2 import Qwen2MLP
 
 # 1) 从本地仓库注册层内核
 register_layer_kernel(
-    kernel_name="MyAwesomeMLP",
-    repo_path="/path/to/local/repo",
-    package_name="my_kernels",
-    layer_name="Qwen2MLPTrainingKernel",
-    device="cuda",
-    mode="train",
+    kernel_name="MyAwesomeMLP",/取的kernel名字，自定义
+    repo_path="/path/to/local/repo",/本地kernel仓库路径
+    package_name="my_kernels",/包名
+    layer_name="Qwen2MLPTrainingKernel",/对应layer.py里面实现类的名字
+    device="cuda",/适用的设备类型
+    mode="train",/使用的场景：train or inference
 )
 
 # 2) 绑定外部层与内核名

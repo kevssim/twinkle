@@ -46,3 +46,15 @@ def test_npu_builtin_skips_missing_modeling_modules():
     from twinkle.kernel.builtin import npu_builtin
     bundle = npu_builtin()  # must not raise
     assert isinstance(bundle, dict)
+
+
+def test_npu_builtin_does_not_overwrite_global_sdpa_on_non_npu_host():
+    """Calling npu_builtin() on a CUDA/CPU host must not contaminate the
+    global HF SDPA registry. The NPU impl inverts boolean masks, which is
+    wrong for non-NPU execution."""
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+    from twinkle.kernel.builtin import npu_builtin
+
+    original = ALL_ATTENTION_FUNCTIONS.get('sdpa')
+    npu_builtin()
+    assert ALL_ATTENTION_FUNCTIONS.get('sdpa') is original

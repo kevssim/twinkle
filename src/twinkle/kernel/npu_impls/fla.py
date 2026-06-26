@@ -42,7 +42,20 @@ def apply_qwen3_5_fla(model=None) -> int:
         logger.info('[NPU] [FLA] Skip: torch_npu unavailable')
         return 0
 
-    # 1. Force FLA availability flags on transformers utility modules
+    # 1. Confirm the MindSpeed Triton kernel is actually importable BEFORE
+    #    flipping any global availability flags. If we flip the flag and then
+    #    fail to install the kernel, HF transformers would route Qwen3.5 onto
+    #    a FLA fast path whose kernel is missing -> runtime failure on NPU.
+    try:
+        from twinkle.kernel.chunk_gated_delta_rule import chunk_gated_delta_rule as mindspeed_fla
+    except ImportError as exc:
+        logger.warning('[NPU] [FLA] MindSpeed unavailable: %s', exc)
+        return 0
+
+    from twinkle.kernel.causal_conv1d import npu_causal_conv1d_fn
+
+    # 2. Only now can we safely claim FLA is available: flip the global flags
+    #    and install the kernel path on Qwen3.5 modeling modules.
     def _is_fla_available() -> bool:
         return True
 
@@ -51,15 +64,6 @@ def apply_qwen3_5_fla(model=None) -> int:
         if utils_mod is not None:
             setattr(utils_mod, 'is_flash_linear_attention_available', _is_fla_available)
 
-    # 2. Try to load MindSpeed Triton kernel
-    try:
-        from twinkle.kernel.chunk_gated_delta_rule import chunk_gated_delta_rule as mindspeed_fla
-    except ImportError as exc:
-        logger.warning('[NPU] [FLA] MindSpeed unavailable: %s', exc)
-        mindspeed_fla = None
-
-    from twinkle.kernel.causal_conv1d import npu_causal_conv1d_fn
-
     # 3. Patch Qwen3.5 modeling modules
     fla_target_modules = [
         'transformers.models.qwen3_5.modeling_qwen3_5',
@@ -67,7 +71,7 @@ def apply_qwen3_5_fla(model=None) -> int:
     ]
     for module_name in fla_target_modules:
         module = _import_optional(module_name)
-        if module is None or mindspeed_fla is None:
+        if module is None:
             continue
         setattr(module, 'is_flash_linear_attention_available', _is_fla_available)
         setattr(module, 'is_fast_path_available', True)
@@ -76,7 +80,7 @@ def apply_qwen3_5_fla(model=None) -> int:
         setattr(module, 'chunk_gated_delta_rule', mindspeed_fla)
 
     # 4. Traverse model and patch per-layer attributes
-    if model is None or mindspeed_fla is None:
+    if model is None:
         return 0
 
     root = getattr(model, 'model', getattr(model, 'module', model))

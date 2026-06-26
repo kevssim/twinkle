@@ -46,15 +46,16 @@ def npu_builtin(model: nn.Module | None = None) -> dict[Any, dict[str, Any]]:
 
     bundle: dict[Any, dict[str, Any]] = {}
 
-    # SDPA attention (global)
-    bundle['transformers.modeling_utils.ALL_ATTENTION_FUNCTIONS'] = {'npu': _SdpaPatchSentinel()}
-    # NOTE: ALL_ATTENTION_FUNCTIONS is a dict, not a function. We can't setattr
-    # it. We instead install the sdpa entry by a small bootstrap below.
-    # Remove the sentinel approach in favor of explicit module-level entries:
-    bundle.pop('transformers.modeling_utils.ALL_ATTENTION_FUNCTIONS', None)
-
-    # Apply SDPA install eagerly (one-shot module-level mutation).
-    _install_sdpa(npu_sdpa_attention_forward)
+    # Apply SDPA install eagerly (one-shot module-level mutation) — only on
+    # NPU hosts. The NPU impl inverts boolean masks, which is wrong for
+    # CUDA/CPU execution, so we must not contaminate the global HF registry
+    # when ``npu_builtin()`` is constructed on a non-NPU machine.
+    try:
+        import torch_npu  # noqa: F401
+    except ImportError:
+        pass
+    else:
+        _install_sdpa(npu_sdpa_attention_forward)
 
     # === per-family class + function entries ===
     _add_qwen2_entries(bundle, NpuRMSNorm, npu_apply_rotary_pos_emb, npu_swiglu_forward)
@@ -81,10 +82,6 @@ def npu_builtin(model: nn.Module | None = None) -> dict[Any, dict[str, Any]]:
     apply_qwen3_5_fla(model)
 
     return bundle
-
-
-class _SdpaPatchSentinel:
-    pass  # unused; placeholder retained for clarity in diffs
 
 
 def _install_sdpa(impl) -> None:

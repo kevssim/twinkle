@@ -11,6 +11,8 @@ from typing import Any
 
 import torch.nn as nn
 
+from twinkle.utils.device_mesh import Platform
+
 
 @dataclass(frozen=True)
 class HubRef:
@@ -47,17 +49,9 @@ def hub(
     return HubRef(repo_id, layer_name, revision, version, backend, trust_remote_code)
 
 
-def _infer_device(model: nn.Module) -> str:
-    """Infer the device type from the first parameter, then first buffer, else cpu."""
-    for p in model.parameters():
-        return p.device.type
-    for b in model.buffers():
-        return b.device.type
-    return 'cpu'
-
 
 def _resolve_value(value: Any, device: str) -> Any | None:
-    """Resolve a mapping value against the inferred device.
+    """Resolve a mapping value against the selected device.
 
     - ``dict``: device-conditional; recurse into ``value[device]`` or return None.
     - anything else (including ``HubRef``): pass through.
@@ -153,15 +147,15 @@ def kernelize(model: nn.Module, mapping: dict) -> nn.Module:
         identified module attribute.
 
     Values:
-      - ``dict[str, V]``: device-conditional dispatch using
-        ``next(model.parameters()).device.type``; non-matching devices skip.
+      - ``dict[str, V]``: device-conditional dispatch using the current
+        Twinkle platform device prefix; non-matching devices skip.
       - ``HubRef``: lazy-resolved via the optional ``kernels`` package.
       - anything else: used directly as the impl.
     """
     if not mapping:
         return model
 
-    device = _infer_device(model)
+    device = Platform.device_prefix()
     for key, value in mapping.items():
         impl = _resolve_value(value, device)
         if impl is None:

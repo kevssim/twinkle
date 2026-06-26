@@ -18,6 +18,7 @@ from typing import Any
 import torch.nn as nn
 
 from twinkle import get_logger
+from twinkle.utils.device_mesh import Platform
 
 logger = get_logger()
 
@@ -46,15 +47,13 @@ def npu_builtin(model: nn.Module | None = None) -> dict[Any, dict[str, Any]]:
 
     bundle: dict[Any, dict[str, Any]] = {}
 
-    # Apply SDPA install eagerly (one-shot module-level mutation) — only on
-    # NPU hosts. The NPU impl inverts boolean masks, which is wrong for
-    # CUDA/CPU execution, so we must not contaminate the global HF registry
-    # when ``npu_builtin()`` is constructed on a non-NPU machine.
-    try:
-        import torch_npu  # noqa: F401
-    except ImportError:
-        pass
-    else:
+    is_npu_platform = Platform.device_prefix() == 'npu'
+
+    # Apply SDPA install eagerly (one-shot module-level mutation) on NPU
+    # platforms. The NPU impl inverts boolean masks, which is wrong for
+    # CUDA/CPU execution, so non-NPU platforms must not mutate the global HF
+    # registry even if ``torch_npu`` is importable in the environment.
+    if is_npu_platform:
         _install_sdpa(npu_sdpa_attention_forward)
 
     # === per-family class + function entries ===
@@ -79,7 +78,8 @@ def npu_builtin(model: nn.Module | None = None) -> dict[Any, dict[str, Any]]:
     )
 
     # === FLA (side-effect; mapping-incompatible) ===
-    apply_qwen3_5_fla(model)
+    if is_npu_platform:
+        apply_qwen3_5_fla(model)
 
     return bundle
 

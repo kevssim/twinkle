@@ -5,6 +5,7 @@ Public API: ``kernelize``, ``hub`` (re-exported from ``twinkle.kernel``).
 """
 from __future__ import annotations
 
+import importlib
 from dataclasses import dataclass
 from typing import Any
 
@@ -66,3 +67,23 @@ def _resolve_value(value: Any, device: str) -> Any | None:
             return None
         return _resolve_value(value[device], device)
     return value
+
+
+def _replace_class(model: nn.Module, target_cls: type, impl_cls: type) -> None:
+    """Rewrite ``__class__`` of every module whose exact type is ``target_cls``.
+
+    Uses ``type(m) is target_cls`` (not ``isinstance``) so user-defined
+    subclasses of ``target_cls`` are deliberately left alone.
+    """
+    for m in model.modules():
+        if type(m) is target_cls:
+            m.__class__ = impl_cls
+
+
+def _replace_attr(dotted_path: str, impl) -> None:
+    """``setattr`` ``impl`` onto the module identified by the dotted path's prefix."""
+    module_path, _, attr = dotted_path.rpartition('.')
+    if not module_path or not attr:
+        raise ValueError(f"Expected 'pkg.module.attr', got: {dotted_path!r}")
+    module = importlib.import_module(module_path)
+    setattr(module, attr, impl)

@@ -15,6 +15,7 @@ from .moe import (
     npu_packed_moe_experts_forward,
     npu_qwen3_5_moe_sparse_block_forward,
 )
+from .fla import apply_qwen3_5_fla
 
 __all__ = [
     'NpuRMSNorm',
@@ -27,4 +28,5 @@ __all__ = [
     'npu_grouped_mm',
     'npu_packed_moe_experts_forward',
     'npu_qwen3_5_moe_sparse_block_forward',
+    'apply_qwen3_5_fla',
 ]

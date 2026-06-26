@@ -111,13 +111,14 @@ def train():
 
     if RESUME_FROM_CHECKPOINT:
         checkpoint_path = Path(RESUME_FROM_CHECKPOINT).expanduser().resolve()
+        progress = None
         for adapter_name in ADAPTER_NAMES:
             progress = model.resume_from_checkpoint(
                 str(checkpoint_path),
                 resume_only_model=RESUME_ONLY_MODEL,
                 adapter_name=adapter_name,
             )
-        if not IGNORE_DATA_SKIP:
+        if progress and not IGNORE_DATA_SKIP:
             dataloader.resume_from_checkpoint(progress['consumed_train_samples'])
 
     logger.info(get_device_placement())
@@ -141,26 +142,27 @@ def train():
             adapter_name=adapter_name,
         )
     
-    for batch_idx, batch in enumerate(dataloader):
-        if callable(batch):
-            batch = batch()
-        adapter_name = ADAPTER_NAMES[batch_idx % len(ADAPTER_NAMES)]
-        model.forward_backward(
-            inputs=batch,
-            adapter_name=adapter_name,
-            gradient_accumulation_steps=GRAD_ACCUM_STEPS,
-        )
-        model.clip_grad_and_step(
-            max_grad_norm=MAX_GRAD_NORM,
-            adapter_name=adapter_name,
-            gradient_accumulation_steps=GRAD_ACCUM_STEPS,
-        )
-        cur_step = model.optimizer_group[adapter_name].cur_step
-        if cur_step > 0 and cur_step % LOG_INTERVAL == 0:
-            metric = model.calculate_metric(is_training=True, adapter_name=adapter_name)
-            if callable(metric):
-                metric = metric()
-            logger.info(f'Adapter {adapter_name} is at step {cur_step} of {len(dataloader)}, metric: {metric}')
+    for adapter_name in ADAPTER_NAMES:
+        for batch_idx, batch in enumerate(dataloader):
+            if callable(batch):
+                batch = batch()
+            # adapter_name = ADAPTER_NAMES[batch_idx % len(ADAPTER_NAMES)]
+            model.forward_backward(
+                inputs=batch,
+                adapter_name=adapter_name,
+                gradient_accumulation_steps=GRAD_ACCUM_STEPS,
+            )
+            model.clip_grad_and_step(
+                max_grad_norm=MAX_GRAD_NORM,
+                adapter_name=adapter_name,
+                gradient_accumulation_steps=GRAD_ACCUM_STEPS,
+            )
+            cur_step = model.optimizer_group[adapter_name].cur_step
+            if cur_step > 0 and cur_step % LOG_INTERVAL == 0:
+                metric = model.calculate_metric(is_training=True, adapter_name=adapter_name)
+                if callable(metric):
+                    metric = metric()
+                logger.info(f'Adapter {adapter_name} is at step {cur_step} of {len(dataloader)}, metric: {metric}')
 
     for adapter_name in ADAPTER_NAMES:
         checkpoint = save_checkpoint(model, adapter_name, dataloader)

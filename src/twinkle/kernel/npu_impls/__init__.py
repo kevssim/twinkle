@@ -6,5 +6,11 @@ replacement) or ``setattr(module, attr, fn)`` (function replacement). No impl
 here is meant to be instantiated directly.
 """
 from .rms_norm import NpuRMSNorm, npu_gated_rms_norm_forward
+from .rotary import npu_apply_multimodal_rotary_pos_emb, npu_apply_rotary_pos_emb
 
-__all__ = ['NpuRMSNorm', 'npu_gated_rms_norm_forward']
+__all__ = [
+    'NpuRMSNorm',
+    'npu_gated_rms_norm_forward',
+    'npu_apply_rotary_pos_emb',
+    'npu_apply_multimodal_rotary_pos_emb',
+]

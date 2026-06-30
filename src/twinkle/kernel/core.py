@@ -24,7 +24,6 @@ class HubRef:
     revision: str | None = None
     version: int | None = None
     backend: str | None = None
-    trust_remote_code: bool = False
 
 
 def hub(
@@ -33,7 +32,6 @@ def hub(
     revision: str | None = None,
     version: int | None = None,
     backend: str | None = None,
-    trust_remote_code: bool = False,
 ) -> HubRef:
     """Build a ``HubRef`` for use as a ``kernelize`` mapping value.
 
@@ -45,7 +43,7 @@ def hub(
     if ':' not in ref:
         raise ValueError(f"Hub ref must be 'repo_id:LayerName', got: {ref!r}")
     repo_id, layer_name = ref.rsplit(':', 1)
-    return HubRef(repo_id, layer_name, revision, version, backend, trust_remote_code)
+    return HubRef(repo_id, layer_name, revision, version, backend)
 
 
 def _resolve_value(value: Any, device: str) -> Any | None:
@@ -122,7 +120,6 @@ def _load_hub_ref(ref: HubRef):
         revision=ref.revision,
         version=ref.version,
         backend=ref.backend,
-        trust_remote_code=ref.trust_remote_code,
     )
     layers = getattr(kernel, 'layers', None)
     if layers is None:

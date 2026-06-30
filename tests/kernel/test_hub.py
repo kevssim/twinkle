@@ -11,7 +11,6 @@ def test_hub_with_version():
     assert ref.version == 1
     assert ref.revision is None
     assert ref.backend is None
-    assert ref.trust_remote_code is False
 
 
 def test_hub_with_revision():
@@ -20,10 +19,9 @@ def test_hub_with_revision():
     assert ref.version is None
 
 
-def test_hub_with_backend_and_trust():
-    ref = hub('org/repo:Layer', version=2, backend='cuda', trust_remote_code=True)
+def test_hub_with_backend():
+    ref = hub('org/repo:Layer', version=2, backend='cuda')
     assert ref.backend == 'cuda'
-    assert ref.trust_remote_code is True
 
 
 def test_hub_rejects_both_revision_and_version():

@@ -93,15 +93,16 @@ class ModelManagement(LazyCleanupMixin, TaskQueueMixin, AdapterManagerMixin):
     - Per-user rate limiting via TaskQueueMixin
     """
 
-    def __init__(self,
-                 model_id: str,
-                 nproc_per_node: int,
-                 device_group: dict[str, Any],
-                 device_mesh: dict[str, Any],
-                 backend: str,
-                 adapter_config: dict[str, Any] | None = None,
-                 queue_config: TaskQueueConfig | None = None,
-                 **kwargs):
+    async def __init__(self,
+                       model_id: str,
+                       nproc_per_node: int,
+                       device_group: dict[str, Any],
+                       device_mesh: dict[str, Any],
+                       backend: str,
+                       adapter_config: dict[str, Any] | None = None,
+                       queue_config: TaskQueueConfig | None = None,
+                       data_plane_url: str | None = None,
+                       **kwargs):
         self.backend = backend
         self.device_group = DeviceGroup(**device_group)
         self.device_mesh = init_twinkle_runtime(
@@ -131,11 +132,14 @@ class ModelManagement(LazyCleanupMixin, TaskQueueMixin, AdapterManagerMixin):
         self.model = MODEL_SELECTOR.construct(backend, ctor_kwargs)
 
         self.state: ServerState = get_server_state()
+        from twinkle.server.data_plane import DataPlaneProxy
+        self.data_plane = DataPlaneProxy(data_plane_url)
         self._replica_registered = False
 
         # Initialize mixins
         self._init_task_queue(queue_config, deployment_name='Model')
         self._init_adapter_manager(**(adapter_config or {}))
+        await self._register_replica_on_startup()
         # Note: countdown task is started lazily in _ensure_sticky()
 
     @property
@@ -148,8 +152,8 @@ class ModelManagement(LazyCleanupMixin, TaskQueueMixin, AdapterManagerMixin):
         """
         return self.device_mesh.data_world_size if self.device_mesh is not None else 1
 
-    async def _ensure_replica_registered(self):
-        """Lazily register replica on first async request."""
+    async def _register_replica_on_startup(self) -> None:
+        """Register this replica's capacity before Ray Serve marks it ready."""
         if not self._replica_registered:
             await self.state.register_replica(self.replica_id, self.max_loras)
             self._replica_registered = True
@@ -166,7 +170,6 @@ class ModelManagement(LazyCleanupMixin, TaskQueueMixin, AdapterManagerMixin):
 
     async def _on_request_start(self, request: Request) -> str:
         await self._ensure_sticky()
-        await self._ensure_replica_registered()
         await self._ensure_state_cleanup_started()
         token = get_token_from_request(request)
         return token
@@ -177,6 +180,7 @@ class ModelManagement(LazyCleanupMixin, TaskQueueMixin, AdapterManagerMixin):
             await self.state.unregister_replica(self.replica_id)
         except Exception:
             pass
+        await self.data_plane.close()
 
     def check_model_health(self) -> dict:
         """Probe model actors liveness via a lightweight ping.
@@ -249,6 +253,7 @@ def build_model_app(model_id: str,
                     backend: str,
                     adapter_config: dict[str, Any] | None = None,
                     queue_config: TaskQueueConfig | None = None,
+                    data_plane_url: str | None = None,
                     **kwargs):
     """Build a unified model management application for distributed training.
 
@@ -293,7 +298,8 @@ def build_model_app(model_id: str,
         deploy_options,
         deployment_name='ModelManagement',
         request_router_config=RequestRouterConfig(request_router_class=StickyLoraRequestRouter),
-        bind_args=(model_id, nproc_per_node, device_group, device_mesh, backend, adapter_config, queue_config),
+        bind_args=(model_id, nproc_per_node, device_group, device_mesh, backend, adapter_config, queue_config,
+                   data_plane_url),
         bind_kwargs=kwargs,
     )
 

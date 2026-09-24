@@ -73,8 +73,7 @@ class HybridFftSlots:
                 wrapper.update(f'fft_{slot}')
             # Keep FFT copies in the base dtype so FSDP2 sees the same original
             # dtype when another tenant activates a different slot.
-            base_dtype = next((parameter.dtype for parameter in original_module.parameters()),
-                              torch.float32)
+            base_dtype = next((parameter.dtype for parameter in original_module.parameters()), torch.float32)
             wrapper.modules_to_save.to(dtype=base_dtype)
             wrapper.set_adapter([])
             for parameter in wrapper.modules_to_save.parameters():

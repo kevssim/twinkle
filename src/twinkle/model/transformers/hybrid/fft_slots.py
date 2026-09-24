@@ -71,8 +71,11 @@ class HybridFftSlots:
             wrapper = ModulesToSaveWrapper(original_module, 'fft_0')
             for slot in range(1, self.multi_lora.max_loras):
                 wrapper.update(f'fft_{slot}')
-            # Match PEFT's FP32 LoRA weights so FSDP sees one trainable dtype.
-            wrapper.modules_to_save.to(dtype=torch.float32)
+            # Keep FFT copies in the base dtype so FSDP2 sees the same original
+            # dtype when another tenant activates a different slot.
+            base_dtype = next((parameter.dtype for parameter in original_module.parameters()),
+                              torch.float32)
+            wrapper.modules_to_save.to(dtype=base_dtype)
             wrapper.set_adapter([])
             for parameter in wrapper.modules_to_save.parameters():
                 parameter.requires_grad_(True)
@@ -116,13 +119,24 @@ class HybridFftSlots:
     def activate_fft_slot(self, adapter_name: str) -> None:
         """Activate this tenant's FFT copies, or disable FFT for regular LoRA."""
         fft_adapter_name = self._fft_adapter_name(adapter_name) if self.is_hybrid(adapter_name) else None
+        selected_adapters = [fft_adapter_name] if fft_adapter_name is not None else []
         for wrapper in self._iter_fft_wrappers():
-            wrapper.set_adapter(fft_adapter_name if fft_adapter_name is not None else [])
+            if wrapper.active_adapters != selected_adapters:
+                wrapper.set_adapter(selected_adapters)
+            self._enable_preallocated_fft_grad(wrapper)
 
     def deactivate_fft_slots(self) -> None:
-        """Disable every FFT wrapper after a model operation."""
+        """Disable active FFT wrappers for a temporary no-adapter operation."""
         for wrapper in self._iter_fft_wrappers():
-            wrapper.set_adapter([])
+            if wrapper.active_adapters:
+                wrapper.set_adapter([])
+            self._enable_preallocated_fft_grad(wrapper)
+
+    @staticmethod
+    def _enable_preallocated_fft_grad(wrapper: ModulesToSaveWrapper) -> None:
+        for parameter in wrapper.modules_to_save.parameters():
+            if not parameter.requires_grad:
+                parameter.requires_grad_(True)
 
     def resolve_lora_targets(self, target_modules) -> List[str]:
         """Resolve tenant LoRA targets while reserving S_FFT for full tuning."""

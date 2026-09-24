@@ -622,7 +622,7 @@ def test_fft_modules_do_not_need_lora_preallocation():
     assert torch.allclose(deployed(inputs), expected, atol=1e-5)
 
 
-def test_fft_slots_use_fp32_with_bf16_base():
+def test_fft_slots_follow_base_dtype():
     from twinkle.model.multi_lora import MultiLora
 
     manager = MultiLora(max_loras=2, max_r=4)
@@ -631,8 +631,7 @@ def test_fft_slots_use_fp32_with_bf16_base():
 
     wrapper = hybrid._get_fft_wrapper('layers.0.self_attn.q_proj')
     assert {parameter.dtype for parameter in wrapper.original_module.parameters()} == {torch.bfloat16}
-    assert {parameter.dtype for parameter in wrapper.modules_to_save.parameters()} == {torch.float32}
-    assert {parameter.dtype for parameter in model.parameters() if parameter.requires_grad} == {torch.float32}
+    assert {parameter.dtype for parameter in wrapper.modules_to_save.parameters()} == {torch.bfloat16}
 
 
 def test_hybrid_lora_targets_follow_tenant_config_but_exclude_fft():
@@ -728,6 +727,148 @@ def _make_multi_tenant_hybrid(hybrid_first=True):
         manager.acquire_lora('regular', regular_config)
         _register_hybrid(manager, spectral, 'hybrid', hybrid_config)
     return base, model, manager, spectral
+
+
+def test_hybrid_context_keeps_fft_slot_selected_between_operations(monkeypatch):
+    from twinkle.model.transformers.hybrid import SpectralHybridTransformersModel
+
+    _, _, manager, spectral = _make_multi_tenant_hybrid()
+    service = object.__new__(SpectralHybridTransformersModel)
+    service.multi_adapter = manager
+    service.fft_slots = spectral
+    fft_wrapper = spectral._get_fft_wrapper('layers.0.self_attn.q_proj')
+
+    with service._adapter_context('hybrid'):
+        pass
+    assert fft_wrapper.active_adapters == ['fft_0']
+
+    calls = []
+    original_set_adapter = fft_wrapper.set_adapter
+
+    def track_set_adapter(adapter_name, inference_mode=False):
+        calls.append(adapter_name)
+        return original_set_adapter(adapter_name, inference_mode=inference_mode)
+
+    monkeypatch.setattr(fft_wrapper, 'set_adapter', track_set_adapter)
+    with service._adapter_context('hybrid'):
+        pass
+    assert calls == []
+
+    with service._adapter_context('regular'):
+        pass
+    assert fft_wrapper.active_adapters == []
+
+
+def test_hybrid_context_switches_between_two_fft_tenants():
+    from twinkle.model.transformers.hybrid import SpectralHybridTransformersModel
+
+    _, _, manager, spectral = _make_multi_tenant_hybrid()
+    manager.release_lora('regular')
+    second_config = LoraConfig(r=2, lora_alpha=4, target_modules=['layers.0.mlp.down_proj'])
+    _register_hybrid(manager, spectral, 'hybrid_b', second_config)
+    service = object.__new__(SpectralHybridTransformersModel)
+    service.multi_adapter = manager
+    service.fft_slots = spectral
+    fft_wrapper = spectral._get_fft_wrapper('layers.0.self_attn.q_proj')
+
+    with service._adapter_context('hybrid'):
+        pass
+    with service._adapter_context('hybrid_b'):
+        pass
+    assert fft_wrapper.active_adapters == ['fft_1']
+
+
+def test_hybrid_tenant_switch_preserves_preallocated_parameter_grad_flags():
+    from twinkle.model.transformers.hybrid import SpectralHybridTransformersModel
+
+    _, model, manager, spectral = _make_multi_tenant_hybrid()
+    manager.release_lora('regular')
+    second_config = LoraConfig(r=2, lora_alpha=4, target_modules=['layers.0.mlp.down_proj'])
+    _register_hybrid(manager, spectral, 'hybrid_b', second_config)
+    service = object.__new__(SpectralHybridTransformersModel)
+    service.multi_adapter = manager
+    service.fft_slots = spectral
+
+    with service._adapter_context('hybrid'):
+        pass
+    with service._adapter_context('hybrid_b'):
+        pass
+
+    adapter_parameters = (
+        parameter for name, parameter in model.named_parameters()
+        if 'lora_' in name or '.modules_to_save.fft_' in name
+    )
+    assert all(parameter.requires_grad for parameter in adapter_parameters)
+
+
+def test_hybrid_initial_adapter_keeps_preallocated_parameters_trainable():
+    from twinkle.model.transformers.hybrid import SpectralHybridTransformersModel
+
+    _, model, manager, spectral = _make_multi_tenant_hybrid()
+    service = object.__new__(SpectralHybridTransformersModel)
+    service.multi_adapter = manager
+    service.fft_slots = spectral
+    manager.reset_adapter_status()
+
+    with service._adapter_context('hybrid'):
+        pass
+
+    adapter_parameters = (
+        parameter for name, parameter in model.named_parameters()
+        if 'lora_' in name or '.modules_to_save.fft_' in name
+    )
+    assert all(parameter.requires_grad for parameter in adapter_parameters)
+
+
+def test_hybrid_disable_lora_restores_preallocated_parameter_grad_flags():
+    from twinkle.model.transformers.hybrid import SpectralHybridTransformersModel
+
+    _, model, manager, spectral = _make_multi_tenant_hybrid()
+    service = object.__new__(SpectralHybridTransformersModel)
+    service.multi_adapter = manager
+    service.fft_slots = spectral
+
+    with service._adapter_context('hybrid', disable_lora=True):
+        pass
+
+    adapter_parameters = (
+        parameter for name, parameter in model.named_parameters()
+        if 'lora_' in name or '.modules_to_save.fft_' in name
+    )
+    assert all(parameter.requires_grad for parameter in adapter_parameters)
+
+
+def test_disable_lora_temporarily_disables_fft_slot():
+    from twinkle.model.transformers.hybrid import SpectralHybridTransformersModel
+
+    _, _, manager, spectral = _make_multi_tenant_hybrid()
+    service = object.__new__(SpectralHybridTransformersModel)
+    service.multi_adapter = manager
+    service.fft_slots = spectral
+    fft_wrapper = spectral._get_fft_wrapper('layers.0.self_attn.q_proj')
+
+    with service._adapter_context('hybrid'):
+        pass
+    with service._adapter_context('hybrid', disable_lora=True):
+        assert fft_wrapper.active_adapters == []
+    assert fft_wrapper.active_adapters == ['fft_0']
+
+
+def test_disable_lora_restores_slots_after_operation_fails():
+    from twinkle.model.transformers.hybrid import SpectralHybridTransformersModel
+
+    _, model, manager, spectral = _make_multi_tenant_hybrid()
+    service = object.__new__(SpectralHybridTransformersModel)
+    service.multi_adapter = manager
+    service.fft_slots = spectral
+    fft_wrapper = spectral._get_fft_wrapper('layers.0.self_attn.q_proj')
+
+    with pytest.raises(RuntimeError, match='operation failed'):
+        with service._adapter_context('hybrid', disable_lora=True):
+            raise RuntimeError('operation failed')
+
+    assert fft_wrapper.active_adapters == ['fft_0']
+    assert all(parameter.requires_grad for name, parameter in model.named_parameters() if 'lora_' in name)
 
 
 def test_multi_tenant_hybrid_isolation_and_non_destructive_merge():
@@ -829,6 +970,52 @@ def test_multi_tenant_optimizer_parameters_and_learning_rates_are_isolated():
     assert any('.modules_to_save.fft_0.' in name for name in hybrid)
     assert {group['lr'] for group in groups} == {2.5e-5, 1e-6}
     assert {id(param) for group in groups for param in group['params']} == {id(param) for param in hybrid.values()}
+
+
+def test_two_hybrid_tenants_train_only_their_own_slot():
+    from twinkle.model.transformers.hybrid import SpectralHybridTransformersModel
+
+    _, model, manager, spectral = _make_multi_tenant_hybrid()
+    manager.release_lora('regular')
+    second_config = LoraConfig(r=2, lora_alpha=4, target_modules=['layers.0.mlp.down_proj'])
+    _register_hybrid(manager, spectral, 'hybrid_b', second_config)
+    service = object.__new__(SpectralHybridTransformersModel)
+    service.multi_adapter = manager
+    service.fft_slots = spectral
+    service.strategy = type('Strategy', (), {'unwrap_model': lambda _self, inner: inner})()
+    service.__dict__['model'] = model
+    service.default_lr_lora = 0.1
+    service.default_lr_fft = 0.1
+    optimizers = {}
+    snapshots = {}
+    for tenant in ('hybrid', 'hybrid_b'):
+        optimizers[tenant] = torch.optim.SGD(service._create_param_group(tenant, weight_decay=0), lr=0.1)
+        snapshots[tenant] = {
+            name: parameter.detach().clone() for name, parameter in service._get_trainable_parameters(tenant).items()
+        }
+    optimizer_parameters = {
+        tenant: {id(parameter) for group in optimizer.param_groups for parameter in group['params']}
+        for tenant, optimizer in optimizers.items()
+    }
+    assert optimizer_parameters['hybrid'].isdisjoint(optimizer_parameters['hybrid_b'])
+
+    inputs = torch.randn(2, 8)
+    for tenant, other in (('hybrid', 'hybrid_b'), ('hybrid_b', 'hybrid')):
+        model.zero_grad(set_to_none=True)
+        with service._adapter_context(other):
+            other_output_before = model(inputs).detach().clone()
+        with service._adapter_context(tenant):
+            model(inputs).square().sum().backward()
+        own = service._get_trainable_parameters(tenant)
+        other_params = service._get_trainable_parameters(other)
+        assert any(parameter.grad is not None for parameter in own.values())
+        assert all(parameter.grad is None for parameter in other_params.values())
+        optimizers[tenant].step()
+        assert any(not torch.equal(parameter, snapshots[tenant][name]) for name, parameter in own.items())
+        assert all(torch.equal(parameter, snapshots[other][name]) for name, parameter in other_params.items())
+        with service._adapter_context(other):
+            assert torch.equal(model(inputs).detach(), other_output_before)
+        snapshots[tenant] = {name: parameter.detach().clone() for name, parameter in own.items()}
 
 
 def test_regular_lora_rejects_targets_outside_preallocation():

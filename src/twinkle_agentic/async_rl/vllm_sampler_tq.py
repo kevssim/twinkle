@@ -15,7 +15,6 @@ from typing import Any
 
 from twinkle import DeviceMesh, get_logger, remote_class, remote_function
 from twinkle.data_format import SampledSequence, SampleResponse, SamplingParams, user_data_get
-from twinkle.hub import HubOperation
 from twinkle.metric import MetricBuffer, MetricRecord
 from twinkle.sampler.vllm_sampler import vLLMSampler
 from .data_plane import TQDataPlane
@@ -84,12 +83,16 @@ class _PromptGroupRolloutStats:
 
 
 @remote_class()
-class VLLMSamplerTQ(GenerationSubmissionMixin, vLLMSampler):
+class VLLMSamplerTQ(vLLMSampler, GenerationSubmissionMixin):
     """vLLM sampler that writes async RL rollout results directly to TransferQueue.
 
     ``sample()`` is intentionally fire-and-forget: it schedules generation work
     on the sampler actor's vLLM event loop and returns submission metadata
     without waiting for any prompt group to finish.
+
+    ``vLLMSampler`` already mixes in the (re-exported, single-identity) submission mixin, so it MUST stay
+    ahead of the explicit mixin base here: listing the mixin first would repeat a base the other parent
+    already inherits and fail C3 linearisation at import.
     """
 
     def __init__(
@@ -214,61 +217,6 @@ class VLLMSamplerTQ(GenerationSubmissionMixin, vLLMSampler):
             adapter_name=adapter_name,
             adapter_path=adapter_path,
         )
-
-    async def _generate_inputs(
-        self,
-        inputs: Any,
-        sampling_params: SamplingParams | dict[str, Any] | None,
-        *,
-        adapter_name: str,
-        adapter_path: str | None,
-        use_base_model: bool,
-    ) -> list[SampleResponse]:
-        """Asynchronous counterpart of ``vLLMSampler.sample`` for CS use."""
-        if sampling_params is None:
-            sampling_params = SamplingParams()
-        elif isinstance(sampling_params, dict):
-            sampling_params = SamplingParams.from_dict(sampling_params)
-
-        inputs_list = self._normalize_inputs(inputs)
-        if not inputs_list:
-            return []
-
-        is_trajectory = 'input_ids' not in inputs_list[0]
-        logprobs_only = False
-        if sampling_params.max_tokens == 0:
-            sampling_params = copy(sampling_params)
-            sampling_params.max_tokens = 1
-            logprobs_only = True
-
-        multi_modal_data_list = [self._extract_multi_modal_data(feat) for feat in inputs_list]
-        if is_trajectory:
-            if self.template is None:
-                raise ValueError('Use set_template to add a template when trying to input Trajectory')
-            encoded_inputs = [
-                self.encode_trajectory_for_vllm(trajectory, adapter_name, not logprobs_only)
-                for trajectory in inputs_list
-            ]
-        else:
-            encoded_inputs = inputs_list
-
-        lora_request = None
-        if adapter_path is not None:
-            logger.info(f'Loading LoRA from {adapter_path}')
-            local_adapter_path = HubOperation.download_model(model_id_or_path=adapter_path)
-            lora_request = await self.engine._get_or_load_lora(local_adapter_path)
-            if lora_request is None:
-                logger.warning(f'Failed to pre-load LoRA from {local_adapter_path}, '
-                               'sampling will proceed without LoRA')
-
-        return await asyncio.gather(*(self._sample_single(
-            feat,
-            sampling_params,
-            lora_request=lora_request,
-            multi_modal_data=multi_modal_data,
-            logprobs_only=logprobs_only,
-            disable_lora=use_base_model,
-        ) for feat, multi_modal_data in zip(encoded_inputs, multi_modal_data_list)))
 
     def _on_submission_done(self, submission_id: str):
 

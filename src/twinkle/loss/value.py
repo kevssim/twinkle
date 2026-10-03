@@ -11,13 +11,19 @@ if TYPE_CHECKING:
 
 
 class PPOValueLoss(Loss):
-    """Clipped PPO value-function loss over response tokens."""
+    """Clipped PPO value-function loss over response tokens.
+
+    ``cliprange_value`` bounds how far the critic may move from its rollout-time estimate (the value
+    analogue of the policy clip); ``vf_coef`` scales the regressed loss, matching the standard PPO
+    value-objective weight.
+    """
 
     require_logps = False
     require_values = True
 
-    def __init__(self, epsilon: float = 0.2, ignore_index: int = -100, **kwargs):
-        self.epsilon = epsilon
+    def __init__(self, cliprange_value: float = 0.2, vf_coef: float = 1.0, ignore_index: int = -100, **kwargs):
+        self.cliprange_value = cliprange_value
+        self.vf_coef = vf_coef
         self.ignore_index = ignore_index
         self._aligner = GRPOLoss(ignore_index=ignore_index)
 
@@ -53,10 +59,10 @@ class PPOValueLoss(Loss):
         old_values = self._aligner._pad_and_align_to_batch(old_values, mask, values.device, values.dtype)
         returns = self._aligner._pad_and_align_to_batch(returns, mask, values.device, values.dtype)
 
-        clipped_values = old_values + torch.clamp(values - old_values, -self.epsilon, self.epsilon)
+        clipped_values = old_values + torch.clamp(values - old_values, -self.cliprange_value, self.cliprange_value)
         loss_unclipped = (values - returns).square()
         loss_clipped = (clipped_values - returns).square()
         per_token_loss = 0.5 * torch.maximum(loss_unclipped, loss_clipped)
         mask_f = mask.to(values.dtype)
         loss = (per_token_loss * mask_f).sum() / mask_f.sum().clamp(min=1.0)
-        return LossOutput(loss=loss, num_tokens=0)
+        return LossOutput(loss=self.vf_coef * loss, num_tokens=0)

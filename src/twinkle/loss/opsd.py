@@ -79,15 +79,16 @@ class OPSDLoss(GRPOLoss):
         """BNPO-style token-mean: sum over all response tokens / total token count."""
         return (per_token_loss * loss_mask).sum() / loss_mask.sum().clamp(min=1.0)
 
-    def __call__(
-        self,
-        inputs: Dict,
-        outputs: Dict,
-        *,
-        teacher_logps: Optional[Union['torch.Tensor', List[List[float]]]] = None,
-        ref_logps: Optional[Union['torch.Tensor', List[List[float]]]] = None,
-        **kwargs,
-    ) -> LossOutput:
+    def _student_logps_and_mask(self, inputs: Dict, outputs: Dict):
+        """Return ``(logps, loss_mask)`` for the student's on-policy response tokens.
+
+        ``logps`` is taken from ``outputs['logps']`` when the forward already harvested it, else
+        recomputed from ``outputs['logits']`` via the no-shift selective log-softmax (twinkle's label
+        convention: labels are pre-shifted to next-token form at encode time). ``loss_mask`` is the
+        trainable-token mask ``(labels != ignore_index)`` — the exact frame the k3 estimator and any
+        teacher alignment must share. Extracted so MOPD fuses multiple teachers against the SAME
+        student logps rather than recomputing them per teacher.
+        """
         import torch
 
         labels = inputs.get('labels')
@@ -107,7 +108,31 @@ class OPSDLoss(GRPOLoss):
             masked_labels = labels.clone()
             masked_labels[~loss_mask] = 0
             logps = selective_log_softmax(logits, masked_labels)
+        return logps, loss_mask
 
+    def _per_token_distill_loss(self, teacher: 'torch.Tensor', logps: 'torch.Tensor') -> 'torch.Tensor':
+        """The sampled-token k3 distillation surrogate shared by OPSD and MOPD.
+
+        ``teacher`` must already be aligned to ``logps``' frame and detached. ``r = teacher - logps``
+        (reverse=True), clamped to guard ``exp`` overflow, then ``exp(r) - r - 1 >= 0``. Its gradient
+        w.r.t. the student log-prob is ``1 - exp(r)``: teacher-preferred tokens pull the student up.
+        """
+        import torch
+
+        r = teacher - logps if self.reverse else logps - teacher
+        r = torch.clamp(r, min=-10.0, max=10.0)
+        return torch.exp(r) - r - 1
+
+    def __call__(
+        self,
+        inputs: Dict,
+        outputs: Dict,
+        *,
+        teacher_logps: Optional[Union['torch.Tensor', List[List[float]]]] = None,
+        ref_logps: Optional[Union['torch.Tensor', List[List[float]]]] = None,
+        **kwargs,
+    ) -> LossOutput:
+        logps, loss_mask = self._student_logps_and_mask(inputs, outputs)
         device = logps.device
 
         # Teacher log-probs: prefer the dedicated kwarg, else reuse the reference channel.
@@ -121,10 +146,6 @@ class OPSDLoss(GRPOLoss):
         teacher = self._pad_and_align_to_batch(teacher, loss_mask, device, logps.dtype)
         teacher = teacher.detach()
 
-        # r = teacher - student. k3 KL estimate: exp(r) - r - 1 (>= 0), pulls student -> teacher.
-        r = teacher - logps if self.reverse else logps - teacher
-        r = torch.clamp(r, min=-10.0, max=10.0)  # guard exp overflow on rare huge gaps
-        per_token_loss = torch.exp(r) - r - 1
-
+        per_token_loss = self._per_token_distill_loss(teacher, logps)
         loss = self._aggregate_loss(per_token_loss, loss_mask, **kwargs)
         return LossOutput(loss=loss, num_tokens=0)

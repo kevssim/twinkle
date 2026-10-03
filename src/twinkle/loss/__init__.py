@@ -3,12 +3,13 @@ from .base import Loss
 from .channel import ChannelLoss
 from .chunked_cross_entropy import ChunkedCrossEntropyLoss
 from .cross_entropy import CrossEntropyLoss
-from .dpo import CPOLoss, DPOLoss, ORPOLoss, SimPOLoss
+from .dpo import CPOLoss, DPOLoss, KTOLoss, ORPOLoss, SimPOLoss
 from .gkd import GKDLoss
 from .grpo import BNPOLoss, CISPOLoss, DRGRPOLoss, GRPOLoss, GSPOLoss, PPOLoss, SAPOLoss
 from .infonce import ContrastiveLoss, CosineSimilarityLoss, EmbeddingLoss, InfonceLoss, OnlineContrastiveLoss
 from .liger_fused_linear_cross_entropy import LigerFusedLinearCrossEntropyLoss
 from .liger_fused_linear_grpo import LigerFusedLinearGRPOLoss
+from .mopd import MOPDLoss
 from .mse import MSELoss
 from .opsd import OPSDLoss
 from .reranker import ListwiseRerankerLoss, PointwiseRerankerLoss
@@ -36,8 +37,10 @@ torch_loss_mapping = {
     'dr_grpo': DRGRPOLoss,
     # Self-distillation losses
     'opsd': OPSDLoss,
+    'mopd': MOPDLoss,
     # DPO family losses
     'dpo': DPOLoss,
+    'kto': KTOLoss,
     'simpo': SimPOLoss,
     'cpo': CPOLoss,
     'orpo': ORPOLoss,

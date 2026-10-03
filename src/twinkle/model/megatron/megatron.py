@@ -144,6 +144,15 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
         self._default_tokenizer = None
         self.use_distributed_optimizer = kwargs.pop('use_distributed_optimizer', True)
         self.variable_seq_lengths = kwargs.get('variable_seq_lengths', True)
+        # MoE routing replay (R2/R3). mcore builds one RouterReplay per MoE router only when
+        # ``moe_enable_routing_replay`` is set on the TransformerConfig, so translate the caller-facing
+        # ``enable_router_replay`` flag into it here (it flows through MegatronStrategy.get_model_config
+        # -> MCoreBridgeBackend.build_model_config's ``config_kwargs.update(kwargs)``). Symmetric with
+        # TransformersModel's ``enable_router_replay`` (basic principle 1: the two backends are equivalent).
+        self._router_replay_enabled = bool(kwargs.pop('enable_router_replay', False))
+        self._router_replay_applied = False
+        if self._router_replay_enabled:
+            kwargs['moe_enable_routing_replay'] = True
         torch_util.set_device()
         self._try_init_process_group()
         # MindSpeed must patch before mcore_bridge imports its patcher, otherwise
@@ -227,6 +236,19 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
         if not self._model_wrapped:
             self.model = self.strategy.wrap_model(self.model)
             self._model_wrapped = True
+
+    def _maybe_apply_router_replay(self):
+        """Lazily patch the MoE all-to-all dispatcher once, when routing replay is enabled.
+
+        The patch is on the dispatcher class (global, idempotent), so this only needs to run once per
+        worker; it is deferred to the first replay forward so a non-MoE or replay-disabled run never
+        touches it.
+        """
+        if not self._router_replay_enabled or self._router_replay_applied:
+            return
+        from twinkle.model.megatron.moe.router_replay import apply_router_replay_patch
+        apply_router_replay_patch()
+        self._router_replay_applied = True
 
     def _lazy_finish_param_config(self):
         if self._finish_config:
@@ -427,7 +449,10 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
         if tracker.get('avg_group') is not None:
             dist.all_reduce(values, group=tracker['avg_group'], op=dist.ReduceOp.AVG)
 
-    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict, sync=True)
+    # lazy_collect=False: forward_only exists to hand its outputs back to the caller, so the driver must
+    # receive the materialized dict rather than an un-collected callable. sync=True orders the workers but
+    # does not materialize the result. Mirrors the transformers backend and calculate_metric.
+    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict, sync=True, lazy_collect=False)
     def forward_only(self,
                      *,
                      inputs: Union[InputFeature, List[InputFeature], List[Trajectory]],
@@ -516,6 +541,11 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
         forward_only = kwargs.pop('forward_only', False)
         return_logits = kwargs.pop('return_logits', False)
         task = kwargs.pop('task', 'causal_lm')
+        # MoE routing replay (R2/R3). The action is a backend-neutral token (str/None) resolved below to
+        # this backend's enum -- symmetric with TransformersModel.forward (basic principle 1). Popped here,
+        # before loss_extra_kwargs_per_mb is assembled, so it never reaches the loss.
+        router_replay_action = kwargs.pop('router_replay_action', None)
+        router_replay_manual_cleanup = kwargs.pop('router_replay_manual_cleanup', False)
         optimizer_config = self.optimizer_group[adapter_name]
         loss_instance = self.optimizer_group[adapter_name].loss_instance
         if not inputs:
@@ -541,6 +571,16 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
             variable_seq_lengths=self.variable_seq_lengths,
             attention_mask_type=getattr(unwrapped_model.config, 'attention_mask_type', None),
         )
+
+        # MoE routing replay: resolve the backend-neutral action to this backend's enum and lazily patch
+        # the dispatcher once. The global action is set right before the scheduler runs; the per-microbatch
+        # record/replay dance lives in forward_step_func (prepare_replay_forward / finish_replay_forward).
+        rr_action = rr_pre = rr_post = None
+        if self._router_replay_enabled and router_replay_action is not None:
+            from twinkle.model.megatron.moe import router_replay as _rr_mod
+            rr_action = _rr_mod.resolve_router_replay_action(router_replay_action)
+            rr_pre, rr_post = _rr_mod.prepare_replay_forward, _rr_mod.finish_replay_forward
+            self._maybe_apply_router_replay()
 
         # Get parallelism settings for sequence padding and splitting
         cp_size = self.device_mesh.cp_world_size
@@ -579,6 +619,7 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
                 loss_extra_kwargs_per_mb.append(mb_kwargs)
 
         _mb_counter = [0]  # mutable counter for closure
+        _recorded_routing = []  # per-microbatch RECORD outputs (R2), concatenated onto model_output below
         feed_mtp = self._mtp_training_enabled(forward_only=forward_only, task=task, disable_lora=disable_lora)
 
         def post_loss_function(output_tensor, inputs, logps, unpacked_logits=None, entropies=None, embeddings=None):
@@ -622,6 +663,10 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
             channel = batch.pop('channel', None)
             # Not a model argument; restored below so the loss can read it.
             completion_mask = batch.pop('completion_mask', None)
+            # Not a model argument either: the whole-model routing to replay (R3, delivered by the
+            # sampler). Popped so it never reaches model(**model_kwargs); consumed by the replay dance
+            # below, which slices it to this rank's local (pp, cp, sp) shard.
+            routed_experts_mb = batch.pop('routed_experts', None)
             # MTP joint training. ``labels`` is deliberately withheld from the model so the main loss
             # stays external (twinkle derives log-probs from logits), but the MTP heads still need
             # next-token targets -- so they get them on a separate keyword. Passed only into the model
@@ -631,11 +676,17 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
                 model_kwargs = dict(batch)
                 model_kwargs['mtp_labels'] = labels
             unwrapped_model = self.strategy.unwrap_model([model])[0]
+            _rr_bs = batch['input_ids'].shape[0] if 'input_ids' in batch else 1
+            _rr_packed = batch.get('packed_seq_params')
+            if rr_pre is not None:
+                rr_pre(rr_action, unwrapped_model, routed_experts_mb, _rr_packed)
             if disable_lora and isinstance(unwrapped_model, PeftModel):
                 with unwrapped_model.disable_adapter():
                     output_tensor = model(**model_kwargs)
             else:
                 output_tensor = model(**model_kwargs)
+            if rr_post is not None:
+                rr_post(rr_action, unwrapped_model, _rr_packed, _recorded_routing, _rr_bs)
 
             batch['labels'] = labels
             if loss_scale is not None:
@@ -772,6 +823,11 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
 
         # Run forward-backward with Megatron's scheduler
         # Megatron handles all communication internally using proper process groups
+        if rr_action is not None:
+            # Set the action on every local router before the schedule; forward_step_func's dance then
+            # flips REPLAY_FORWARD<->REPLAY_BACKWARD per microbatch (mirrors legacy base.py train_step).
+            from twinkle.model.megatron.moe.router_replay import set_global_router_replay_action
+            set_global_router_replay_action(rr_action)
         with _resolve_task_context(self.model, task):
             losses = forward_backward_func(
                 forward_step_func=forward_step_func,
@@ -847,6 +903,22 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
         model_output = ModelOutput(logits=logits, loss=loss, logps=logps)
         if channel_loss:
             model_output['channel_loss'] = channel_loss
+        if rr_action is not None:
+            # R2 RECORD: hand the captured whole-model routing back to the driver (symmetric with
+            # TransformersModel.forward's return_outputs['routed_experts']) so it can be replayed later.
+            from twinkle.model.megatron.moe.router_replay import (RouterReplayAction, clear_global_indices,
+                                                                  clear_global_router_replay_action)
+            if rr_action == RouterReplayAction.RECORD and _recorded_routing:
+                # Microbatches share a seq length only when sequences are uniform; otherwise keep the
+                # per-microbatch list (exactly how variable-seq ``logps`` is returned above) so the driver
+                # re-aligns each sample's routing to its own input length on the replay forward.
+                if all(r.shape == _recorded_routing[0].shape for r in _recorded_routing):
+                    model_output['routed_experts'] = torch.cat(_recorded_routing, dim=0)
+                else:
+                    model_output['routed_experts'] = _recorded_routing
+            if not router_replay_manual_cleanup:
+                clear_global_router_replay_action()
+                clear_global_indices()
         if forward_only:
             optimizer_config.eval_status.inputs = inputs
             optimizer_config.eval_status.outputs = model_output

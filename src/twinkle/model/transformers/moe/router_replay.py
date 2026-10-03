@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from twinkle import Platform
 from twinkle.utils import get_logger
@@ -72,6 +72,27 @@ def clear_global_indices() -> None:
 def get_replay_state(block_name: str) -> _RouterReplayState | None:
     """Return the replay state for *block_name*, or *None*."""
     return _registry.get(block_name)
+
+
+def resolve_router_replay_action(action: Any) -> Optional[RouterReplayAction]:
+    """Resolve a backend-neutral action token to this backend's ``RouterReplayAction`` enum.
+
+    Callers (swift/dev) stay backend-agnostic per basic principle 1, so they pass the action as a plain
+    string (``'record'`` / ``'replay_forward'`` / ``'replay_backward'``) rather than importing a
+    backend-specific enum -- and they MUST: the Megatron backend's ``RouterReplayAction`` is a different
+    class (mcore's), so no single enum instance can drive both backends. ``None`` passes through (replay
+    disabled for this forward); an already-enum value passes through; a string is looked up by value.
+    Mirrors ``twinkle.model.megatron.moe.router_replay.resolve_router_replay_action``.
+    """
+    if action is None or isinstance(action, RouterReplayAction):
+        return action
+    if isinstance(action, str):
+        try:
+            return RouterReplayAction(action)
+        except ValueError:
+            raise ValueError(f'Unknown router_replay_action {action!r}; expected one of '
+                             f'{[a.value for a in RouterReplayAction]} or None.') from None
+    raise TypeError(f'router_replay_action must be a str, RouterReplayAction or None, got {type(action).__name__}.')
 
 
 def set_router_replay_data(

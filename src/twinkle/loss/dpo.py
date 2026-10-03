@@ -175,11 +175,14 @@ class DPOLoss(PreferenceLossBase):
             chosen_logratios = policy_chosen_logps - reference_chosen_logps
             rejected_logratios = policy_rejected_logps - reference_rejected_logps
 
-        # Compute preference margin
-        logits = self.beta * (chosen_logratios - rejected_logratios)
+        # Preference margin: the raw log-ratio difference h = (chosen - rejected). beta is applied
+        # per loss_type below rather than folded in here, because ipo operates on h itself (its target
+        # 1/(2*beta) lives in h-space), not on beta*h.
+        margin = chosen_logratios - rejected_logratios
 
         if self.loss_type == 'sigmoid':
-            # Standard DPO loss: -log(sigmoid(beta * margin))
+            # Standard DPO loss: -log(sigmoid(beta * h))
+            logits = self.beta * margin
             losses = -F.logsigmoid(logits)
             # Apply label smoothing (only meaningful here: Bradley-Terry soft labels).
             if self.label_smoothing > 0:
@@ -188,11 +191,12 @@ class DPOLoss(PreferenceLossBase):
                 losses = (1 - self.label_smoothing) * losses + self.label_smoothing * smooth_losses
         elif self.loss_type == 'hinge':
             # Hinge loss variant
-            losses = torch.relu(1 - logits)
+            losses = torch.relu(1 - self.beta * margin)
         elif self.loss_type == 'ipo':
             # IPO (Identity Preference Optimization) loss
             # Reference: "A General Theoretical Paradigm to Understand Learning from Human Feedback"
-            losses = (logits - 1 / (2 * self.beta))**2
+            # eq 17: (h - 1/(2*beta))**2 on the raw margin h (NOT beta-scaled).
+            losses = (margin - 1 / (2 * self.beta))**2
         elif self.loss_type == 'kto_pair':
             # KTO pair loss (simplified version)
             chosen_logratios_scaled = self.beta * chosen_logratios
@@ -311,6 +315,121 @@ class DPOLoss(PreferenceLossBase):
         # DPO loss is already per-sample mean, unlike SFT which sums per-token loss
         # When num_tokens=0, normalize_and_clip_grad_norm defaults to 1 (no division)
         return LossOutput(loss=loss, num_tokens=0)
+
+
+class KTOLoss(PreferenceLossBase):
+    """KTO (Kahneman-Tversky Optimization) Loss -- the UNPAIRED preference objective.
+
+    Where DPO needs a chosen/rejected pair per prompt, KTO needs only a single completion carrying a
+    binary label (desirable / undesirable), so it trains directly on the asymmetric feedback people
+    actually give. Each example is scored against a reference POINT ``z_KL`` rather than against a
+    paired counterpart:
+
+        desirable   (label=True):   L = desirable_weight   * (1 - sigmoid(beta * (logratio - z_KL)))
+        undesirable (label=False):  L = undesirable_weight  * (1 - sigmoid(beta * (z_KL - logratio)))
+
+    with ``logratio = log pi(y|x) - log pi_ref(y|x)`` per example and ``z_KL`` a DETACHED, clamped
+    estimate of ``KL(pi || pi_ref)`` over a mismatched "KL batch" (a prompt paired with an unrelated
+    completion). Anchoring on z_KL -- not on a paired response -- is what lets KTO absorb an imbalanced
+    desirable/undesirable mix; the two weights counteract that imbalance.
+
+    ``z_KL`` is supplied by the caller: the training loop owns the extra KL-batch forwards and reduces
+    them to this detached scalar (mirroring TRL, whose ``kto_loss`` receives the KL logps and forms
+    ``kl = mean(policy_KL - reference_KL).clamp(min=0).detach()``). ``z_kl=None`` -- ``calculate_KL``
+    off -- anchors at 0, the degenerate no-KL form.
+
+    Reference:
+        "KTO: Model Alignment as Prospect Theoretic Optimization" (https://arxiv.org/abs/2402.01306)
+
+    Args:
+        beta: Temperature on the implicit reward (default: 0.1).
+        desirable_weight: Weight on the desirable (label=True) term (default: 1.0).
+        undesirable_weight: Weight on the undesirable (label=False) term (default: 1.0).
+        ignore_index: Index to ignore in labels (default: -100).
+    """
+
+    def __init__(
+        self,
+        beta: float = 0.1,
+        desirable_weight: float = 1.0,
+        undesirable_weight: float = 1.0,
+        ignore_index: int = -100,
+        **kwargs,
+    ):
+        super().__init__(ignore_index=ignore_index)
+        self.beta = beta
+        self.desirable_weight = desirable_weight
+        self.undesirable_weight = undesirable_weight
+
+    def __call__(
+        self,
+        inputs: Dict,
+        outputs: Dict,
+        *,
+        label: Optional[Union['torch.Tensor', List[bool]]] = None,
+        z_kl: Optional[float] = None,
+        ref_outputs: Optional[Dict] = None,
+        ref_logps: Optional[Union['torch.Tensor', List[List[float]]]] = None,
+        **kwargs,
+    ) -> LossOutput:
+        """Compute the KTO loss over an UNPAIRED completion batch.
+
+        Args:
+            inputs: Dict with 'labels' [batch, seq_len]; one completion per row. The batch is split by
+                ``label``, NOT by position -- there is no chosen/rejected interleaving as in DPO.
+            outputs: Dict with 'logps' [batch, seq_len] (or 'logits' to compute them from).
+            label: Per-row binary label; True marks a desirable example, False an undesirable one.
+            z_kl: The detached KL(pi||pi_ref) reference point estimated over the mismatched KL batch,
+                or None to anchor at 0 (calculate_KL off).
+            ref_outputs / ref_logps: Reference-model per-token logps for the completion batch.
+        """
+        import torch
+
+        if ref_outputs is not None and ref_logps is None:
+            ref_logps = ref_outputs.get('logps')
+        labels = inputs.get('labels')
+        assert labels is not None, "inputs must contain 'labels'"
+        if not torch.is_tensor(labels):
+            labels = torch.as_tensor(labels)
+        if labels.dim() == 1:
+            labels = labels.unsqueeze(0)
+        if label is None:
+            raise ValueError("KTO needs a per-example binary 'label' (desirable/undesirable); the loop "
+                             'must forward it through forward_backward.')
+        if ref_logps is None:
+            # KTO's implicit reward IS the reference log-ratio and z_KL is a KL against the reference, so
+            # there is no reference-free form -- fail loudly rather than anchor on a silent zero.
+            raise ValueError('KTO requires reference logps (log pi(y|x) - log pi_ref(y|x)); build a '
+                             'reference model or use the LoRA adapter-disabled base as the reference.')
+
+        logps = self._get_logps_from_outputs(outputs, labels)
+        device, dtype = logps.device, logps.dtype
+        policy_logps = self._compute_sequence_logps(logps, labels)
+        ref_logps_aligned = align_per_token_values(
+            ref_logps,
+            tuple(labels.shape),
+            device=device,
+            dtype=dtype,
+            name='ref_logps',
+            valid_mask=labels != self.ignore_index,
+        )
+        reference_logps = self._compute_sequence_logps(ref_logps_aligned, labels)
+
+        label_mask = torch.as_tensor(label, device=device).bool().reshape(-1)
+        if label_mask.shape[0] != policy_logps.shape[0]:
+            raise ValueError(f'KTO label count ({label_mask.shape[0]}) does not match the completion '
+                             f'batch size ({policy_logps.shape[0]}).')
+
+        z_kl_value = (torch.as_tensor(z_kl, device=device, dtype=dtype).reshape(())
+                      if z_kl is not None else torch.zeros((), device=device, dtype=dtype))
+        logratios = policy_logps - reference_logps
+        chosen_losses = 1 - torch.sigmoid(self.beta * (logratios[label_mask] - z_kl_value))
+        rejected_losses = 1 - torch.sigmoid(self.beta * (z_kl_value - logratios[~label_mask]))
+        # Either side may be empty (an all-desirable or all-undesirable batch); cat + mean handles that,
+        # each side scaled by its imbalance-correcting weight.
+        losses = torch.cat(
+            (self.desirable_weight * chosen_losses, self.undesirable_weight * rejected_losses), 0)
+        return LossOutput(loss=losses.mean(), num_tokens=0)
 
 
 class SimPOLoss(PreferenceLossBase):

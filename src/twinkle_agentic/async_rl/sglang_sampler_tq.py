@@ -12,22 +12,23 @@ from __future__ import annotations
 
 import asyncio
 from copy import copy
-from typing import Any, Optional
+from typing import Any
 
 from twinkle import remote_class
 from twinkle.data_format import SampleResponse, SamplingParams
-from twinkle.hub import HubOperation
 from twinkle.sampler.sglang_sampler import SGLangSampler
 from .generation_submissions import GenerationSubmissionMixin
 
 
 @remote_class()
-class SGLangSamplerTQ(GenerationSubmissionMixin, SGLangSampler):
+class SGLangSamplerTQ(SGLangSampler, GenerationSubmissionMixin):
     """:class:`SGLangSampler` that admits generations without blocking the Ray actor.
 
     The quartet lives in :class:`GenerationSubmissionMixin`; this class only supplies ``_async_loop``
     (inherited from ``SGLangSampler``), the ``_generation_submissions`` map, and the sglang-specific
-    ``_generate_inputs``.
+    ``_generate_inputs``. ``SGLangSampler`` already mixes in the (re-exported, single-identity) mixin, so
+    it MUST stay ahead of the explicit mixin base here: listing the mixin first would repeat a base the
+    other parent already inherits and fail C3 linearisation at import.
     """
 
     def __init__(self, *args, **kwargs):
@@ -35,26 +36,6 @@ class SGLangSamplerTQ(GenerationSubmissionMixin, SGLangSampler):
         # The mixin's quartet tracks admitted-but-uncollected submissions here. SGLangSampler has no
         # such map, so initialise it after the engine (and its background loop) is up.
         self._generation_submissions: dict[str, Any] = {}
-
-    async def _aregister_lora(self, adapter_path: Optional[str],
-                              adapter_name: Optional[str] = None) -> Optional[str]:
-        """Async counterpart of ``SGLangSampler._register_lora``.
-
-        ``_generate_inputs`` runs *on* the sampler's background event loop, so it cannot call the
-        blocking ``_register_lora`` (that would submit to the same loop and deadlock waiting for itself).
-        Registration is cached by path for the same reason the sync one is: sglang's ``load_lora_adapter``
-        on an already-registered name is an error, and a per-input adapter would otherwise re-register on
-        every request.
-        """
-        if adapter_path is None:
-            return None
-        if adapter_path in self._registered_loras:
-            return self._registered_loras[adapter_path]
-        lora_name = adapter_name or f'lora_{len(self._registered_loras)}'
-        local_path = await asyncio.to_thread(HubOperation.download_model, model_id_or_path=adapter_path)
-        await self.engine.load_lora_adapter(lora_name=lora_name, lora_path=local_path)
-        self._registered_loras[adapter_path] = lora_name
-        return lora_name
 
     async def _generate_inputs(
         self,

@@ -15,6 +15,7 @@ from twinkle.hub import HubOperation
 from twinkle.patch import Patch, apply_patch
 from twinkle.patch.vllm_lora_weights import VLLMLoraWeights
 from twinkle.sampler.base import Sampler
+from twinkle.sampler.generation_submission import GenerationSubmissionMixin
 from twinkle.utils import Platform
 
 logger = get_logger()
@@ -41,7 +42,7 @@ _MAX_CONCURRENCY = max(1, int(os.environ.get('TWINKLE_SAMPLER_MAX_CONCURRENCY') 
 
 
 @remote_class(max_concurrency=_MAX_CONCURRENCY)
-class vLLMSampler(Sampler, CheckpointEngineMixin):
+class vLLMSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin):
     """A vLLM-based sampler using VLLMEngine (AsyncLLM).
 
     This sampler automatically configures vLLM based on available GPUs.
@@ -78,6 +79,10 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
         self._async_loop = asyncio.new_event_loop()
         self._async_thread = threading.Thread(target=self._run_event_loop, daemon=True, name='vLLMSampler-EventLoop')
         self._async_thread.start()
+
+        # In-flight non-blocking generations keyed by submission id (GenerationSubmissionMixin). Each
+        # entry is a concurrent.futures.Future scheduled on ``self._async_loop`` above.
+        self._generation_submissions: Dict[str, Any] = {}
 
         from .vllm_engine import VLLMEngine
         engine_kwargs = engine_args.copy() if engine_args else {}
@@ -328,12 +333,47 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
             - ``adapter_paths`` is a list too, so it is sliced in lockstep with ``inputs`` and stays
               aligned with them on every rank.
         """
+        # One sampling path: the blocking sample is the async core driven to completion on the loop. The
+        # non-blocking submit_generation (GenerationSubmissionMixin) schedules the SAME coroutine and
+        # collects it later, so an overlapped RL rollout and a plain blocking call cannot drift.
+        return self._run_in_loop(
+            self._generate_inputs(
+                inputs,
+                sampling_params,
+                adapter_name,
+                adapter_path,
+                return_encoded=return_encoded,
+                use_base_model=use_base_model,
+                adapter_paths=adapter_paths))
+
+    async def _generate_inputs(
+        self,
+        inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
+        sampling_params: Optional[Union[SamplingParams, Dict[str, Any]]] = None,
+        adapter_name: str = '',
+        adapter_path: Optional[str] = None,
+        *,
+        return_encoded: bool = False,
+        use_base_model: bool = False,
+        adapter_paths: Optional[List[Optional[str]]] = None,
+    ) -> List[SampleResponse]:
+        """The async generation core shared by the blocking :meth:`sample` and :meth:`submit_generation`.
+
+        ``sample`` drives this coroutine to completion on the background loop; ``submit_generation``
+        (GenerationSubmissionMixin) schedules the very same coroutine and collects it later, so an
+        overlapped RL rollout and a plain blocking call cannot drift apart. LoRA is resolved with the
+        async ``_aload_lora`` rather than the blocking ``_load_lora`` because this already runs inside
+        the event loop -- ``_load_lora`` would call ``_run_in_loop`` and deadlock on itself.
+        """
         if sampling_params is None:
             sampling_params = SamplingParams()
         elif isinstance(sampling_params, dict):
             sampling_params = SamplingParams.from_dict(sampling_params)
 
         inputs_list = self._normalize_inputs(inputs)
+        if not inputs_list:
+            return []
+
         if adapter_paths is not None:
             if adapter_path is not None:
                 raise ValueError('Pass either adapter_path (one adapter for the whole call) or adapter_paths '
@@ -351,13 +391,10 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
             sampling_params.max_tokens = 1
             logprobs_only = True
 
-        multi_modal_data_list = []
-        for feat in inputs_list:
-            multi_modal_data_list.append(self._extract_multi_modal_data(feat))
+        multi_modal_data_list = [self._extract_multi_modal_data(feat) for feat in inputs_list]
 
         if is_trajectory:
-            template = self.template
-            assert template is not None, \
+            assert self.template is not None, \
                 'Use set_template to add a template when trying to input Trajectory'
             encoded_inputs = [
                 self.encode_trajectory_for_vllm(traj, adapter_name, not logprobs_only) for traj in inputs_list
@@ -366,26 +403,18 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
             encoded_inputs = inputs_list
 
         if adapter_paths is not None:
-            lora_requests = [self._load_lora(path) for path in adapter_paths]
+            lora_requests = [await self._aload_lora(path) for path in adapter_paths]
         else:
-            lora_requests = [self._load_lora(adapter_path)] * len(encoded_inputs)
+            lora_requests = [await self._aload_lora(adapter_path)] * len(encoded_inputs)
 
-        # Sample all inputs in parallel using background event loop
-        async def _sample_all():
-            tasks = [
-                self._sample_single(
-                    feat,
-                    sampling_params,
-                    lora_request=lora_request,
-                    multi_modal_data=multi_modal_data,
-                    logprobs_only=logprobs_only,
-                    disable_lora=use_base_model,
-                ) for feat, multi_modal_data, lora_request in zip(encoded_inputs, multi_modal_data_list, lora_requests)
-            ]
-            return await asyncio.gather(*tasks)
-
-        sample_results = self._run_in_loop(_sample_all())
-        return sample_results
+        return await asyncio.gather(*(self._sample_single(
+            feat,
+            sampling_params,
+            lora_request=lora_request,
+            multi_modal_data=multi_modal_data,
+            logprobs_only=logprobs_only,
+            disable_lora=use_base_model,
+        ) for feat, multi_modal_data, lora_request in zip(encoded_inputs, multi_modal_data_list, lora_requests)))
 
     async def _encode_single(
         self,
@@ -479,20 +508,28 @@ class vLLMSampler(Sampler, CheckpointEngineMixin):
 
         return self._run_in_loop(_encode_all())
 
+    async def _aload_lora(self, adapter_path: Optional[str]):
+        """Async :meth:`_load_lora`: resolve an adapter path to a vLLM ``LoRARequest`` on the event loop.
+
+        Split out so the async generation core (``_generate_inputs``) can ``await`` it directly; calling
+        the blocking ``_load_lora`` from inside the loop would re-enter ``_run_in_loop`` and deadlock.
+        """
+        if adapter_path is None:
+            return None
+        logger.info(f'Loading LoRA from {adapter_path}')
+        local_path = HubOperation.download_model(model_id_or_path=adapter_path)
+        lora_request = await self.engine._get_or_load_lora(local_path)
+        if lora_request is None:
+            logger.warning(f'Failed to pre-load LoRA from {adapter_path}, sampling will proceed without LoRA')
+        return lora_request
+
     def _load_lora(self, adapter_path: Optional[str]):
         """Resolve an adapter path to a vLLM ``LoRARequest``, or None for the base model.
 
         ``_get_or_load_lora`` caches by path, so repeating the same path across a batch of per-input
         adapters costs one ``add_lora`` RPC, not one per input.
         """
-        if adapter_path is None:
-            return None
-        logger.info(f'Loading LoRA from {adapter_path}')
-        local_path = HubOperation.download_model(model_id_or_path=adapter_path)
-        lora_request = self._run_in_loop(self.engine._get_or_load_lora(local_path))
-        if lora_request is None:
-            logger.warning(f'Failed to pre-load LoRA from {adapter_path}, sampling will proceed without LoRA')
-        return lora_request
+        return self._run_in_loop(self._aload_lora(adapter_path))
 
     def sample_stream(
         self,

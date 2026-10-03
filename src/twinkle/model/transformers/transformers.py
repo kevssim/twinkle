@@ -582,7 +582,12 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
             return lambda: None
 
         from .moe.router_replay import (RouterReplayAction, clear_global_indices, clear_global_router_replay_action,
-                                        get_router_replay_data, set_global_router_replay_action, set_router_replay_data)
+                                        get_router_replay_data, resolve_router_replay_action,
+                                        set_global_router_replay_action, set_router_replay_data)
+        # Callers (swift/dev) pass a backend-neutral string token (basic principle 1: the two backends are
+        # driven identically, and Megatron's RouterReplayAction is a different class), so resolve it to this
+        # backend's enum before the ``== RouterReplayAction.*`` comparisons and the per-block state below.
+        router_replay_action = resolve_router_replay_action(router_replay_action)
         unwrapped = self.strategy.unwrap_model(self.model)
         set_global_router_replay_action(router_replay_action)
         if router_replay_action == RouterReplayAction.REPLAY_FORWARD:
@@ -746,7 +751,11 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
             return_outputs['routed_experts'] = recorded_routing
         return return_outputs
 
-    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
+    # lazy_collect=False: forward_only exists to hand its outputs back to the caller, so the driver must
+    # receive the materialized dict. The lazy default returns an un-collected callable instead, which a
+    # driver reading ``out['logps']``/``out['logits']`` (reference/teacher/reward/critic scoring) would
+    # silently mis-read as "no such key". Mirrors calculate_metric, the other return-value method.
+    @remote_function(dispatch='slice_dp', collect=collect_tensor_dict, lazy_collect=False)
     def forward_only(self, *, inputs: Union[InputFeature, List[InputFeature], List[Trajectory]], **kwargs):
         """Call forward function without grad and record the inputs and outputs.
 

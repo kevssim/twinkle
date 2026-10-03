@@ -16,6 +16,7 @@ from twinkle.data_format import (InputFeature, PoolingParams, PoolingResponse, S
 from twinkle.hub import HubOperation
 from twinkle.patch import Patch, apply_patch
 from twinkle.sampler.base import Sampler
+from twinkle.sampler.generation_submission import GenerationSubmissionMixin
 from twinkle.utils import Platform
 
 logger = get_logger()
@@ -39,7 +40,7 @@ def _convert_ndarray_to_list(obj: Any) -> Any:
 
 
 @remote_class()
-class SGLangSampler(Sampler, CheckpointEngineMixin):
+class SGLangSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin):
     """An sglang-based sampler using :class:`SGLangEngine`.
 
     Mirrors :class:`vLLMSampler`: tensor parallelism is taken from the visible devices unless given
@@ -87,6 +88,10 @@ class SGLangSampler(Sampler, CheckpointEngineMixin):
         self._async_loop = asyncio.new_event_loop()
         self._async_thread = threading.Thread(target=self._run_event_loop, daemon=True, name='SGLangSampler-EventLoop')
         self._async_thread.start()
+
+        # In-flight non-blocking generations keyed by submission id (GenerationSubmissionMixin). Each
+        # entry is a concurrent.futures.Future scheduled on ``self._async_loop`` above.
+        self._generation_submissions: Dict[str, Any] = {}
 
         from .sglang_engine import SGLangEngine
         engine_kwargs = engine_args.copy() if engine_args else {}
@@ -253,12 +258,43 @@ class SGLangSampler(Sampler, CheckpointEngineMixin):
             (dispatch='slice_dp'), so each worker receives its own shard of ``inputs``.
             ``adapter_paths`` is a list too and is sliced in lockstep, staying aligned with ``inputs``.
         """
+        # One sampling path: the blocking sample is the async core driven to completion on the loop. The
+        # non-blocking submit_generation (GenerationSubmissionMixin) schedules the SAME coroutine and
+        # collects it later, so an overlapped RL rollout and a plain blocking call cannot drift.
+        return self._run_in_loop(
+            self._generate_inputs(
+                inputs,
+                sampling_params,
+                adapter_name,
+                adapter_path,
+                adapter_paths=adapter_paths))
+
+    async def _generate_inputs(
+        self,
+        inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
+        sampling_params: Optional[Union[SamplingParams, Dict[str, Any]]] = None,
+        adapter_name: str = '',
+        adapter_path: Optional[str] = None,
+        *,
+        use_base_model: bool = False,
+        adapter_paths: Optional[List[Optional[str]]] = None,
+    ) -> List[SampleResponse]:
+        """The async generation core shared by the blocking :meth:`sample` and :meth:`submit_generation`.
+
+        Mirrors :meth:`vLLMSampler._generate_inputs`. Adapters are registered with the async
+        ``_aregister_lora`` rather than the blocking ``_register_lora`` because this already runs inside
+        the event loop -- ``_register_lora`` would call ``_run_in_loop`` and deadlock on itself.
+        ``use_base_model`` drops the adapter so the base weights are sampled.
+        """
         if sampling_params is None:
             sampling_params = SamplingParams()
         elif isinstance(sampling_params, dict):
             sampling_params = SamplingParams.from_dict(sampling_params)
 
         inputs_list = self._normalize_inputs(inputs)
+        if not inputs_list:
+            return []
+
         if adapter_paths is not None:
             if adapter_path is not None:
                 raise ValueError('Pass either adapter_path (one adapter for the whole call) or adapter_paths '
@@ -287,25 +323,21 @@ class SGLangSampler(Sampler, CheckpointEngineMixin):
         else:
             encoded_inputs = inputs_list
 
-        if adapter_paths is not None:
-            lora_names = [self._register_lora(path) for path in adapter_paths]
+        if use_base_model:
+            lora_names = [None] * len(encoded_inputs)
+        elif adapter_paths is not None:
+            lora_names = [await self._aregister_lora(path) for path in adapter_paths]
         else:
-            registered = self._register_lora(adapter_path, adapter_name)
+            registered = await self._aregister_lora(adapter_path, adapter_name)
             lora_names = [registered or (adapter_name or None)] * len(encoded_inputs)
 
-        async def _sample_all():
-            tasks = [
-                self._sample_single(
-                    feat,
-                    sampling_params,
-                    image_data=image_data,
-                    lora_name=lora_name,
-                    logprobs_only=logprobs_only,
-                ) for feat, image_data, lora_name in zip(encoded_inputs, image_data_list, lora_names)
-            ]
-            return await asyncio.gather(*tasks)
-
-        return self._run_in_loop(_sample_all())
+        return await asyncio.gather(*(self._sample_single(
+            feat,
+            sampling_params,
+            image_data=image_data,
+            lora_name=lora_name,
+            logprobs_only=logprobs_only,
+        ) for feat, image_data, lora_name in zip(encoded_inputs, image_data_list, lora_names)))
 
     async def _encode_single(
         self,
@@ -399,8 +431,12 @@ class SGLangSampler(Sampler, CheckpointEngineMixin):
 
         return self._run_in_loop(_encode_all())
 
-    def _register_lora(self, adapter_path: Optional[str], adapter_name: Optional[str] = None) -> Optional[str]:
-        """Register an adapter with sglang and return the name to send as ``lora_path``.
+    async def _aregister_lora(self, adapter_path: Optional[str],
+                              adapter_name: Optional[str] = None) -> Optional[str]:
+        """Async :meth:`_register_lora`: register an adapter on the event loop, return its ``lora_path``.
+
+        Split out so the async generation core (``_generate_inputs``) can ``await`` it directly; calling
+        the blocking ``_register_lora`` from inside the loop would re-enter ``_run_in_loop`` and deadlock.
 
         Cached by path: ``load_lora_adapter`` on an already-registered name is an error, and per-input
         adapters would otherwise re-register the same adapter once per request. When no name is given
@@ -412,10 +448,20 @@ class SGLangSampler(Sampler, CheckpointEngineMixin):
             return self._registered_loras[adapter_path]
         lora_name = adapter_name or f'lora_{len(self._registered_loras)}'
         logger.info(f'Loading LoRA {lora_name!r} from {adapter_path}')
-        local_path = HubOperation.download_model(model_id_or_path=adapter_path)
-        self._run_in_loop(self.engine.load_lora_adapter(lora_name=lora_name, lora_path=local_path))
+        # Offload the (blocking) hub download off the event loop so it cannot stall other in-flight
+        # generations sharing this loop.
+        local_path = await asyncio.to_thread(HubOperation.download_model, model_id_or_path=adapter_path)
+        await self.engine.load_lora_adapter(lora_name=lora_name, lora_path=local_path)
         self._registered_loras[adapter_path] = lora_name
         return lora_name
+
+    def _register_lora(self, adapter_path: Optional[str], adapter_name: Optional[str] = None) -> Optional[str]:
+        """Register an adapter with sglang and return the name to send as ``lora_path``.
+
+        Blocking wrapper over :meth:`_aregister_lora` for callers outside the event loop (``encode``,
+        ``sample_stream``).
+        """
+        return self._run_in_loop(self._aregister_lora(adapter_path, adapter_name))
 
     def sample_stream(
         self,

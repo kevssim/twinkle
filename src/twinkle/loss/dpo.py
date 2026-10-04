@@ -18,6 +18,25 @@ if TYPE_CHECKING:
     import torch
 
 
+def _get_exp_cap(value: 'torch.Tensor', decimal: int = 4) -> 'torch.Tensor':
+    """dtype-aware exponent cap: ``floor(log(finfo(dtype).max) * 10**decimal) / 10**decimal``.
+
+    Mirrors the legacy DPOTrainer helper so the alpha-divergence branch saturates at the largest
+    exponent the tensor dtype can represent instead of a hard-coded constant.
+    """
+    import torch
+    vdtype_max = torch.zeros([1]).to(value.dtype) + torch.finfo(value.dtype).max
+    vdtype_log_max = torch.log(vdtype_max).to(value.device)
+    return torch.floor(vdtype_log_max * 10**decimal) / 10**decimal if decimal > 0 else vdtype_log_max
+
+
+def _cap_exp(value: 'torch.Tensor', cap: float = -1) -> 'torch.Tensor':
+    """``exp(clamp(value, max=cap))``; ``cap < 0`` derives the dtype-aware cap from ``_get_exp_cap``."""
+    import torch
+    cap = _get_exp_cap(value) if cap < 0 else cap
+    return torch.exp(torch.clamp(value, max=cap))
+
+
 class PreferenceLossBase(Loss):
     """Base class for preference optimization losses with shared utilities."""
 
@@ -116,34 +135,68 @@ class DPOLoss(PreferenceLossBase):
 
     Args:
         beta: Temperature parameter controlling how much to deviate from ref policy (default: 0.1).
-        label_smoothing: Label smoothing parameter for soft labels (default: 0.0).
+        label_smoothing: Label smoothing parameter for soft labels (default: 0.0). Only applied on the
+            'sigmoid' variant; rejected unless 'sigmoid' is among ``loss_type``.
         ignore_index: Index to ignore in labels (default: -100).
-        loss_type: Type of DPO loss variant ('sigmoid', 'hinge', 'ipo', 'kto_pair') (default: 'sigmoid').
+        loss_type: One DPO variant or a list of variants combined as a weighted sum (MPO). Each item is
+            one of 'sigmoid', 'hinge', 'ipo', 'kto_pair', 'discopop' (default: 'sigmoid').
         reference_free: Whether to use reference-free DPO (default: False).
         sft_weight: Weight for SFT loss on chosen responses to prevent likelihood displacement (default: 0.0).
+        ld_alpha: Length-desensitization coefficient. When set, the policy sequence logps keep the shared
+            prefix of each chosen/rejected pair at full weight and down-weight the length-dependent suffix
+            by ``ld_alpha`` (applied to the policy only, never the reference) (default: None).
+        discopop_tau: Temperature of the DiscoPOP log-ratio modulation gate (default: 0.05).
+        f_divergence_type: f-divergence reshaping the preference margin before the per-variant transform;
+            one of 'reverse_kl', 'forward_kl', 'js_divergence', 'alpha_divergence' (default: 'reverse_kl').
+            'reverse_kl' and 'forward_kl' both reduce to the plain Bradley-Terry margin.
+        f_alpha_divergence_coef: Coefficient of the 'alpha_divergence' branch (default: 0.5).
+        loss_weights: Per-variant weights aligned with ``loss_type`` when it is a list (MPO). If given, its
+            length must equal the number of variants; otherwise every variant weighs 1.0 (default: None).
     """
+
+    _DPO_VARIANTS = ('sigmoid', 'hinge', 'ipo', 'kto_pair', 'discopop')
+    _F_DIVERGENCE_TYPES = ('reverse_kl', 'forward_kl', 'js_divergence', 'alpha_divergence')
 
     def __init__(
         self,
         beta: float = 0.1,
         label_smoothing: float = 0.0,
         ignore_index: int = -100,
-        loss_type: str = 'sigmoid',
+        loss_type: Union[str, List[str]] = 'sigmoid',
         reference_free: bool = False,
         sft_weight: float = 0.0,
+        ld_alpha: Optional[float] = None,
+        discopop_tau: float = 0.05,
+        f_divergence_type: str = 'reverse_kl',
+        f_alpha_divergence_coef: float = 0.5,
+        loss_weights: Optional[List[float]] = None,
         **kwargs,
     ):
         super().__init__(ignore_index=ignore_index)
-        if loss_type not in ('sigmoid', 'hinge', 'ipo', 'kto_pair'):
-            raise ValueError(f'Unknown loss_type: {loss_type}')
-        if label_smoothing > 0 and loss_type != 'sigmoid':
-            raise ValueError(f'label_smoothing > 0 is only defined for loss_type="sigmoid", '
-                             f'got loss_type="{loss_type}". Set label_smoothing=0.0 or switch to sigmoid.')
+        loss_types = [loss_type] if isinstance(loss_type, str) else list(loss_type)
+        if not loss_types:
+            raise ValueError('loss_type must name at least one DPO variant.')
+        for variant in loss_types:
+            if variant not in self._DPO_VARIANTS:
+                raise ValueError(f'Unknown loss_type: {variant}')
+        if loss_weights is not None and len(loss_weights) != len(loss_types):
+            raise ValueError(f'loss_weights must align with loss_type '
+                             f'({len(loss_weights)} weights for {len(loss_types)} variants).')
+        if label_smoothing > 0 and 'sigmoid' not in loss_types:
+            raise ValueError('label_smoothing > 0 is only defined for loss_type="sigmoid", '
+                             f'got loss_type={loss_types}. Set label_smoothing=0.0 or include sigmoid.')
+        if f_divergence_type not in self._F_DIVERGENCE_TYPES:
+            raise ValueError(f'Unknown f_divergence_type: {f_divergence_type}')
         self.beta = beta
         self.label_smoothing = label_smoothing
-        self.loss_type = loss_type
+        self.loss_types = loss_types
         self.reference_free = reference_free
         self.sft_weight = sft_weight
+        self.ld_alpha = ld_alpha
+        self.discopop_tau = discopop_tau
+        self.f_divergence_type = f_divergence_type
+        self.f_alpha_divergence_coef = f_alpha_divergence_coef
+        self.loss_weights = loss_weights
 
     def _compute_dpo_loss(
         self,
@@ -152,7 +205,7 @@ class DPOLoss(PreferenceLossBase):
         reference_chosen_logps: 'torch.Tensor',
         reference_rejected_logps: 'torch.Tensor',
     ) -> 'torch.Tensor':
-        """Compute the DPO loss.
+        """Compute the DPO loss, summing every configured variant weighted by ``loss_weights`` (MPO).
 
         Args:
             policy_chosen_logps: [batch/2] log probs of chosen under current policy
@@ -163,7 +216,6 @@ class DPOLoss(PreferenceLossBase):
         Returns:
             loss: Scalar DPO loss
         """
-        import torch
         import torch.nn.functional as F
 
         # Compute log ratios
@@ -175,39 +227,107 @@ class DPOLoss(PreferenceLossBase):
             chosen_logratios = policy_chosen_logps - reference_chosen_logps
             rejected_logratios = policy_rejected_logps - reference_rejected_logps
 
-        # Preference margin: the raw log-ratio difference h = (chosen - rejected). beta is applied
-        # per loss_type below rather than folded in here, because ipo operates on h itself (its target
-        # 1/(2*beta) lives in h-space), not on beta*h.
-        margin = chosen_logratios - rejected_logratios
+        # Plain Bradley-Terry margin h = (chosen - rejected). beta is applied per variant rather than folded
+        # in here, because ipo operates on h itself (its target 1/(2*beta) lives in h-space), not on beta*h.
+        plain_margin = chosen_logratios - rejected_logratios
 
-        if self.loss_type == 'sigmoid':
+        # Divergence-aware margin: the f-divergence family reshapes h before the per-variant transform.
+        # reverse_kl (default) and forward_kl both reduce to the plain margin (legacy does not fork them);
+        # js_divergence subtracts the softplus difference; alpha_divergence uses the capped-exponential form.
+        if self.f_divergence_type == 'alpha_divergence':
+            coef = self.f_alpha_divergence_coef
+            divergence_margin = (_cap_exp(rejected_logratios * -coef) - _cap_exp(chosen_logratios * -coef)) / coef
+        else:
+            divergence_margin = plain_margin
+            if self.f_divergence_type == 'js_divergence':
+                divergence_margin = divergence_margin - (
+                    F.softplus(chosen_logratios) - F.softplus(rejected_logratios))
+
+        # Sum the per-variant, per-sample losses weighted by loss_weights (each 1.0 when unset), then mean.
+        # The margin / divergence terms are computed once and shared by every variant.
+        weights = self.loss_weights
+        total = None
+        for idx, loss_type in enumerate(self.loss_types):
+            variant = self._variant_losses(loss_type, divergence_margin, plain_margin, chosen_logratios,
+                                           rejected_logratios)
+            weight = weights[idx] if weights is not None else 1.0
+            total = variant * weight if total is None else total + variant * weight
+        return total.mean()
+
+    def _variant_losses(
+        self,
+        loss_type: str,
+        divergence_margin: 'torch.Tensor',
+        plain_margin: 'torch.Tensor',
+        chosen_logratios: 'torch.Tensor',
+        rejected_logratios: 'torch.Tensor',
+    ) -> 'torch.Tensor':
+        """Per-sample losses for a single DPO variant (element-wise faithful to the legacy branch).
+
+        sigmoid/hinge/ipo consume the divergence-aware margin; kto_pair uses the raw log-ratios; discopop
+        recomputes from the plain margin because the legacy discopop branch ignores f_divergence.
+        """
+        import torch
+        import torch.nn.functional as F
+
+        if loss_type == 'sigmoid':
             # Standard DPO loss: -log(sigmoid(beta * h))
-            logits = self.beta * margin
+            logits = self.beta * divergence_margin
             losses = -F.logsigmoid(logits)
             # Apply label smoothing (only meaningful here: Bradley-Terry soft labels).
             if self.label_smoothing > 0:
                 # Soft labels: (1 - eps) * loss_chosen + eps * loss_rejected
                 smooth_losses = -F.logsigmoid(-logits)  # Loss for flipped preference
                 losses = (1 - self.label_smoothing) * losses + self.label_smoothing * smooth_losses
-        elif self.loss_type == 'hinge':
+            return losses
+        if loss_type == 'hinge':
             # Hinge loss variant
-            losses = torch.relu(1 - self.beta * margin)
-        elif self.loss_type == 'ipo':
+            return torch.relu(1 - self.beta * divergence_margin)
+        if loss_type == 'ipo':
             # IPO (Identity Preference Optimization) loss
             # Reference: "A General Theoretical Paradigm to Understand Learning from Human Feedback"
             # eq 17: (h - 1/(2*beta))**2 on the raw margin h (NOT beta-scaled).
-            losses = (margin - 1 / (2 * self.beta))**2
-        elif self.loss_type == 'kto_pair':
+            return (divergence_margin - 1 / (2 * self.beta))**2
+        if loss_type == 'kto_pair':
             # KTO pair loss (simplified version)
-            chosen_logratios_scaled = self.beta * chosen_logratios
-            rejected_logratios_scaled = self.beta * rejected_logratios
-            chosen_losses = 1 - F.sigmoid(chosen_logratios_scaled)
-            rejected_losses = F.sigmoid(rejected_logratios_scaled)
-            losses = chosen_losses + rejected_losses
-        else:
-            raise ValueError(f'Unknown loss_type: {self.loss_type}')
+            chosen_losses = 1 - F.sigmoid(self.beta * chosen_logratios)
+            rejected_losses = F.sigmoid(self.beta * rejected_logratios)
+            return chosen_losses + rejected_losses
+        if loss_type == 'discopop':
+            # DiscoPOP: legacy recomputes the plain margin here (f_divergence is NOT applied) and scales by beta.
+            logits = self.beta * plain_margin
+            log_ratio_modulation = torch.sigmoid(logits / self.discopop_tau)
+            logistic_component = -F.logsigmoid(logits)
+            exp_component = torch.exp(-logits)
+            return logistic_component * (1 - log_ratio_modulation) + exp_component * log_ratio_modulation
+        raise ValueError(f'Unknown loss_type: {loss_type}')
 
-        return losses.mean()
+    def _compute_sequence_logps_ld(
+        self,
+        per_token_logps: 'torch.Tensor',
+        labels: 'torch.Tensor',
+        ld_alpha: float,
+    ) -> 'torch.Tensor':
+        """Length-desensitization sequence logps over the INTERLEAVED layout [c1, r1, c2, r2, ...].
+
+        Pair k = (row 2k, row 2k+1). The shared prefix of length min(len_c, len_r) is kept at full weight
+        and the length-dependent suffix is down-weighted by ``ld_alpha``. This is the legacy DPOTrainer
+        standard branch adapted from the split [chosen..., rejected...] layout to the interleaved one:
+        ``public.repeat_interleave(2)`` maps public[k] onto rows 2k and 2k+1.
+        """
+        import torch
+        loss_mask = (labels != self.ignore_index)
+        completion_lengths = loss_mask.sum(dim=1)
+        public_lengths = torch.minimum(completion_lengths[0::2], completion_lengths[1::2])
+        public_row = public_lengths.repeat_interleave(2)
+        # cumsum over the float mask gives the 1-indexed position within the completion; shift to 0-indexed.
+        position_ids = (loss_mask.float().cumsum(dim=1) - 1) * loss_mask.float()
+        ld_mask = position_ids < public_row.unsqueeze(1)
+        front_mask = (ld_mask & loss_mask).float()
+        rear_mask = (~ld_mask & loss_mask).float()
+        front_logps = (per_token_logps * front_mask).sum(dim=1)
+        rear_logps = (per_token_logps * rear_mask).sum(dim=1)
+        return front_logps + ld_alpha * rear_logps
 
     def __call__(
         self,
@@ -266,9 +386,15 @@ class DPOLoss(PreferenceLossBase):
         chosen_labels, rejected_labels = self._split_chosen_rejected(labels)
         chosen_logps, rejected_logps = self._split_chosen_rejected(logps)
 
-        # Compute sequence-level log probs for policy
-        policy_chosen_logps = self._compute_sequence_logps(chosen_logps, chosen_labels)
-        policy_rejected_logps = self._compute_sequence_logps(rejected_logps, rejected_labels)
+        # Compute sequence-level log probs for policy. With ld_alpha the length-desensitization front/rear
+        # split must be paired across the interleaved layout, so it runs on the full [B, T] tensor before
+        # splitting. Legacy applies ld_alpha to the policy only; the reference logps below keep the plain sum.
+        if self.ld_alpha is not None:
+            policy_logps = self._compute_sequence_logps_ld(logps, labels, self.ld_alpha)
+            policy_chosen_logps, policy_rejected_logps = self._split_chosen_rejected(policy_logps)
+        else:
+            policy_chosen_logps = self._compute_sequence_logps(chosen_logps, chosen_labels)
+            policy_rejected_logps = self._compute_sequence_logps(rejected_logps, rejected_labels)
 
         # Handle reference log probs
         if ref_chosen_logps is not None and ref_rejected_logps is not None:

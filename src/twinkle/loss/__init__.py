@@ -5,7 +5,7 @@ from .chunked_cross_entropy import ChunkedCrossEntropyLoss
 from .cross_entropy import CrossEntropyLoss
 from .dpo import CPOLoss, DPOLoss, KTOLoss, ORPOLoss, SimPOLoss
 from .gkd import GKDLoss
-from .grpo import BNPOLoss, CISPOLoss, DRGRPOLoss, GRPOLoss, GSPOLoss, PPOLoss, SAPOLoss
+from .grpo import BNPOLoss, CISPOLoss, DRGRPOLoss, GRPOLoss, GSPOLoss, PPOLoss, REALLoss, SAPOLoss
 from .infonce import ContrastiveLoss, CosineSimilarityLoss, EmbeddingLoss, InfonceLoss, OnlineContrastiveLoss
 from .liger_fused_linear_cross_entropy import LigerFusedLinearCrossEntropyLoss
 from .liger_fused_linear_grpo import LigerFusedLinearGRPOLoss
@@ -35,6 +35,7 @@ torch_loss_mapping = {
     'cispo': CISPOLoss,
     'bnpo': BNPOLoss,
     'dr_grpo': DRGRPOLoss,
+    'real': REALLoss,
     # Self-distillation losses
     'opsd': OPSDLoss,
     'mopd': MOPDLoss,

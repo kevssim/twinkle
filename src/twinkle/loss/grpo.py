@@ -341,6 +341,28 @@ class GRPOLoss(Loss):
 
         # ── Compute loss ────────────────────────────────────────────────
         log_importance_weights = self._compute_log_importance_weights(logps, old_logps, loss_mask)
+        return self._reduce_loss(logps, old_logps, ref_logps, advantages, loss_mask, log_importance_weights,
+                                 outputs, **kwargs)
+
+    def _reduce_loss(
+        self,
+        logps: 'torch.Tensor',
+        old_logps: 'torch.Tensor',
+        ref_logps: Optional['torch.Tensor'],
+        advantages: 'torch.Tensor',
+        loss_mask: 'torch.Tensor',
+        log_importance_weights: 'torch.Tensor',
+        outputs: Dict,
+        **kwargs,
+    ) -> LossOutput:
+        """Reduce the per-token importance weights to the scalar ``LossOutput``.
+
+        This is the extension seam for objectives that reshape the surrogate at the sequence / group
+        level instead of per token (e.g. ``REALLoss``). The base implementation is the standard clipped
+        PPO surrogate plus the optional KL penalty and entropy bonus, aggregated by ``_aggregate_loss``
+        -- byte-for-byte identical to inlining it at the tail of ``__call__``.
+        """
+        import torch
         ratio = torch.exp(log_importance_weights)
 
         per_token_loss = self._compute_per_token_loss(ratio, advantages, logps)
@@ -600,3 +622,85 @@ class DRGRPOLoss(GRPOLoss):
         """Normalize by batch_size * max_completion_length."""
         batch_size = loss_mask.shape[0]
         return (per_token_loss * loss_mask).sum() / (batch_size * self.max_completion_length)
+
+
+class REALLoss(GRPOLoss):
+    """REAL: a group-level soft-constraint objective (https://arxiv.org/abs/2602.05630).
+
+    Instead of the clipped per-token surrogate, REAL reduces each sequence to a scalar score (its mean
+    token log importance ratio), splits every generation group into positive- and negative-advantage
+    members, and applies a symmetric log-sum-exp soft constraint that pushes positive scores up and
+    negative scores down against a zero baseline, temperature-scaled by ``real_tau``. A group that is
+    all-positive or all-negative carries no contrastive signal and is skipped; if every group is
+    degenerate the loss collapses to a zero that stays connected to autograd.
+
+    Args:
+        real_tau: Softmax temperature scaling the per-group scores (default: 0.5).
+        num_generations: Group size; must divide the batch so ``view(-1, num_generations)`` is exact.
+    """
+
+    def __init__(self, real_tau: float = 0.5, num_generations: int = 1, **kwargs):
+        super().__init__(**kwargs)
+        self.real_tau = real_tau
+        self.num_generations = num_generations
+
+    def _reduce_loss(
+        self,
+        logps: 'torch.Tensor',
+        old_logps: 'torch.Tensor',
+        ref_logps: Optional['torch.Tensor'],
+        advantages: 'torch.Tensor',
+        loss_mask: 'torch.Tensor',
+        log_importance_weights: 'torch.Tensor',
+        outputs: Dict,
+        **kwargs,
+    ) -> LossOutput:
+        import torch
+        batch_size = loss_mask.shape[0]
+        assert self.num_generations > 0 and batch_size % self.num_generations == 0, (
+            f'REAL needs num_generations ({self.num_generations}) to divide the batch ({batch_size}) '
+            'into whole groups.')
+        mask_sum = loss_mask.sum(-1).clamp(min=1.0)
+
+        # Per-sequence score = mean token log importance ratio. Legacy REAL uses the UNCLAMPED token log
+        # ratio (grpo_trainer.py:1022,1105), so recompute it from logps/old_logps rather than reuse the
+        # base class's clamped log_importance_weights; the group scores then match legacy element-wise.
+        log_ratio = logps - old_logps
+        global_scores = (log_ratio * loss_mask).sum(-1) / mask_sum
+        # advantages is per-token [B, T] (constant across tokens without a teacher); reduce to a scalar.
+        seq_advantages = (advantages * loss_mask).sum(-1) / mask_sum
+
+        group_scores = global_scores.view(-1, self.num_generations)
+        group_rewards = seq_advantages.view(-1, self.num_generations)
+
+        pos_mask = group_rewards > 0
+        neg_mask = group_rewards <= 0
+        valid_mask = (pos_mask.sum(dim=1) != 0) & (neg_mask.sum(dim=1) != 0)
+
+        if not bool(valid_mask.any()):
+            loss = global_scores.mean() * 0.0
+        else:
+            batch_scores = group_scores[valid_mask]
+            batch_pos_mask = pos_mask[valid_mask]
+            batch_neg_mask = neg_mask[valid_mask]
+
+            scaled_scores = batch_scores / self.real_tau
+            zeros = torch.zeros(batch_scores.size(0), 1, device=batch_scores.device, dtype=batch_scores.dtype)
+
+            # Negative loss: log(1 + sum(exp(S_neg)))
+            neg_input = scaled_scores.masked_fill(~batch_neg_mask, float('-inf'))
+            neg_loss = torch.logsumexp(torch.cat([neg_input, zeros], dim=1), dim=1)
+            # Positive loss: log(1 + sum(exp(-S_pos)))
+            pos_input = (-scaled_scores).masked_fill(~batch_pos_mask, float('-inf'))
+            pos_loss = torch.logsumexp(torch.cat([pos_input, zeros], dim=1), dim=1)
+
+            loss = (neg_loss + pos_loss).sum() / group_rewards.size(0)
+
+        # REAL's KL is a standalone global token-mean term (legacy grpo_trainer.py:1137-1139), not the
+        # per-token penalty the base surrogate folds into per_token_loss.
+        if self.beta != 0.0 and ref_logps is not None:
+            per_token_kl = torch.exp(ref_logps - logps) - (ref_logps - logps) - 1
+            kl_loss = (per_token_kl * loss_mask).sum() / loss_mask.sum().clamp(min=1.0)
+            loss = loss + self.beta * kl_loss
+
+        return LossOutput(loss=loss, num_tokens=self._loss_num_tokens(loss_mask))

@@ -132,6 +132,17 @@ class DriverStats:
     optimizer_steps: int = 0        # optimizer steps reported by ``consume``
     publishes: int = 0              # weight publications (partition cycles closed)
     final_version: int = 0          # policy version at exit (= publishes)
+    #: Wall-clock seconds the driver thread spent blocked inside ``consume`` (training). The generation
+    #: itself runs on the (disaggregated) sampler in the background and is NOT measured here -- the
+    #: algorithm-agnostic driver cannot see sampler GPU time without instrumenting the data plane.
+    train_active_time: float = 0.0
+    #: Wall-clock seconds spent in the idle ``sleep`` branch: trajectories in flight, none completed this
+    #: pass, buffer not yet trainable -- i.e. the trainer starved for ready work (the trainer bubble).
+    idle_time: float = 0.0
+    #: Wall-clock seconds for the whole :meth:`StreamingDriver.run`, set in its ``finally`` (so it is
+    #: defined on every exit path: drain, budget hit, or error). ``total >= train_active + idle``; the
+    #: residual is the driver's own admit/poll/collect/publish overhead.
+    total_time: float = 0.0
 
 
 def _no_prune() -> None:
@@ -261,6 +272,7 @@ class StreamingDriver:
         # version and the sampler generates from it, never an unpinned base model. None for in-place.
         initial_path = self._initial_adapter_path()
         ctx_mgr.register_context(ctx, adapter_path=initial_path, policy_version=0)
+        _run_start = time.perf_counter()
         prompts = iter(self._prompt_stream)
         # The prompt currently being expanded into trajectories: (prompt_idx, trajectory_idx, group_key).
         # A backpressure cap can interrupt the expansion mid-prompt; the cursor resumes it (carrying the
@@ -377,7 +389,9 @@ class StreamingDriver:
                 #     pulls only; the remainder stays buffered for the next batch).
                 records = self._assembly_ready(ready) if ready else None
                 if records:
+                    _t = time.perf_counter()
                     self._train_pull(records, ready)
+                    self.stats.train_active_time += time.perf_counter() - _t
                     steps_in_cycle += self._last_pull_steps
                     progressed = True
                 elif stream_done and partial is None and pending is None and not handles:
@@ -390,7 +404,9 @@ class StreamingDriver:
                 if not progressed and handles:
                     # Generations in flight, none completed, buffer not (yet) trainable: wait briefly
                     # instead of hot-spinning the poll.
+                    _t = time.perf_counter()
                     self._sleep(0.01)
+                    self.stats.idle_time += time.perf_counter() - _t
         finally:
             # Budget hit, drained, or an error: cancel and unpin everything STILL generating (uncollected
             # handles -- a collected one already released its pin at collect), drop the unusable buffer
@@ -405,6 +421,7 @@ class StreamingDriver:
             for window in self._live_windows():
                 ctx_mgr.on_partition_cleared(window)
             self.stats.final_version = self._current_version()
+            self.stats.total_time = time.perf_counter() - _run_start
 
     # --- internals ---------------------------------------------------------------------------------------
 

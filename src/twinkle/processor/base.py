@@ -45,6 +45,7 @@ class InputProcessor:
         'input_features': 0.0,
         'feature_attention_mask': 0,
         'routed_experts': 0,
+        'replay_mask': 0,
     }
 
     # VLM fields to concatenate (not pad) in batch
@@ -742,6 +743,7 @@ class InputProcessor:
                 'max_length_k',
                 'packed_seq_params',
                 'routed_experts',
+                'replay_mask',
                 'mm_token_type_ids',
                 'second_per_grid_ts',
             ] + list(InputProcessor.VLM_CONCAT_FIELDS)
@@ -978,19 +980,38 @@ class InputProcessor:
             routed_experts = _input.get('routed_experts', None)
             input_ids = _input.get('input_ids', None)
             input_seq_len = input_ids.shape[-1] if input_ids is not None else 0
-            if routed_experts is not None:
-                # The number of experts in the output can be 1 less than (prompt_length + response_token_count)
-                # This gap of 1 is expected
-                # For more details, please refer PR https://github.com/vllm-project/vllm/pull/28284
-                experts_seq_len = routed_experts.shape[0]
-                # Padding routed_experts(seq_len, layer_num, topk) seq_len to match the seq_len of the input_ids
-                padding_routed_experts = routed_experts
-                padding_len = input_seq_len - experts_seq_len
-                if padding_len > 0:
-                    padding_routed_experts = torch.nn.functional.pad(routed_experts, (0, 0, 0, 0, 0, padding_len),
-                                                                     'constant',
-                                                                     self.padding_map.get('routed_experts', 0))
-                _input['routed_experts'] = padding_routed_experts.unsqueeze(0)
+            if routed_experts is None:
+                # No reference routing to replay, so a stray mask is meaningless (and would reach the model
+                # as an unexpected column) -- drop it.
+                _input.pop('replay_mask', None)
+                return _input
+            # The number of experts in the output can be 1 less than (prompt_length + response_token_count)
+            # This gap of 1 is expected
+            # For more details, please refer PR https://github.com/vllm-project/vllm/pull/28284
+            experts_seq_len = routed_experts.shape[0]
+            # Padding routed_experts(seq_len, layer_num, topk) seq_len to match the seq_len of the input_ids
+            padding_routed_experts = routed_experts
+            padding_len = input_seq_len - experts_seq_len
+            if padding_len > 0:
+                padding_routed_experts = torch.nn.functional.pad(routed_experts, (0, 0, 0, 0, 0, padding_len),
+                                                                 'constant',
+                                                                 self.padding_map.get('routed_experts', 0))
+            _input['routed_experts'] = padding_routed_experts.unsqueeze(0)
+
+            # The per-token replay_mask rides alongside routed_experts and must stay token-aligned with it:
+            # pad it to the SAME input_seq_len, and clamp away every row that has no reference routing -- the
+            # sampler's short-by-one tail (PR 28284) plus the CP padding -- so those tokens recompute their
+            # routing natively instead of replaying zero-filled expert ids. prepare_inputs already gave the
+            # mask a leading batch dim ([1, seq]); restore that shape after the seq-axis pad. Kept as long
+            # (0/1) to match routed_experts' int64 through the CP/SP scatter; consumers call ``.bool()``.
+            replay_mask = _input.get('replay_mask', None)
+            if replay_mask is not None:
+                mask = replay_mask.reshape(-1)[:experts_seq_len]
+                mask_pad_len = input_seq_len - mask.shape[0]
+                if mask_pad_len > 0:
+                    mask = torch.nn.functional.pad(mask, (0, mask_pad_len), 'constant',
+                                                   self.padding_map.get('replay_mask', 0))
+                _input['replay_mask'] = mask.to(torch.long).unsqueeze(0)
 
             return _input
 

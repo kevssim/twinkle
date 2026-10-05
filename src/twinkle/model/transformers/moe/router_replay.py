@@ -41,6 +41,10 @@ class _RouterReplayState:
     action: RouterReplayAction = None
     recorded_indices: torch.Tensor | None = None  # [num_tokens, topk]
     target_indices: torch.Tensor | None = None  # [num_tokens, topk]
+    # Per-token mask: True = replay ``target_indices`` for this token, False = recompute the routing
+    # natively from the current (drifting) weights. ``None`` = replay every token, which is byte-identical
+    # to the pre-mask behaviour. Shape ``[num_tokens]``, layer-independent (shared by every MoE block).
+    target_mask: torch.Tensor | None = None
 
 
 _registry: dict[str, _RouterReplayState] = {}
@@ -67,6 +71,7 @@ def clear_global_indices() -> None:
     for state in _registry.values():
         state.recorded_indices = None
         state.target_indices = None
+        state.target_mask = None
 
 
 def get_replay_state(block_name: str) -> _RouterReplayState | None:
@@ -98,12 +103,17 @@ def resolve_router_replay_action(action: Any) -> Optional[RouterReplayAction]:
 def set_router_replay_data(
     routed_experts: torch.Tensor,
     model: nn.Module,
+    replay_mask: torch.Tensor = None,
 ) -> None:
     """Slice *routed_experts* into per-block
     ``target_indices`` and inject them into the registered MoE blocks of *model*.
 
     Each block receives a ``[num_tokens, topk]`` slice covering the tokens
     processed by that layer.
+
+    *replay_mask* (``[bs, seq_len]``, optional) is the per-token mask selecting which tokens replay the
+    reference routing vs recompute natively. It is split by the SAME SP call as *routed_experts* so it
+    stays token-aligned with the indices, then broadcast to every block (the mask is layer-independent).
     """
     if routed_experts is None:
         return
@@ -116,10 +126,15 @@ def set_router_replay_data(
         raise ValueError(f'Expected routed_experts with shape [bs, seq_len, layers, topk], '
                          f'got {tuple(routed_experts.shape)}')
 
-    # SP: slice full-sequence routed_experts to local SP rank tokens.
+    # SP: slice full-sequence routed_experts (and the per-token replay_mask) to local SP rank tokens.
+    # Both travel in one pad_and_split_inputs call so the mask is split identically to the indices and
+    # stays token-aligned with them.
     from ..strategy.sequence_parallel import sequence_parallel as sp
     sp_world_size = getattr(sp, 'sp_world_size', None) or 1
     if sp_world_size > 1:
+        extra_split_values = [(routed_experts, 0, 1)]
+        if replay_mask is not None:
+            extra_split_values.append((replay_mask, 0, 1))
         _, _, _, _, _, _, extra_values = sp.pad_and_split_inputs(
             None,
             None,
@@ -128,11 +143,15 @@ def set_router_replay_data(
             None,
             None,
             real_position_ids=sp.real_position_ids,
-            extra_split_values=[(routed_experts, 0, 1)])
+            extra_split_values=extra_split_values)
         routed_experts = extra_values[0]
+        if replay_mask is not None:
+            replay_mask = extra_values[1]
 
     # [bs, seq_len, num_moe_layers, topk] -> [total_seq, num_moe_layers, topk]
     routed_experts = routed_experts.flatten(0, 1).to(Platform.get_local_device())
+    # [bs, seq_len] -> [total_seq]; per-token (layer-independent), shared by every block.
+    local_mask = replay_mask.flatten(0, 1).to(Platform.get_local_device()) if replay_mask is not None else None
 
     num_layers_in_data = routed_experts.shape[1]
 
@@ -147,6 +166,7 @@ def set_router_replay_data(
         target = routed_experts[:, layer_idx, :].to(torch.int64)
         if target.numel() > 0:
             state.target_indices = target
+            state.target_mask = local_mask
 
 
 def get_router_replay_data(model: nn.Module, batch_size=1) -> torch.Tensor | None:

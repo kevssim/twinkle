@@ -567,7 +567,12 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         apply_router_replay_patch(model)
         self._router_replay_applied = True
 
-    def _router_replay_setup(self, router_replay_action, routed_experts=None, batch_size=1, manual_cleanup=False):
+    def _router_replay_setup(self,
+                             router_replay_action,
+                             routed_experts=None,
+                             batch_size=1,
+                             manual_cleanup=False,
+                             replay_mask=None):
         """Set up routing replay before a model forward.
 
         Returns ``cleanup_fn``.
@@ -592,7 +597,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         set_global_router_replay_action(router_replay_action)
         if router_replay_action == RouterReplayAction.REPLAY_FORWARD:
             assert routed_experts is not None, 'routed_experts must be not None'
-            set_router_replay_data(routed_experts, unwrapped)
+            set_router_replay_data(routed_experts, unwrapped, replay_mask)
 
         def cleanup():
             recorded = None
@@ -693,10 +698,11 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         router_replay_action = kwargs.pop('router_replay_action', None)
         router_replay_manual_cleanup = kwargs.pop('router_replay_manual_cleanup', False)
         routed_experts = inputs.pop('routed_experts', None)
+        replay_mask = inputs.pop('replay_mask', None)
         batch_size = labels.shape[0] if labels is not None else (
             inputs['input_ids'].shape[0] if 'input_ids' in inputs else 1)
         rr_cleanup = self._router_replay_setup(router_replay_action, routed_experts, batch_size,
-                                               router_replay_manual_cleanup)
+                                               router_replay_manual_cleanup, replay_mask)
 
         with _resolve_task_context(self.model, task, template=optimizer_config.template), \
                 _resolve_mm_graph_context(self.model, optimizer_config.template):
@@ -830,10 +836,11 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
             router_replay_action = kwargs.pop('router_replay_action', None)
             router_replay_manual_cleanup = kwargs.pop('router_replay_manual_cleanup', False)
             routed_experts = inputs.pop('routed_experts', None)
+            replay_mask = inputs.pop('replay_mask', None)
             batch_size = labels.shape[0] if labels is not None else (
                 inputs['input_ids'].shape[0] if 'input_ids' in inputs else 1)
             rr_cleanup = self._router_replay_setup(router_replay_action, routed_experts, batch_size,
-                                                   router_replay_manual_cleanup)
+                                                   router_replay_manual_cleanup, replay_mask)
 
             lora_ctx = (
                 unwrapped_model.disable_adapter()

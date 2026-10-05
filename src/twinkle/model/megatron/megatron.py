@@ -667,6 +667,10 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
             # sampler). Popped so it never reaches model(**model_kwargs); consumed by the replay dance
             # below, which slices it to this rank's local (pp, cp, sp) shard.
             routed_experts_mb = batch.pop('routed_experts', None)
+            # Per-token mask selecting which tokens replay the reference routing vs recompute natively
+            # (R3). Built by the processor from the response mask and popped here -- like
+            # ``routed_experts`` it is not a model argument, so it must not reach ``model(**model_kwargs)``.
+            replay_mask_mb = batch.pop('replay_mask', None)
             # MTP joint training. ``labels`` is deliberately withheld from the model so the main loss
             # stays external (twinkle derives log-probs from logits), but the MTP heads still need
             # next-token targets -- so they get them on a separate keyword. Passed only into the model
@@ -677,16 +681,21 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
                 model_kwargs['mtp_labels'] = labels
             unwrapped_model = self.strategy.unwrap_model([model])[0]
             _rr_bs = batch['input_ids'].shape[0] if 'input_ids' in batch else 1
+            # Full (pre-CP) seq length, used only to size a zero-MoE chunk's zero placeholder (an all-dense
+            # VPP chunk / PP stage records no tokens). The processor's split_cp left input_ids at the
+            # CP-local length, and gather_cp_load_balanced rebuilds full = local * cp -- matching what a
+            # MoE chunk derives from its recorded tokens, so the placeholders stay shape-consistent.
+            _rr_full_seq = (batch['input_ids'].shape[1] * (cp_size or 1)) if 'input_ids' in batch else None
             _rr_packed = batch.get('packed_seq_params')
             if rr_pre is not None:
-                rr_pre(rr_action, unwrapped_model, routed_experts_mb, _rr_packed)
+                rr_pre(rr_action, unwrapped_model, routed_experts_mb, _rr_packed, replay_mask_mb)
             if disable_lora and isinstance(unwrapped_model, PeftModel):
                 with unwrapped_model.disable_adapter():
                     output_tensor = model(**model_kwargs)
             else:
                 output_tensor = model(**model_kwargs)
             if rr_post is not None:
-                rr_post(rr_action, unwrapped_model, _rr_packed, _recorded_routing, _rr_bs)
+                rr_post(rr_action, unwrapped_model, _rr_packed, _recorded_routing, _rr_bs, _rr_full_seq)
 
             batch['labels'] = labels
             if loss_scale is not None:
@@ -906,16 +915,19 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
         if rr_action is not None:
             # R2 RECORD: hand the captured whole-model routing back to the driver (symmetric with
             # TransformersModel.forward's return_outputs['routed_experts']) so it can be replayed later.
-            from twinkle.model.megatron.moe.router_replay import (RouterReplayAction, clear_global_indices,
+            from twinkle.model.megatron.moe.router_replay import (RouterReplayAction, assemble_recorded_routing,
+                                                                  clear_global_indices,
                                                                   clear_global_router_replay_action)
             if rr_action == RouterReplayAction.RECORD and _recorded_routing:
-                # Microbatches share a seq length only when sequences are uniform; otherwise keep the
-                # per-microbatch list (exactly how variable-seq ``logps`` is returned above) so the driver
-                # re-aligns each sample's routing to its own input length on the replay forward.
-                if all(r.shape == _recorded_routing[0].shape for r in _recorded_routing):
-                    model_output['routed_experts'] = torch.cat(_recorded_routing, dim=0)
-                else:
-                    model_output['routed_experts'] = _recorded_routing
+                # Regroup the per-(micro-batch x chunk) recordings into the whole-model all-layer tensor:
+                # sum each micro-batch's VPP chunks (schedule order), concatenate micro-batches, and
+                # all-reduce(SUM) across the PP group. Micro-batches share a seq length only when sequences
+                # are uniform; otherwise assemble keeps the per-micro-batch list (exactly how variable-seq
+                # ``logps`` is returned above) so the driver re-aligns each sample's routing on replay.
+                assembled = assemble_recorded_routing(_recorded_routing, unwrapped_model.config,
+                                                      num_microbatches, vpp_size)
+                if assembled is not None:
+                    model_output['routed_experts'] = assembled
             if not router_replay_manual_cleanup:
                 clear_global_router_replay_action()
                 clear_global_indices()

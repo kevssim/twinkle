@@ -1,12 +1,12 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Single-owner control plane for async multi-LoRA RL."""
+"""Single-owner control plane for async RL (full-param or single-LoRA)."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import StrEnum
 
-from .types import LoraContext, PartitionAdmission, RolloutPolicy
+from .types import PartitionAdmission, RLContext, RolloutPolicy
 
 
 class ContextStatus(StrEnum):
@@ -21,7 +21,7 @@ class ContextStatus(StrEnum):
 
 @dataclass
 class _ContextState:
-    context: LoraContext
+    context: RLContext
     policy: RolloutPolicy
     policy_history: list[RolloutPolicy] = field(default_factory=list)
     next_step: int = 0
@@ -34,7 +34,7 @@ class _ContextState:
     max_steps: int | None = None
 
 
-class LoraContextManager:
+class RLContextManager:
     """Ray-safe control plane; it deliberately knows no TQ sample readiness."""
 
     def __init__(self, *, max_staleness: int = 0, max_steps: int | None = None):
@@ -49,7 +49,7 @@ class LoraContextManager:
         self._stop_requested = max_steps == 0
 
     def register_context(self,
-                         context: LoraContext,
+                         context: RLContext,
                          *,
                          adapter_path: str | None = None,
                          policy_version: int = 0,
@@ -67,7 +67,7 @@ class LoraContextManager:
             max_steps=max_steps,
         )
 
-    def reserve_context(self, context: LoraContext, *, max_steps: int | None = None) -> None:
+    def reserve_context(self, context: RLContext, *, max_steps: int | None = None) -> None:
         if context.key in self._contexts:
             raise KeyError(f'context already exists: {context.key}')
         if max_steps is not None and max_steps < 0:
@@ -75,7 +75,7 @@ class LoraContextManager:
         self.register_context(context, status=ContextStatus.ADDING, max_steps=max_steps)
 
     def activate_context(self,
-                         context: LoraContext | str,
+                         context: RLContext | str,
                          *,
                          adapter_path: str | None = None,
                          policy_version: int = 0) -> None:
@@ -87,7 +87,7 @@ class LoraContextManager:
         state.policy_history = [policy]
         state.status = ContextStatus.ACTIVE
 
-    def request_context_drain(self, context: LoraContext | str) -> None:
+    def request_context_drain(self, context: RLContext | str) -> None:
         state = self._state(context)
         if state.status in (ContextStatus.REMOVED, ContextStatus.FAILED):
             return
@@ -95,23 +95,23 @@ class LoraContextManager:
             raise RuntimeError(f'{state.context.key} is still being added')
         state.status = ContextStatus.DRAINING
 
-    def context_is_drained(self, context: LoraContext | str) -> bool:
+    def context_is_drained(self, context: RLContext | str) -> bool:
         return not self._state(context).live_partitions
 
-    def fail_context(self, context: LoraContext | str) -> None:
+    def fail_context(self, context: RLContext | str) -> None:
         state = self._state(context)
         if state.live_partitions:
             raise RuntimeError(f'{state.context.key} still has live partitions')
         state.status = ContextStatus.FAILED
 
-    def unregister_context(self, context: LoraContext | str) -> None:
+    def unregister_context(self, context: RLContext | str) -> None:
         state = self._state(context)
         if state.live_partitions:
             raise RuntimeError(f'{state.context.key} still has live partitions')
         state.status = ContextStatus.REMOVED
         self._contexts.pop(state.context.key)
 
-    def context_snapshot(self, context: LoraContext | str) -> dict[str, object]:
+    def context_snapshot(self, context: RLContext | str) -> dict[str, object]:
         state = self._state(context)
         return {
             'context': state.context,
@@ -128,15 +128,15 @@ class LoraContextManager:
     def list_context_snapshots(self) -> list[dict[str, object]]:
         return [self.context_snapshot(key) for key in self._contexts]
 
-    def context_adapter_paths(self, context: LoraContext | str) -> list[str]:
+    def context_adapter_paths(self, context: RLContext | str) -> list[str]:
         return [
             policy.adapter_path for policy in self._state(context).policy_history if policy.adapter_path is not None
         ]
 
-    def get_rollout_policy(self, context: LoraContext | str) -> RolloutPolicy:
+    def get_rollout_policy(self, context: RLContext | str) -> RolloutPolicy:
         return self._state(context).policy
 
-    def acquire_rollout_policy(self, context: LoraContext | str) -> RolloutPolicy:
+    def acquire_rollout_policy(self, context: RLContext | str) -> RolloutPolicy:
         """Pin the current policy while one sampler request is using it."""
         state = self._state(context)
         policy = state.policy
@@ -159,7 +159,7 @@ class LoraContextManager:
         else:
             references[policy.adapter_path] = count - 1
 
-    def request_rollout_partition(self, context: LoraContext | str, *, target_groups: int,
+    def request_rollout_partition(self, context: RLContext | str, *, target_groups: int,
                                   num_generations: int) -> PartitionAdmission | None:
         state = self._state(context)
         if target_groups <= 0 or num_generations <= 0:
@@ -210,7 +210,7 @@ class LoraContextManager:
             partitions.append(min(state.live_partitions.values(), key=lambda admission: admission.step))
         return sorted(partitions, key=lambda admission: admission.created_order)
 
-    def on_dataset_exhausted(self, context: LoraContext | str) -> None:
+    def on_dataset_exhausted(self, context: RLContext | str) -> None:
         state = self._state(context)
         state.dataset_exhausted = True
         if state.status is ContextStatus.ACTIVE:
@@ -227,7 +227,7 @@ class LoraContextManager:
             raise RuntimeError(f'{admission.partition_id} cannot train before {oldest_partition.partition_id}')
         state.training_partition_id = admission.partition_id
 
-    def on_partition_trained(self, admission: PartitionAdmission, *, adapter_path: str) -> RolloutPolicy:
+    def on_partition_trained(self, admission: PartitionAdmission, *, adapter_path: str | None) -> RolloutPolicy:
         state = self._state(admission.context)
         self._require_live(state, admission)
         next_policy = RolloutPolicy(state.context.key, state.context.adapter_name, state.policy.version + 1,
@@ -281,14 +281,14 @@ class LoraContextManager:
             paths.update(state.rollout_policy_references)
         return paths
 
-    def context_status(self, context: LoraContext | str) -> ContextStatus:
+    def context_status(self, context: RLContext | str) -> ContextStatus:
         return self._state(context).status
 
     def _finish_if_drained(self, state: _ContextState) -> None:
         if state.dataset_exhausted and not state.live_partitions and state.status is ContextStatus.EXHAUSTED:
             state.status = ContextStatus.FINISHED
 
-    def _state(self, context: LoraContext | str) -> _ContextState:
+    def _state(self, context: RLContext | str) -> _ContextState:
         key = context if isinstance(context, str) else context.key
         return self._contexts[key]
 
@@ -296,3 +296,8 @@ class LoraContextManager:
     def _require_live(state: _ContextState, admission: PartitionAdmission) -> None:
         if state.live_partitions.get(admission.partition_id) != admission:
             raise KeyError(f'unknown live partition {admission.partition_id}')
+
+
+# Backward-compatible alias: ``RLContextManager`` generalizes the former
+# ``LoraContextManager`` (it now governs full-param runs as well as single-LoRA).
+LoraContextManager = RLContextManager

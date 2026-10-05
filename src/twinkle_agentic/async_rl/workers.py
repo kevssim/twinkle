@@ -12,11 +12,11 @@ from collections.abc import Callable, Iterable, Sequence
 from typing import Any
 
 from twinkle.metric import MetricBuffer, MetricRecord
-from .context_manager import ContextStatus, LoraContextManager
+from .context_manager import ContextStatus, RLContextManager
 from .data_plane import TQDataPlane
 from .metrics import advantage_signal_metrics, training_policy_metrics
 from .scheduler import ContextScheduler, ScheduleCandidate, SchedulerConfig
-from .types import LoraContext, PartitionAdmission
+from .types import PartitionAdmission, RLContext
 
 
 class _Worker:
@@ -58,7 +58,7 @@ class _Worker:
         self,
         stage: str,
         *,
-        context: LoraContext | None = None,
+        context: RLContext | None = None,
         admission: PartitionAdmission | None = None,
         partition_id: str | None = None,
         values: dict[str, Any] | None = None,
@@ -97,7 +97,7 @@ class RolloutWorker(_Worker):
 
     def __init__(self,
                  *,
-                 context_manager: LoraContextManager,
+                 context_manager: RLContextManager,
                  data_plane: TQDataPlane,
                  sampler: Any,
                  prompt_batches: dict[str, Iterable[Sequence[dict[str, Any]]]
@@ -126,7 +126,7 @@ class RolloutWorker(_Worker):
 
     async def register_context(
         self,
-        context: LoraContext,
+        context: RLContext,
         prompt_batches: Iterable[Sequence[dict[str, Any]]] | Callable[[], Iterable[Sequence[dict[str, Any]]]],
         rollout_config: dict[str, Any],
     ) -> None:
@@ -140,7 +140,7 @@ class RolloutWorker(_Worker):
             self._start_next_batch(key)
         self._contexts_changed.set()
 
-    async def unregister_context(self, context: LoraContext | str) -> None:
+    async def unregister_context(self, context: RLContext | str) -> None:
         key = context if isinstance(context, str) else context.key
         task = self._next_batch_tasks.pop(key, None)
         if task is not None:
@@ -273,7 +273,7 @@ class AdvantageWorker(_Worker):
 
     def __init__(self,
                  *,
-                 context_manager: LoraContextManager,
+                 context_manager: RLContextManager,
                  data_plane: TQDataPlane,
                  advantage_fn: Callable[[Any, PartitionAdmission], tuple[Sequence[float], Sequence[float]]],
                  scheduler: SchedulerConfig,
@@ -349,10 +349,10 @@ class TrainerWorker(_Worker):
 
     def __init__(self,
                  *,
-                 context_manager: LoraContextManager,
+                 context_manager: RLContextManager,
                  data_plane: TQDataPlane,
                  train_fn: Callable[[Any, PartitionAdmission], dict[str, Any] | None],
-                 save_adapter: Callable[[PartitionAdmission], str],
+                 save_adapter: Callable[[PartitionAdmission], str | None],
                  mini_batch_sizes: dict[str, int],
                  scheduler: SchedulerConfig,
                  train_with_config_fn: Callable[[Any, PartitionAdmission, Any], dict[str, Any] | None] | None = None,
@@ -395,7 +395,7 @@ class TrainerWorker(_Worker):
 
     async def register_context(
         self,
-        context: LoraContext,
+        context: RLContext,
         *,
         mini_batch_size: int,
         train_batch_config: Any | None = None,
@@ -416,7 +416,7 @@ class TrainerWorker(_Worker):
         if evaluation_reward is not None:
             self.evaluation_rewards[key] = evaluation_reward
 
-    async def unregister_context(self, context: LoraContext | str) -> None:
+    async def unregister_context(self, context: RLContext | str) -> None:
         key = context if isinstance(context, str) else context.key
         self.mini_batch_sizes.pop(key, None)
         self.train_batch_configs.pop(key, None)
@@ -548,10 +548,16 @@ class TrainerWorker(_Worker):
         release_started = time.perf_counter()
         await self.context_manager.on_partition_cleared.remote(admission)
         partition_release_latency_s = time.perf_counter() - release_started
-        self._adapter_history[admission.context.key].append(adapter_path)
-        prune_started = time.perf_counter()
-        await self._prune_adapter_history(admission.context)
-        adapter_prune_schedule_latency_s = time.perf_counter() - prune_started
+        # An in-place weight sync returns no handle: with a single overwritten live copy there is no
+        # per-version snapshot to retain or delete, so the disk-adapter history and prune apply only
+        # to path handles (AdapterSnapshotSync).
+        if adapter_path is not None:
+            self._adapter_history[admission.context.key].append(adapter_path)
+            prune_started = time.perf_counter()
+            await self._prune_adapter_history(admission.context)
+            adapter_prune_schedule_latency_s = time.perf_counter() - prune_started
+        else:
+            adapter_prune_schedule_latency_s = 0.0
         self._record_metric(
             'partition',
             context=admission.context,
@@ -626,7 +632,7 @@ class TrainerWorker(_Worker):
             policy_version=policy_version,
         )
 
-    async def _prune_adapter_history(self, context: LoraContext) -> None:
+    async def _prune_adapter_history(self, context: RLContext) -> None:
         protected = set(await self.context_manager.adapter_paths_to_keep.remote())
         context_key = context.key
         history = self._adapter_history[context_key]
@@ -639,7 +645,7 @@ class TrainerWorker(_Worker):
             self._adapter_removal_tasks.add(task)
             task.add_done_callback(self._adapter_removal_tasks.discard)
 
-    async def _remove_adapter(self, context: LoraContext, path: str) -> None:
+    async def _remove_adapter(self, context: RLContext, path: str) -> None:
         started = time.perf_counter()
         try:
             await asyncio.to_thread(self.remove_adapter, path)

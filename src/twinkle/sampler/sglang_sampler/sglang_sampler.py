@@ -4,6 +4,7 @@ import asyncio
 import atexit
 import os
 import threading
+import uuid
 from copy import copy
 from typing import Any, Dict, List, Optional, Type, Union
 
@@ -17,6 +18,7 @@ from twinkle.hub import HubOperation
 from twinkle.patch import Patch, apply_patch
 from twinkle.sampler.base import Sampler
 from twinkle.sampler.generation_submission import GenerationSubmissionMixin
+from twinkle.sampler.partial_rollout import PartialRolloutMixin
 from twinkle.utils import Platform
 
 logger = get_logger()
@@ -40,7 +42,7 @@ def _convert_ndarray_to_list(obj: Any) -> Any:
 
 
 @remote_class()
-class SGLangSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin):
+class SGLangSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, PartialRolloutMixin):
     """An sglang-based sampler using :class:`SGLangEngine`.
 
     Mirrors :class:`vLLMSampler`: tensor parallelism is taken from the visible devices unless given
@@ -92,6 +94,10 @@ class SGLangSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin):
         # In-flight non-blocking generations keyed by submission id (GenerationSubmissionMixin). Each
         # entry is a concurrent.futures.Future scheduled on ``self._async_loop`` above.
         self._generation_submissions: Dict[str, Any] = {}
+
+        # Engine request ids currently mid-generation (PartialRolloutMixin), so an in-place weight republish
+        # can abort them and let each resume on the fresh weights. Only touched from ``self._async_loop``.
+        self._inflight_request_ids: set = set()
 
         from .sglang_engine import SGLangEngine
         engine_kwargs = engine_args.copy() if engine_args else {}
@@ -185,14 +191,28 @@ class SGLangSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin):
         image_data: Optional[List[Any]] = None,
         lora_name: Optional[str] = None,
         logprobs_only: bool = False,
+        request_id: Optional[str] = None,
     ) -> SampleResponse:
-        """Sample a single input asynchronously."""
-        response = await self.engine.sample(
-            prompt=feat['input_ids'],
-            sampling_params=sampling_params,
-            image_data=image_data,
-            lora_name=lora_name,
-        )
+        """Sample a single input asynchronously.
+
+        ``request_id`` is this generation's engine handle (sglang's ``rid``): auto-generated when not given,
+        and registered as in-flight for the duration of the call so :meth:`abort_all_inflight`
+        (PartialRolloutMixin) can interrupt it and let a partial rollout resume from the tokens it produced
+        before the abort. Mirrors ``vLLMSampler._sample_single`` so the resume loop is backend-agnostic.
+        """
+        if request_id is None:
+            request_id = uuid.uuid4().hex
+        self._register_inflight(request_id)
+        try:
+            response = await self.engine.sample(
+                prompt=feat['input_ids'],
+                sampling_params=sampling_params,
+                image_data=image_data,
+                lora_name=lora_name,
+                request_id=request_id,
+            )
+        finally:
+            self._unregister_inflight(request_id)
 
         if 'input_ids' not in feat:
             feat['input_ids'] = response.prompt_token_ids
@@ -230,6 +250,7 @@ class SGLangSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin):
         adapter_path: Optional[str] = None,
         *,
         adapter_paths: Optional[List[Optional[str]]] = None,
+        allow_partial_rollout: bool = False,
     ) -> List[SampleResponse]:
         """Sample responses for given inputs.
 
@@ -267,7 +288,8 @@ class SGLangSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin):
                 sampling_params,
                 adapter_name,
                 adapter_path,
-                adapter_paths=adapter_paths))
+                adapter_paths=adapter_paths,
+                allow_partial_rollout=allow_partial_rollout))
 
     async def _generate_inputs(
         self,
@@ -278,6 +300,7 @@ class SGLangSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin):
         *,
         use_base_model: bool = False,
         adapter_paths: Optional[List[Optional[str]]] = None,
+        allow_partial_rollout: bool = False,
     ) -> List[SampleResponse]:
         """The async generation core shared by the blocking :meth:`sample` and :meth:`submit_generation`.
 
@@ -285,6 +308,11 @@ class SGLangSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin):
         ``_aregister_lora`` rather than the blocking ``_register_lora`` because this already runs inside
         the event loop -- ``_register_lora`` would call ``_run_in_loop`` and deadlock on itself.
         ``use_base_model`` drops the adapter so the base weights are sampled.
+
+        With ``allow_partial_rollout`` each input is driven through
+        :meth:`~twinkle.sampler.partial_rollout.PartialRolloutMixin._run_partial_rollout`, so an abort from
+        a concurrent in-place weight republish resumes it from its own tokens on the fresh weights instead
+        of ending it truncated; otherwise each input is a single ``_sample_single`` attempt.
         """
         if sampling_params is None:
             sampling_params = SamplingParams()
@@ -331,13 +359,42 @@ class SGLangSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin):
             registered = await self._aregister_lora(adapter_path, adapter_name)
             lora_names = [registered or (adapter_name or None)] * len(encoded_inputs)
 
-        return await asyncio.gather(*(self._sample_single(
-            feat,
-            sampling_params,
-            image_data=image_data,
-            lora_name=lora_name,
-            logprobs_only=logprobs_only,
-        ) for feat, image_data, lora_name in zip(encoded_inputs, image_data_list, lora_names)))
+        async def _generate_one(feat, image_data, lora_name):
+            if not allow_partial_rollout:
+                return await self._sample_single(
+                    feat,
+                    sampling_params,
+                    image_data=image_data,
+                    lora_name=lora_name,
+                    logprobs_only=logprobs_only,
+                )
+
+            # Partial rollout: one generation attempt is a plain _sample_single; the resume/merge loop
+            # (PartialRolloutMixin) re-runs it from new_input_feature when a republish aborts it. The core
+            # path carries no per-attempt control-plane state, so run_attempt returns None for it.
+            async def run_attempt(current_input, attempt_params, attempt):
+                response = await self._sample_single(
+                    current_input,
+                    attempt_params,
+                    image_data=image_data,
+                    lora_name=lora_name,
+                    logprobs_only=logprobs_only,
+                )
+                return response, None
+
+            outcome = await self._run_partial_rollout(
+                feat,
+                sampling_params,
+                run_attempt=run_attempt,
+                allow_partial_rollout=True,
+                max_retries=self.rollout_max_retries,
+                retry_delay_s=self.rollout_retry_delay_s,
+            )
+            return outcome.response
+
+        return await asyncio.gather(*(
+            _generate_one(feat, image_data, lora_name)
+            for feat, image_data, lora_name in zip(encoded_inputs, image_data_list, lora_names)))
 
     async def _encode_single(
         self,

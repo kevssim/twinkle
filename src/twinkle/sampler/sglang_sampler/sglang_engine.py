@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """SGLang inference engine, the sglang counterpart of `vllm_engine.VLLMEngine`."""
+import inspect
 import torch
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
@@ -116,6 +117,25 @@ class SGLangEngine(BaseSamplerEngine):
     # =========================================================================
     # Core Sampling API
     # =========================================================================
+
+    async def abort_request(self, request_id: str) -> None:
+        """Abort an in-flight request so it comes back with finish reason ``'abort'`` + partial tokens.
+
+        The sglang counterpart of :meth:`VLLMEngine.abort_request`, and the trigger half of partial rollout.
+        Routed through ``tokenizer_manager`` (``self._manager``) rather than ``sgl.Engine.abort_request`` for
+        the same event-loop reason as every other request here (see the class docstring): the ``Engine``
+        wrapper would call ``run_until_complete`` on a loop that is already running. sglang's abort API has
+        been sync in some releases and a coroutine in others, so await only an awaitable result rather than
+        blindly awaiting -- a sync abort returns ``None`` and awaiting that raises ``TypeError``.
+        ``request_id`` is the ``rid`` passed to :meth:`sample`.
+        """
+        abort = getattr(self._manager, 'abort_request', None)
+        if abort is None:
+            raise NotImplementedError('this sglang build exposes no tokenizer_manager.abort_request; '
+                                      'partial rollout (interrupt/resume) requires it')
+        result = abort(request_id)
+        if inspect.isawaitable(result):
+            await result
 
     async def sample(
         self,

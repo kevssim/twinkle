@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Sequence
 
-from .types import LoraContext, PartitionAdmission
+from .types import PartitionAdmission, RLContext
 
 
 class ContextSchedulePolicy(StrEnum):
@@ -24,7 +24,7 @@ class SchedulerConfig:
 
 @dataclass(frozen=True)
 class ScheduleCandidate:
-    context: LoraContext
+    context: RLContext
     partition: PartitionAdmission | None = None
 
 

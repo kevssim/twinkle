@@ -4,6 +4,7 @@ import atexit
 import numpy as np
 import os
 import threading
+import uuid
 from copy import copy
 from typing import Any, Dict, List, Optional, Type, Union
 
@@ -16,6 +17,7 @@ from twinkle.patch import Patch, apply_patch
 from twinkle.patch.vllm_lora_weights import VLLMLoraWeights
 from twinkle.sampler.base import Sampler
 from twinkle.sampler.generation_submission import GenerationSubmissionMixin
+from twinkle.sampler.partial_rollout import PartialRolloutMixin
 from twinkle.utils import Platform
 
 logger = get_logger()
@@ -42,7 +44,7 @@ _MAX_CONCURRENCY = max(1, int(os.environ.get('TWINKLE_SAMPLER_MAX_CONCURRENCY') 
 
 
 @remote_class(max_concurrency=_MAX_CONCURRENCY)
-class vLLMSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin):
+class vLLMSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, PartialRolloutMixin):
     """A vLLM-based sampler using VLLMEngine (AsyncLLM).
 
     This sampler automatically configures vLLM based on available GPUs.
@@ -83,6 +85,10 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin):
         # In-flight non-blocking generations keyed by submission id (GenerationSubmissionMixin). Each
         # entry is a concurrent.futures.Future scheduled on ``self._async_loop`` above.
         self._generation_submissions: Dict[str, Any] = {}
+
+        # Engine request ids currently mid-generation (PartialRolloutMixin), so an in-place weight republish
+        # can abort them and let each resume on the fresh weights. Only touched from ``self._async_loop``.
+        self._inflight_request_ids: set = set()
 
         from .vllm_engine import VLLMEngine
         engine_kwargs = engine_args.copy() if engine_args else {}
@@ -238,16 +244,29 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin):
         multi_modal_data: Optional[Dict[str, Any]] = None,
         logprobs_only: bool = False,
         disable_lora: bool = False,
+        request_id: Optional[str] = None,
     ) -> SampleResponse:
-        """Sample a single input asynchronously."""
-        response = await self.engine.sample(
-            prompt=self.template.get_vllm_input_ids(feat['input_ids']) if self.template else feat['input_ids'],
-            sampling_params=sampling_params,
-            lora_request=lora_request,
-            multi_modal_data=multi_modal_data,
-            mm_processor_kwargs=feat.get('mm_processor_kwargs'),
-            disable_lora=disable_lora,
-        )
+        """Sample a single input asynchronously.
+
+        ``request_id`` is this generation's engine handle: auto-generated when not given, and registered as
+        in-flight for the duration of the call so :meth:`abort_all_inflight` (PartialRolloutMixin) can
+        interrupt it and let a partial rollout resume from the tokens it produced before the abort.
+        """
+        if request_id is None:
+            request_id = uuid.uuid4().hex
+        self._register_inflight(request_id)
+        try:
+            response = await self.engine.sample(
+                prompt=self.template.get_vllm_input_ids(feat['input_ids']) if self.template else feat['input_ids'],
+                sampling_params=sampling_params,
+                lora_request=lora_request,
+                multi_modal_data=multi_modal_data,
+                mm_processor_kwargs=feat.get('mm_processor_kwargs'),
+                disable_lora=disable_lora,
+                request_id=request_id,
+            )
+        finally:
+            self._unregister_inflight(request_id)
 
         if 'input_ids' not in feat or multi_modal_data:
             if 'input_ids' in feat:
@@ -298,6 +317,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin):
         return_encoded: bool = False,
         use_base_model: bool = False,
         adapter_paths: Optional[List[Optional[str]]] = None,
+        allow_partial_rollout: bool = False,
     ) -> List[SampleResponse]:
         """Sample responses for given inputs.
 
@@ -344,7 +364,8 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin):
                 adapter_path,
                 return_encoded=return_encoded,
                 use_base_model=use_base_model,
-                adapter_paths=adapter_paths))
+                adapter_paths=adapter_paths,
+                allow_partial_rollout=allow_partial_rollout))
 
     async def _generate_inputs(
         self,
@@ -356,6 +377,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin):
         return_encoded: bool = False,
         use_base_model: bool = False,
         adapter_paths: Optional[List[Optional[str]]] = None,
+        allow_partial_rollout: bool = False,
     ) -> List[SampleResponse]:
         """The async generation core shared by the blocking :meth:`sample` and :meth:`submit_generation`.
 
@@ -364,6 +386,11 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin):
         overlapped RL rollout and a plain blocking call cannot drift apart. LoRA is resolved with the
         async ``_aload_lora`` rather than the blocking ``_load_lora`` because this already runs inside
         the event loop -- ``_load_lora`` would call ``_run_in_loop`` and deadlock on itself.
+
+        With ``allow_partial_rollout`` each input is driven through
+        :meth:`~twinkle.sampler.partial_rollout.PartialRolloutMixin._run_partial_rollout`, so an abort from
+        a concurrent in-place weight republish resumes it from its own tokens on the fresh weights instead
+        of ending it truncated; otherwise each input is a single ``_sample_single`` attempt.
         """
         if sampling_params is None:
             sampling_params = SamplingParams()
@@ -407,14 +434,44 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin):
         else:
             lora_requests = [await self._aload_lora(adapter_path)] * len(encoded_inputs)
 
-        return await asyncio.gather(*(self._sample_single(
-            feat,
-            sampling_params,
-            lora_request=lora_request,
-            multi_modal_data=multi_modal_data,
-            logprobs_only=logprobs_only,
-            disable_lora=use_base_model,
-        ) for feat, multi_modal_data, lora_request in zip(encoded_inputs, multi_modal_data_list, lora_requests)))
+        async def _generate_one(feat, multi_modal_data, lora_request):
+            if not allow_partial_rollout:
+                return await self._sample_single(
+                    feat,
+                    sampling_params,
+                    lora_request=lora_request,
+                    multi_modal_data=multi_modal_data,
+                    logprobs_only=logprobs_only,
+                    disable_lora=use_base_model,
+                )
+
+            # Partial rollout: one generation attempt is a plain _sample_single; the resume/merge loop
+            # (PartialRolloutMixin) re-runs it from new_input_feature when a republish aborts it. The core
+            # path carries no per-attempt control-plane state, so run_attempt returns None for it.
+            async def run_attempt(current_input, attempt_params, attempt):
+                response = await self._sample_single(
+                    current_input,
+                    attempt_params,
+                    lora_request=lora_request,
+                    multi_modal_data=multi_modal_data,
+                    logprobs_only=logprobs_only,
+                    disable_lora=use_base_model,
+                )
+                return response, None
+
+            outcome = await self._run_partial_rollout(
+                feat,
+                sampling_params,
+                run_attempt=run_attempt,
+                allow_partial_rollout=True,
+                max_retries=self.rollout_max_retries,
+                retry_delay_s=self.rollout_retry_delay_s,
+            )
+            return outcome.response
+
+        return await asyncio.gather(*(
+            _generate_one(feat, multi_modal_data, lora_request) for feat, multi_modal_data, lora_request in
+            zip(encoded_inputs, multi_modal_data_list, lora_requests)))
 
     async def _encode_single(
         self,

@@ -19,7 +19,7 @@ fix never has to be mirrored across backends or layers.
 Contract for a concrete subclass: be decorated with ``@remote_class()``, own a running background event
 loop at ``self._async_loop``, initialise ``self._generation_submissions`` to a dict, and implement
 ``async def _generate_inputs(self, inputs, sampling_params, *, adapter_name, adapter_path,
-use_base_model) -> list[SampleResponse]``.
+use_base_model, allow_partial_rollout) -> list[SampleResponse]``.
 """
 from __future__ import annotations
 
@@ -81,6 +81,7 @@ class GenerationSubmissionMixin:
         adapter_name: str,
         adapter_path: str | None,
         use_base_model: bool,
+        allow_partial_rollout: bool = False,
     ) -> list[SampleResponse]:
         """Run one admitted submission's generation on the engine. Supplied by each backend."""
         raise NotImplementedError(f'{type(self).__name__} must implement _generate_inputs')
@@ -95,6 +96,7 @@ class GenerationSubmissionMixin:
         adapter_path: str | None = None,
         *,
         use_base_model: bool = False,
+        allow_partial_rollout: bool = False,
     ) -> dict[str, Any]:
         """Submit a sampling shard without blocking the Ray actor.
 
@@ -102,6 +104,12 @@ class GenerationSubmissionMixin:
         them. This gives a driver-overlapped RL loop (and the HTTP data-plane service) fast admission:
         the call returns as soon as the work is scheduled on the sampler's background event loop, so the
         caller can go train the previous batch while this one generates.
+
+        ``allow_partial_rollout`` makes each generation resumable: when an in-place weight republish aborts
+        it (:meth:`~twinkle.sampler.partial_rollout.PartialRolloutMixin.abort_all_inflight`), the generation
+        continues from the tokens it already produced on the fresh weights instead of returning truncated,
+        so a deep buffer can overwrite the sampler's single live weight copy soundly. Off by default: an
+        abort then simply ends the generation with whatever it produced.
         """
         if submission_id in self._generation_submissions:
             raise KeyError(f'generation submission already exists: {submission_id}')
@@ -112,6 +120,7 @@ class GenerationSubmissionMixin:
                 adapter_name=adapter_name,
                 adapter_path=adapter_path,
                 use_base_model=use_base_model,
+                allow_partial_rollout=allow_partial_rollout,
             ))
         self._generation_submissions[submission_id] = future
         return {'submission_id': submission_id, 'status': 'running'}

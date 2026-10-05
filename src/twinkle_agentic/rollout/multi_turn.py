@@ -335,6 +335,15 @@ class MultiTurnRollout(Rollout):
         adapter_kwargs = {'adapter_path': adapter_path} if adapter_path else {}
         if kwargs.get('use_base_model', self.use_base_model):
             adapter_kwargs['use_base_model'] = True
+        # ``allow_partial_rollout`` makes each per-turn ``sample()`` resumable across an in-place weight
+        # republish: a publish aborts the turn in flight and, with this set, it continues from its own
+        # tokens on the fresh weights instead of returning truncated -- what lets a MULTI-TURN episode
+        # span versions soundly under the streaming driver's ``in_place`` publication. It is a
+        # local-sampler capability, so it is threaded only when a sampler drives the turns; an API/teacher
+        # backend has no in-place weight sync to resume across (and its callback would not take the kwarg).
+        # Left out entirely when unset, so the default per-turn call is unchanged.
+        if self.sampler is not None and kwargs.get('allow_partial_rollout', False):
+            adapter_kwargs['allow_partial_rollout'] = True
         sampling_params = kwargs.get('sampling_params', self.sampling_params)
         if sampling_params.num_samples != 1:
             raise ValueError(f'MultiTurnRollout supports num_samples=1 only, got '

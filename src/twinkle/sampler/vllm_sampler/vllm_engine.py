@@ -382,6 +382,21 @@ class VLLMEngine(BaseSamplerEngine):
     # Core Sampling API
     # =========================================================================
 
+    async def abort_request(self, request_id: str) -> None:
+        """Abort an in-flight request so its ``generate()`` finishes with ``finish_reason='abort'``.
+
+        This is the trigger half of partial rollout (the resume/merge half is
+        :class:`~twinkle.sampler.partial_rollout.PartialRolloutMixin`). vLLM v1's ``AsyncLLM.abort`` is a
+        coroutine; under the hood ``OutputProcessor.abort_requests`` enqueues a final ``RequestOutput`` with
+        ``FinishReason.ABORT`` that carries the tokens decoded so far -- and because that output counts as
+        finished, it is emitted even in ``FINAL_ONLY`` mode -- so the caller gets ``stop_reason='abort'``
+        plus the partial tokens it needs to resume from. ``request_id`` is the external id passed to
+        :meth:`sample`; aborting one already finished is a harmless no-op.
+        """
+        if self.engine is None:
+            return
+        await self.engine.abort(request_id)
+
     async def sample(self,
                      prompt: Union[List[int], str],
                      sampling_params: Union[SamplingParams, Dict[str, Any]],

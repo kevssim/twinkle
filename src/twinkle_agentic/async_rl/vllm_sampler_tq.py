@@ -14,13 +14,13 @@ from pathlib import Path
 from typing import Any
 
 from twinkle import DeviceMesh, get_logger, remote_class, remote_function
-from twinkle.data_format import SampledSequence, SampleResponse, SamplingParams, user_data_get
+from twinkle.data_format import SampleResponse, SamplingParams, user_data_get
 from twinkle.metric import MetricBuffer, MetricRecord
 from twinkle.sampler.vllm_sampler import vLLMSampler
 from .data_plane import TQDataPlane
 from .generation_submissions import GenerationSubmissionMixin
 from .metrics import rollout_metrics
-from .types import LoraContext, PromptGroup, RolloutOutput, RolloutPolicy
+from .types import PromptGroup, RLContext, RolloutOutput, RolloutPolicy
 from .utils import resolve_adapter_path, sample_responses_to_rollout_rows
 
 logger = get_logger()
@@ -32,7 +32,7 @@ def _path_component(value: str) -> str:
 
 def _compute_rewards(
     reward_registry: dict[str, Any],
-    context: LoraContext,
+    context: RLContext,
     rollout_rows: list[RolloutOutput],
 ) -> list[float] | None:
     reward_fn = reward_registry.get(context.key)
@@ -43,7 +43,7 @@ def _compute_rewards(
 
 def _compute_reward_metrics(
     reward_registry: dict[str, Any],
-    context: LoraContext,
+    context: RLContext,
     rollout_rows: list[RolloutOutput],
     rewards: list[float],
 ) -> dict[str, Any]:
@@ -404,7 +404,7 @@ class VLLMSamplerTQ(vLLMSampler, GenerationSubmissionMixin):
         output_dir = self.rollout_output_dir.joinpath(
             _path_component(group.context.tenant_id),
             _path_component(group.context.training_run_id),
-            _path_component(group.context.adapter_name),
+            _path_component(group.context.policy_slot),
             f'policy_{policy_version}',
         )
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -464,7 +464,7 @@ class VLLMSamplerTQ(vLLMSampler, GenerationSubmissionMixin):
 
     async def _generate_group_samples(
         self,
-        context: LoraContext,
+        context: RLContext,
         sources: list[dict[str, Any]],
         sampling_params: SamplingParams,
         *,
@@ -482,7 +482,8 @@ class VLLMSamplerTQ(vLLMSampler, GenerationSubmissionMixin):
             template = self.template
             assert template is not None, 'Use set_template before sampling trajectories'
             encoded_inputs = [
-                self.encode_trajectory_for_vllm(source, context.adapter_name, not logprobs_only) for source in sources
+                self.encode_trajectory_for_vllm(source, context.adapter_name or '', not logprobs_only)
+                for source in sources
             ]
         else:
             encoded_inputs = sources
@@ -504,7 +505,7 @@ class VLLMSamplerTQ(vLLMSampler, GenerationSubmissionMixin):
 
     async def _generate_sample(
         self,
-        context: LoraContext,
+        context: RLContext,
         original_input: dict[str, Any],
         sampling_params: SamplingParams,
         *,
@@ -512,91 +513,43 @@ class VLLMSamplerTQ(vLLMSampler, GenerationSubmissionMixin):
         logprobs_only: bool,
         allow_partial_rollout: bool,
     ) -> _GeneratedSample:
-        current_input = original_input
-        partial_responses: list[SampleResponse] = []
-        partial_policies: list[RolloutPolicy] = []
-        generated_tokens = 0
-        last_error: Exception | None = None
-        was_aborted = False
-        resumed_partial_output = False
+        """Generate one sample, resuming across aborts via the shared backend-agnostic kernel.
 
-        for attempt in range(self.rollout_max_retries + 1):
+        The retry/resume/merge loop lives in :class:`~twinkle.sampler.partial_rollout.PartialRolloutMixin`
+        so vLLM and SGLang share one implementation; what is specific to this TransferQueue path is the
+        per-attempt policy pinning, supplied here as ``run_attempt`` -- acquire the rollout policy for this
+        context, sample under its (possibly per-version) adapter, then release the pin. Each segment's
+        policy is threaded back out as the kernel's opaque attempt state so the merged sample can report the
+        versions it spanned.
+        """
+
+        async def run_attempt(current_input: dict[str, Any], attempt_params: SamplingParams,
+                              attempt: int) -> tuple[SampleResponse, RolloutPolicy]:
             policy = await self.context_manager.acquire_rollout_policy.remote(context)
-            attempt_params = copy(sampling_params)
-            if allow_partial_rollout and attempt_params.max_tokens is not None:
-                attempt_params.max_tokens -= generated_tokens
             try:
-                try:
-                    response = await self._sample_single(
-                        current_input,
-                        attempt_params,
-                        lora_request=await self._load_lora_for_policy(policy),
-                        multi_modal_data=multi_modal_data,
-                        logprobs_only=logprobs_only,
-                    )
-                    sequence = response.sequences[0]
-                except Exception as exc:
-                    last_error = exc
-                else:
-                    if sequence.stop_reason not in {'abort', 'error'}:
-                        if not allow_partial_rollout or not partial_responses:
-                            return _GeneratedSample(response, (policy, ), attempt + 1, was_aborted,
-                                                    resumed_partial_output)
-                        partial_responses.append(response)
-                        partial_policies.append(policy)
-                        return _GeneratedSample(
-                            self._merge_partial_responses(partial_responses), tuple(partial_policies), attempt + 1,
-                            was_aborted, resumed_partial_output)
-
-                    last_error = RuntimeError(f'generation stopped with {sequence.stop_reason}')
-                    was_aborted = was_aborted or sequence.stop_reason == 'abort'
-                    if allow_partial_rollout and sequence.tokens:
-                        resumed_partial_output = True
-                        partial_responses.append(response)
-                        partial_policies.append(policy)
-                        generated_tokens += len(sequence.tokens)
-                        current_input = sequence.new_input_feature
-                        if sampling_params.max_tokens is not None and generated_tokens >= sampling_params.max_tokens:
-                            return _GeneratedSample(
-                                self._merge_partial_responses(partial_responses, stop_reason='length'),
-                                tuple(partial_policies),
-                                attempt + 1,
-                                was_aborted,
-                                resumed_partial_output,
-                            )
-                    elif not allow_partial_rollout:
-                        current_input = original_input
+                response = await self._sample_single(
+                    current_input,
+                    attempt_params,
+                    lora_request=await self._load_lora_for_policy(policy),
+                    multi_modal_data=multi_modal_data,
+                    logprobs_only=logprobs_only,
+                )
+                return response, policy
             finally:
                 await self.context_manager.release_rollout_policy.remote(policy)
 
-            if attempt < self.rollout_max_retries:
-                await asyncio.sleep(self.rollout_retry_delay_s)
-
-        error_detail = f'{type(last_error).__name__}: {last_error}'
-        error = RuntimeError(
-            f'generation failed after {self.rollout_max_retries + 1} attempts; last error: {error_detail}')
-        raise error from last_error
-
-    def _merge_partial_responses(
-        self,
-        responses: list[SampleResponse],
-        *,
-        stop_reason: str | None = None,
-    ) -> SampleResponse:
-        sequences = [response.sequences[0] for response in responses]
-        tokens = [token for sequence in sequences for token in sequence.tokens]
-        logprobs = [logprob for sequence in sequences for logprob in (sequence.logprobs or [])]
-        final_sequence = sequences[-1]
-        return SampleResponse(
-            prompt_token_ids=responses[0].prompt_token_ids,
-            sequences=[
-                SampledSequence(
-                    stop_reason=stop_reason or final_sequence.stop_reason,
-                    tokens=tokens,
-                    logprobs=logprobs,
-                    decoded=self.template.decode(tokens),
-                    new_input_feature=final_sequence.new_input_feature,
-                    routed_experts=final_sequence.routed_experts,
-                )
-            ],
+        outcome = await self._run_partial_rollout(
+            original_input,
+            sampling_params,
+            run_attempt=run_attempt,
+            allow_partial_rollout=allow_partial_rollout,
+            max_retries=self.rollout_max_retries,
+            retry_delay_s=self.rollout_retry_delay_s,
+        )
+        return _GeneratedSample(
+            outcome.response,
+            outcome.attempt_states,
+            outcome.attempts,
+            outcome.was_aborted,
+            outcome.resumed_partial_output,
         )

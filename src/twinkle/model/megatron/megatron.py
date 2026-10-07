@@ -888,30 +888,35 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
                 elif isinstance(loss_dict, torch.Tensor):
                     raise ValueError('Expected loss dict, got tensor')
 
-        loss = loss / (count or 1)
+        # Report the LOCAL token-sum and its token denominator, matching the transformers contract
+        # (outputs['loss'] = token SUM, outputs['num_tokens'] = count). LossMetric's sum branch then
+        # divides exactly once (Σ loss / Σ num_tokens) and its dp_group gather performs the DP
+        # reduction by summing the local values. So we must NOT pre-divide into a per-token mean
+        # here -- doing that made LossMetric divide a second time by the label count, shrinking the
+        # logged loss by ~num_tokens (e.g. 2.57 -> 0.0065) while gradients stayed correct. We must
+        # NOT all_reduce(AVG) across DP here either: the metric gather already sums over the DP
+        # group, so a pre-average would be reduced twice. mcore consumes the raw token-sum tensor
+        # returned by reduce_loss for the backward pass and normalizes it itself (see reduce_loss),
+        # so this reporting-only change leaves gradients untouched.
+        num_tokens = count
 
-        # For PP > 1, broadcast loss from last PP stage to all ranks
+        # For PP > 1 only the last stage holds a real loss/count; broadcast both from it so every PP
+        # rank reports consistent values (calculate_metric collects 'last_pp_first').
         # Note: mpu is imported at module level, no need to reimport
         if mpu.get_pipeline_model_parallel_world_size() > 1:
-            loss_tensor = loss.detach().clone()
-            # Broadcast from last PP stage (rank with pipeline_model_parallel_rank == pp_size - 1)
             src_rank = mpu.get_pipeline_model_parallel_last_rank()
             pp_group = mpu.get_pipeline_model_parallel_group()
-
-            torch.distributed.broadcast(loss_tensor, src=src_rank, group=pp_group)
-
-            loss = loss_tensor.item()
+            loss_f = loss.detach().float() if isinstance(loss, torch.Tensor) else torch.tensor(
+                float(loss), device=Platform.get_local_device())
+            count_f = torch.as_tensor(float(num_tokens), device=loss_f.device, dtype=torch.float32)
+            # One broadcast carries both scalars so the collective count stays identical on all stages.
+            packed = torch.stack([loss_f, count_f])
+            torch.distributed.broadcast(packed, src=src_rank, group=pp_group)
+            loss = packed[0]
+            num_tokens = packed[1]
 
         if not forward_only:
             optimizer_config.cur_step += 1
-
-        dp_world_size = mpu.get_data_parallel_world_size()
-        if dp_world_size > 1:
-            if isinstance(loss, (int, float)):
-                loss = torch.tensor(loss, device=Platform.get_local_device())
-            # Average loss across DP group (with CP if enabled)
-            dp_cp_group = mpu.get_data_parallel_group(with_context_parallel=True)
-            torch.distributed.all_reduce(loss, op=torch.distributed.ReduceOp.AVG, group=dp_cp_group)
 
         if logps and not self.variable_seq_lengths:
             logps = torch.cat(logps, dim=0)
@@ -921,10 +926,12 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
             logits = torch.cat(logits, dim=0)
         if isinstance(loss, torch.Tensor):
             loss = loss.detach().float().item()
+        if isinstance(num_tokens, torch.Tensor):
+            num_tokens = num_tokens.detach().float().item()
         if not return_logits:
             logits = None
         inputs = processor.unpack_inputs(inputs, task=task)
-        model_output = ModelOutput(logits=logits, loss=loss, logps=logps)
+        model_output = ModelOutput(logits=logits, loss=loss, logps=logps, num_tokens=num_tokens)
         if channel_loss:
             model_output['channel_loss'] = channel_loss
         if rr_action is not None:

@@ -52,6 +52,8 @@ class DPOMetric(Metric):
             - outputs['logps']: [batch, seq_len] per-token log probabilities
             - inputs['labels']: [batch, seq_len] labels with ignore_index for non-target tokens
             - kwargs['ref_outputs']: Optional reference model outputs with 'logps'
+            - kwargs['ref_logps']: Optional reference per-token logps passed directly (a caller that
+              already holds the reference logps need not reshape them into a ``ref_outputs`` dict).
         """
         import torch
         logps = outputs.get('logps')
@@ -98,40 +100,45 @@ class DPOMetric(Metric):
         self.total_chosen_logps += chosen_logps.sum().item()
         self.total_rejected_logps += rejected_logps.sum().item()
 
-        # Compute rewards if ref_outputs available
-        ref_outputs = kwargs.get('ref_outputs')
-        if ref_outputs is not None:
-            ref_logps = ref_outputs.get('logps')
-            if isinstance(ref_logps, (list, tuple)) and not ref_logps:
-                ref_logps = None
-            if ref_logps is not None:
-                # Align ref_logps to match labels shape (handles different seq lengths)
-                ref_logps = align_per_token_values(
-                    ref_logps,
-                    tuple(labels.shape),
-                    device=labels.device,
-                    dtype=logps.dtype,
-                    name='ref_logps',
-                    valid_mask=labels != self.ignore_index,
-                )
+        # Compute rewards when reference logps are available. Two shapes are accepted: twinkle's own
+        # callers pass a ``ref_outputs`` dict; a caller that already holds the reference per-token logps
+        # (e.g. dev's preference loop, which forwards ``ref_logps`` straight through the model forward)
+        # passes them directly. ``ref_logps`` wins when both are present.
+        ref_logps = kwargs.get('ref_logps')
+        if ref_logps is None:
+            ref_outputs = kwargs.get('ref_outputs')
+            if ref_outputs is not None:
+                ref_logps = ref_outputs.get('logps')
+        if isinstance(ref_logps, (list, tuple)) and not ref_logps:
+            ref_logps = None
+        if ref_logps is not None:
+            # Align ref_logps to match labels shape (handles different seq lengths)
+            ref_logps = align_per_token_values(
+                ref_logps,
+                tuple(labels.shape),
+                device=labels.device,
+                dtype=logps.dtype,
+                name='ref_logps',
+                valid_mask=labels != self.ignore_index,
+            )
 
-                ref_seq_logps = self._compute_sequence_logps(ref_logps, labels)
-                ref_chosen_logps, ref_rejected_logps = self._split_chosen_rejected(ref_seq_logps)
+            ref_seq_logps = self._compute_sequence_logps(ref_logps, labels)
+            ref_chosen_logps, ref_rejected_logps = self._split_chosen_rejected(ref_seq_logps)
 
-                # Accumulate ref logps
-                self.total_ref_chosen_logps += ref_chosen_logps.sum().item()
-                self.total_ref_rejected_logps += ref_rejected_logps.sum().item()
+            # Accumulate ref logps
+            self.total_ref_chosen_logps += ref_chosen_logps.sum().item()
+            self.total_ref_rejected_logps += ref_rejected_logps.sum().item()
 
-                # Compute rewards: β * (policy - ref)
-                chosen_rewards = self.beta * (chosen_logps - ref_chosen_logps)
-                rejected_rewards = self.beta * (rejected_logps - ref_rejected_logps)
+            # Compute rewards: β * (policy - ref)
+            chosen_rewards = self.beta * (chosen_logps - ref_chosen_logps)
+            rejected_rewards = self.beta * (rejected_logps - ref_rejected_logps)
 
-                self.total_chosen_rewards += chosen_rewards.sum().item()
-                self.total_rejected_rewards += rejected_rewards.sum().item()
-                margins = chosen_rewards - rejected_rewards
-                self.total_reward_margin += margins.sum().item()
-                self.total_reward_correct += (margins > 0).sum().item()
-                self.has_rewards = True
+            self.total_chosen_rewards += chosen_rewards.sum().item()
+            self.total_rejected_rewards += rejected_rewards.sum().item()
+            margins = chosen_rewards - rejected_rewards
+            self.total_reward_margin += margins.sum().item()
+            self.total_reward_correct += (margins > 0).sum().item()
+            self.has_rewards = True
 
         self.total_count += chosen_logps.shape[0]
 

@@ -393,6 +393,28 @@ def stateless_init_process_group(
     return communicator
 
 
+def _representable_pad_value(dtype: 'torch.dtype', pad_value: float) -> float:
+    """Clamp *pad_value* into the range *dtype* can actually hold (no-op for float / bool).
+
+    ``pad_and_stack_tensors`` defaults to ``-200``, a sentinel meaningful for the float logps and int64
+    labels it usually pads -- both represent it exactly. An unsigned payload cannot: the MoE routing
+    RECORD boundary is ``uint8`` expert indices, and ``F.pad(uint8, value=-200)`` raises ``value cannot
+    be converted to type uint8_t without overflow``, which breaks collecting the megatron R2 record
+    across ranks / micro-batches (the transformers record rides int64, so it never hit this). Those pad
+    slots are the sequence tail beyond a row's real length -- the consumer slices it off with
+    ``routed[:length]`` -- so their value is never read and the dtype's nearest bound (0 for uint8) is a
+    safe stand-in. ``torch.iinfo`` raises ``TypeError`` for float / bool, which keep *pad_value* as-is.
+    """
+    import torch
+    try:
+        info = torch.iinfo(dtype)
+    except TypeError:
+        return pad_value
+    if info.min <= pad_value <= info.max:
+        return pad_value
+    return info.min if pad_value < info.min else info.max
+
+
 def pad_and_stack_tensors(tensors: List['torch.Tensor'], pad_value: float = -200, concat=True) -> 'torch.Tensor':
     import torch
     if not tensors:
@@ -425,7 +447,7 @@ def pad_and_stack_tensors(tensors: List['torch.Tensor'], pad_value: float = -200
             pad_params = []
             for dim in range(max_ndim - 1, pad_from - 1, -1):
                 pad_params.extend([0, max_shape[dim] - t.shape[dim]])
-            padded = torch.nn.functional.pad(t, pad_params, value=pad_value)
+            padded = torch.nn.functional.pad(t, pad_params, value=_representable_pad_value(t.dtype, pad_value))
             padded_tensors.append(padded)
 
     if concat:

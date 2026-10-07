@@ -452,8 +452,20 @@ class MegatronStrategy:
         count = local_count.clamp(min=1).to(torch.int64)
         cp_size = self.device_mesh.cp_world_size or 1
         grad_count = (count // cp_size).clamp(min=1) if cp_size > 1 else count
+        # The reported loss MUST be a real copy (.clone()), not a storage-sharing .detach() view of
+        # local_loss. This 3-tuple is the (loss, num_tokens, loss_reduced) contract Megatron-core's
+        # forward_step_calc_loss consumes: it takes the FIRST element as output_tensor and scales it
+        # IN PLACE for gradient accumulation -- `output_tensor /= clamp(num_tokens); /= num_microbatches`
+        # (schedules.py). local_loss IS that first element, so a bare local_loss.detach() in the dict
+        # shares its storage and gets silently divided by num_microbatches (and num_tokens) too, corrupting
+        # the logged/metric loss. It only showed up at num_microbatches>1 (a single microbatch divides by 1)
+        # and only for losses that report num_tokens=0 (mean-reduced preference/RL losses like DPO, whose
+        # per-microbatch value is already the batch mean); per-token-sum losses hide it because their
+        # num_tokens scaling is folded back out downstream. clone() snapshots the true value before mcore
+        # touches the backward tensor. logits/logps are separate tensors mcore never scales, so detach
+        # suffices for them.
         return local_loss, grad_count, {
-            'loss': local_loss.detach(),
+            'loss': local_loss.detach().clone(),
             'logits': logits.detach() if logits is not None else None,
             'logps': logps.detach() if logps is not None else None,
             'num_tokens': count
@@ -614,12 +626,31 @@ class MegatronStrategy:
             inner = getattr(_optimizer, 'optimizer', _optimizer)
             if inner is None or getattr(_optimizer, 'is_stub_optimizer', False):
                 continue
-            # The fp32 master copies of the fp16/bf16 parameters live in the inner param_groups.
+            # The inner param_groups hold the optimizer's own handle on each parameter. For
+            # bf16/fp16 training under a DistributedOptimizer these are separate fp32 master shards
+            # (``shard_fp32_from_float16_groups``, allocated with ``.clone().float()``): they own
+            # their storage, so offloading only the DDP param/grad buffers would leave the master
+            # weights (and below, the momentum) resident -- hence this walk.
+            #
+            # For FP32 training the DistributedOptimizer does NOT clone. It aliases its inner params
+            # to VIEWS of the DDP flat param buffer (``_build_model_and_main_param_groups`` slices
+            # ``model_param.view(-1)[start:end]`` straight into ``shard_fp32_params``). The
+            # ``buffer.offload_to_cpu()`` above already copied that buffer to pinned host memory and
+            # freed its device storage (``param_data.storage().resize_(0)``), so those views now
+            # dangle and a D2H copy of one raises CUDA "invalid argument". Their bytes are safe in
+            # the buffer's host copy and reappear on ``reload_from_cpu()``, so skip exactly the params
+            # whose storage was freed and move only the ones still owning live storage (the
+            # bf16/fp16 master shards). Skipping is required for correctness, not just to dodge the
+            # crash: reassigning a freed view's ``.data`` to a fresh host tensor would detach it from
+            # the buffer the model itself reads, so ``reload_from_cpu()`` would restore the model's
+            # weights while the optimizer kept stepping on an orphaned copy.
             for group in inner.param_groups:
                 for param in group['params']:
-                    if isinstance(param, torch.Tensor):
+                    if isinstance(param, torch.Tensor) and param.untyped_storage().size() > 0:
                         param.data = param.data.to(device, non_blocking=True)
+            # Momentum/variance (exp_avg, exp_avg_sq, ...) are always fresh allocations, never buffer
+            # views, so the freed-storage guard is a no-op here; it just keeps the walk uniform.
             for state in inner.state.values():
                 for key, value in state.items():
-                    if isinstance(value, torch.Tensor):
+                    if isinstance(value, torch.Tensor) and value.untyped_storage().size() > 0:
                         state[key] = value.to(device, non_blocking=True)

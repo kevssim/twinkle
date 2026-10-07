@@ -378,7 +378,10 @@ class MultiLoraMegatronModel(MegatronModel):
         if dist.is_initialized():
             dist.barrier()
 
-    @remote_function(dispatch='all', collect='first', sync=True)
+    # lazy_collect=False: see TransformersModel.resume_from_checkpoint -- the driver consumes the returned
+    # training-state dict immediately, so the lazy callable default would break it. Keeps this multi-LoRA
+    # megatron variant backend-equivalent with the others.
+    @remote_function(dispatch='all', collect='first', sync=True, lazy_collect=False)
     def resume_from_checkpoint(self, checkpoint_dir, *, resume_only_model=False, **kwargs):
         adapter_name = kwargs.pop('adapter_name', None)
         self._check_adapter_valid(adapter_name)

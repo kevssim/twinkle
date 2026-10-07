@@ -323,7 +323,9 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
                     mapping[name] = checkpoint_name
         return mapping
 
-    @remote_function(collect='first')
+    # lazy_collect=False: see TransformersModel.save -- a checkpoint write the caller acts on immediately
+    # must block until it lands, or the run's final save is torn down with the actor before writing.
+    @remote_function(collect='first', lazy_collect=False)
     def save(self, name, output_dir: Optional[str] = None, interval=1, **kwargs):
         self._check_adapter_valid(kwargs.get('adapter_name'))
         with self.multi_adapter.save_context(kwargs.get('adapter_name')):

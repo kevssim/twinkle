@@ -40,6 +40,38 @@ def _convert_ndarray_to_list(obj: Any) -> Any:
     return obj
 
 
+def _unwrap_mm_ref(entry: Any) -> Any:
+    """Unwrap an HF-datasets media cell ``{'bytes': ..., 'path': ...}`` to its loadable payload.
+
+    HF datasets serialises a media column cell (``images``/``videos``) as ``{'bytes': ..., 'path': ...}``; the
+    vLLM engine forwards ``multi_modal_data`` verbatim to the HF processor, whose ``fetch_images`` rejects a
+    dict (``TypeError: only a single or a list of entries is supported but got type=<class 'dict'>``) and
+    accepts only a PIL image / path / URL / bytes. Extracting ``bytes or path`` -- the same unwrap the
+    template's ``preprocess_image`` does -- yields a form the engine can load; any other entry (already a PIL
+    image / path / bytes) passes through untouched, so text-only and pre-loaded media are unaffected.
+    """
+    if isinstance(entry, dict) and ('bytes' in entry or 'path' in entry):
+        return entry.get('bytes') or entry.get('path')
+    return entry
+
+
+def _load_vllm_image(entry: Any) -> Any:
+    """Decode one image entry to a PIL image, the canonical ``multi_modal_data['image']`` form.
+
+    A raw ``bytes`` payload is not something the HF image processor's ``fetch_images`` accepts either, so an
+    image is loaded all the way to PIL rather than merely unwrapped. This reuses twinkle's ``load_image`` --
+    the SAME loader the template's ``preprocess_image`` runs -- so the engine conditions generation on exactly
+    the RGB pixels the template encoded the prompt's ``<image>`` pad count from, keeping vLLM's re-expanded
+    vision grid identical to the one frozen into ``input_ids``. A non-str/bytes entry (an already-loaded PIL
+    image) passes through. Video is not a single image, so it only needs :func:`_unwrap_mm_ref`.
+    """
+    from twinkle.utils.vision_tools import load_image
+    unwrapped = _unwrap_mm_ref(entry)
+    if isinstance(unwrapped, (str, bytes, bytearray)):
+        return load_image(unwrapped)
+    return unwrapped
+
+
 _MAX_CONCURRENCY = max(1, int(os.environ.get('TWINKLE_SAMPLER_MAX_CONCURRENCY') or 24))
 
 
@@ -230,9 +262,11 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, Par
 
         mm_data = {}
         if images:
-            mm_data['image'] = images
+            image_list = images if isinstance(images, (list, tuple)) else [images]
+            mm_data['image'] = [_load_vllm_image(im) for im in image_list]
         if videos:
-            mm_data['video'] = videos
+            video_list = videos if isinstance(videos, (list, tuple)) else [videos]
+            mm_data['video'] = [_unwrap_mm_ref(video) for video in video_list]
         return mm_data or None
 
     async def _sample_single(

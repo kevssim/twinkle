@@ -720,7 +720,12 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
                     # [b, s, 1] for generative_reranker) with labels=None, so pool the last valid
                     # token per sequence here -- mirroring legacy's get_last_tokens in the trainer.
                     # These losses read logits (require_logps=False), so no selective_log_softmax.
-                    if is_last_pp and labels is not None:
+                    # The pool runs on the last PP stage regardless of labels: a seq_cls/rm row carries no
+                    # next-token labels at all (RewardLoss scores the pooled head, not logps), so gating on
+                    # ``labels is not None`` would skip pooling and hand the loss raw [b, s, C] per-token
+                    # scores. transformers pools inside *ForSequenceClassification, so this keeps the two
+                    # backends equivalent (basic principle 1).
+                    if is_last_pp:
                         _packed = batch.get('packed_seq_params')
                         # CP reconstruct first (like the causal_lm branch), then take the last token.
                         cu_seqlens_q = getattr(_packed, 'cu_seqlens_q', None) if _packed is not None else None
@@ -729,10 +734,20 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
                             _am = batch.get('attention_mask')
                             if _am is None:
                                 _am = batch.get('attention_mask_2d')
-                            # attention_mask_2d compatibility: a 4D mask collapses to per-row validity.
-                            if _am is not None and _am.dim() > 2:
-                                _am = (~_am).sum(dim=(1, 2)) > 0
-                            _last_idx = processor._last_valid_indices(_am.long())
+                            if _am is None:
+                                # No mask in the batch: a seq_cls/rm preference row carries only input_ids and
+                                # the collator right-pads without emitting an attention_mask. Pool the final
+                                # position -- exactly what transformers' *ForSequenceClassification does when
+                                # handed no mask -- so the two backends resolve the same score.
+                                _last_idx = torch.full((output_tensor.shape[0], ),
+                                                       output_tensor.shape[1] - 1,
+                                                       dtype=torch.long,
+                                                       device=output_tensor.device)
+                            else:
+                                # attention_mask_2d compatibility: a 4D mask collapses to per-row validity.
+                                if _am.dim() > 2:
+                                    _am = (~_am).sum(dim=(1, 2)) > 0
+                                _last_idx = processor._last_valid_indices(_am.long())
                             unpacked_logits = output_tensor[
                                 torch.arange(output_tensor.shape[0], device=output_tensor.device), _last_idx]
                         else:
@@ -1405,7 +1420,10 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
         if dist.is_initialized():
             dist.barrier()
 
-    @remote_function(dispatch='all')
+    # lazy_collect=False: see TransformersModel.resume_from_checkpoint -- the driver consumes the returned
+    # training-state dict immediately (loop.resume subscripts state['cur_step']), so the lazy callable
+    # default would break it. Keeps megatron backend-equivalent with the transformers variant.
+    @remote_function(dispatch='all', lazy_collect=False)
     def resume_from_checkpoint(self, checkpoint_dir, *, resume_only_model=False, **kwargs):
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]

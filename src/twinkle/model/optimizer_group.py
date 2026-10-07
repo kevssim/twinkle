@@ -70,6 +70,16 @@ class BaseOptimizerGroup:
         """Accumulate metrics for train/eval status. Override in subclass if needed."""
         status = self.train_status if is_training else self.eval_status
         if len(status.metrics) > 0 and status.inputs is not None and status.outputs is not None:
+            # forward_kwargs is the raw kwargs the forward was called with. A caller that drives
+            # gradient accumulation threads gradient_accumulation_steps through it (the Megatron
+            # forward_backward pops it for do_grad_sync, but the dict stored on train_status still
+            # carries it). It must not be forwarded to the metric verbatim: this method passes the
+            # authoritative self.gradient_accumulation_steps explicitly, so a second copy inside
+            # **forward_kwargs raises "got multiple values for keyword argument". Pop it here -- the
+            # TransformersOptimizerGroup override does the same -- so both backends accumulate metrics
+            # identically (basic principle: backend equivalence, no per-backend special casing).
+            forward_kwargs = dict(status.forward_kwargs)
+            forward_kwargs.pop('gradient_accumulation_steps', None)
             for metric in status.metrics:
                 metric.accumulate(
                     status.inputs,
@@ -78,7 +88,8 @@ class BaseOptimizerGroup:
                     step=self.cur_step - 1,
                     gradient_accumulation_steps=self.gradient_accumulation_steps,
                     grad_norm=self._last_grad_norm,
-                    **status.forward_kwargs)
+                    loss_reduction=getattr(self.loss_instance, 'reduction', 'mean'),
+                    **forward_kwargs)
 
     def calculate_metrics(self, is_training):
         """Calculate and return metrics."""

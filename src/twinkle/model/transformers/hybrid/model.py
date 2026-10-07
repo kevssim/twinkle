@@ -352,7 +352,9 @@ class SpectralHybridTransformersModel(MultiLoraTransformersModel):
                 dist.barrier()
         return checkpoint_dir
 
-    @remote_function(collect='first')
+    # lazy_collect=False: see TransformersModel.save -- a checkpoint write the caller acts on immediately
+    # must block until it lands, or the run's final save is torn down with the actor before writing.
+    @remote_function(collect='first', lazy_collect=False)
     def save(self, name, output_dir: Optional[str] = None, interval=1, **kwargs):
         adapter_name = kwargs.pop('adapter_name', None)
         self._check_adapter_valid(adapter_name)
@@ -400,7 +402,10 @@ class SpectralHybridTransformersModel(MultiLoraTransformersModel):
             'gradient_accumulation_steps': trainer_state['gradient_accumulation_steps'],
         }
 
-    @remote_function(dispatch='all', collect='first', sync=True)
+    # lazy_collect=False: see TransformersModel.resume_from_checkpoint -- the driver consumes the returned
+    # training-state dict immediately, so this override must stay non-lazy too (it either delegates to
+    # super() or returns _resume_spectral_hybrid's dict). Preserves backend equivalence.
+    @remote_function(dispatch='all', collect='first', sync=True, lazy_collect=False)
     def resume_from_checkpoint(self, checkpoint_dir, *, resume_only_model=False, **kwargs):
         adapter_name = kwargs.get('adapter_name', '')
         self._check_adapter_valid(adapter_name)

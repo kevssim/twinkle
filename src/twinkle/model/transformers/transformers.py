@@ -87,6 +87,17 @@ def _prepare_sampling_replay(
     return loss_mask, masked_labels, metadata
 
 
+#: Tasks whose forward output is NOT a vocab log-softmax distribution, so ``selective_log_softmax`` logps
+#: must be skipped: classification/score heads (``seq_cls``/``reranker``/``generative_reranker`` emit
+#: ``[B, num_labels]``), the PPO ``value`` head (per-token ``V``), and pooled ``embedding`` features. Only a
+#: causal-LM head has a vocab axis to gather label logps from. The megatron backend dispatches exactly these
+#: tasks away from its logps branch (see megatron.py ``forward`` -- ``task in ('seq_cls', 'reranker', ...)``),
+#: so excluding them here keeps the two backends equivalent. This matters for a FROZEN seq_cls reward/value
+#: model: it carries no loss, ``require_logps`` defaults True, so without this guard its ``forward_only``
+#: would try to gather vocab logps out of a ``[B, 1]`` score and raise a shape error.
+_NON_LOGPS_TASKS = frozenset({'embedding', 'seq_cls', 'reranker', 'generative_reranker', 'value'})
+
+
 def _resolve_task_context(model, task, template=None):
     """Return a context manager that applies the right per-forward Patch for ``task``.
 
@@ -717,7 +728,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
             inputs['channel'] = channel
         if completion_mask is not None:
             inputs['completion_mask'] = completion_mask
-        if task != 'embedding' and labels is not None and loss_require_logps:
+        if task not in _NON_LOGPS_TASKS and labels is not None and loss_require_logps:
             loss_mask = replay_loss_mask if enable_sampling_replay else (labels != -100).bool()
             masked_labels = replay_masked_labels if enable_sampling_replay else labels.masked_fill(~loss_mask, 0)
             logits = outputs['logits']
@@ -857,7 +868,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
                 inputs['channel'] = channel
             if completion_mask is not None:
                 inputs['completion_mask'] = completion_mask
-            if task != 'embedding' and labels is not None and loss_require_logps:
+            if task not in _NON_LOGPS_TASKS and labels is not None and loss_require_logps:
                 loss_mask = replay_loss_mask if enable_sampling_replay else (labels != -100).bool()
                 masked_labels = replay_masked_labels if enable_sampling_replay else labels.masked_fill(~loss_mask, 0)
                 logits = outputs['logits']
@@ -1580,7 +1591,14 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
     def __del__(self):
         HubOperation.wait_for()
 
-    @remote_function(collect='first')
+    # lazy_collect=False: save is a persistence side-effect the caller acts on immediately (it rotates
+    # old checkpoints, writes args.json INTO the dir, and returns a path `swift infer` reloads), so the
+    # driver must block until the write lands. A deferred (lazy) handle only materializes when its result
+    # is consumed or a LATER remote call forces it -- so the final save of a run, which nothing follows,
+    # would be torn down with the actor before writing, leaving an empty checkpoint-final. Megatron's save
+    # is sync=True for the same reason; keeping the transformers backend non-lazy preserves that backend
+    # equivalence.
+    @remote_function(collect='first', lazy_collect=False)
     def save(self, name: Optional[str] = None, output_dir: Optional[str] = None, interval: int = 1, **kwargs):
         """Save model.
 
@@ -1886,7 +1904,13 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
 
         return trainer_state
 
-    @remote_function(dispatch='all', collect='first', sync=True)
+    # lazy_collect=False: resume_from_checkpoint returns the training-state dict the driver consumes
+    # immediately -- assembly.resume_model() hands it straight to loop.resume(), which subscripts
+    # state['cur_step']. The lazy default returns an un-collected callable instead, so subscripting
+    # raises "'function' object is not subscriptable". Mirrors forward_only/calculate_metric, the other
+    # methods whose return value the driver reads. sync=True orders the workers but does not materialize
+    # the result; the megatron/hybrid/multi_lora variants are non-lazy for the same backend equivalence.
+    @remote_function(dispatch='all', collect='first', sync=True, lazy_collect=False)
     def resume_from_checkpoint(self, checkpoint_dir, *, resume_only_model=False, **kwargs):
         adapter_name = kwargs.get('adapter_name', '')
 

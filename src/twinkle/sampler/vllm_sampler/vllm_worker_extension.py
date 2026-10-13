@@ -18,12 +18,15 @@ import platform
 import re
 import signal
 import torch
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 from twinkle import get_logger
 from twinkle.utils import Platform
 from twinkle.utils.framework import Torch
 from twinkle.utils.zmq_utils import configure_zmq_socket, get_timeout_s_from_env
+
+if TYPE_CHECKING:
+    from twinkle.checkpoint_engine.delta.config import DeltaWorkerCapabilities, DeltaWorkerMetadata
 
 logger = get_logger()
 
@@ -36,6 +39,17 @@ def set_death_signal():
     libc.prctl(1, signal.SIGKILL)
     if os.getppid() == 1:
         os.kill(os.getpid(), signal.SIGKILL)
+
+
+def _cuda_visible_device(device: torch.device) -> str:
+    device_index = device.index if device.index is not None else torch.cuda.current_device()
+    visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES')
+    if visible_devices is None:
+        return str(device_index)
+    selectors = [value.strip() for value in visible_devices.split(',')]
+    if not 0 <= device_index < len(selectors) or not selectors[device_index] or selectors[device_index] == '-1':
+        raise ValueError(f'Cannot map CUDA device {device_index} to CUDA_VISIBLE_DEVICES={visible_devices!r}')
+    return selectors[device_index]
 
 
 # Constants for the RL training LoRA adapter identity.
@@ -103,8 +117,41 @@ class TwinkleWorkerExtension:
         from twinkle.patch.vllm_lora_weights import VLLMLoraWeights
         set_death_signal()
         VLLMLoraWeights()(None)
+        config = getattr(kwargs.get('vllm_config'), 'weight_transfer_config', None)
+        if getattr(config, 'backend', None) == 'twinkle_delta_ipc':
+            from .delta_weight_transfer import register_twinkle_delta_weight_transfer_engine
+            register_twinkle_delta_weight_transfer_engine()
 
         return super().__new__(cls)
+
+    def validate_cuda_delta_worker(self) -> 'DeltaWorkerCapabilities':
+        from .delta_weight_transfer import TwinkleDeltaIPCWeightTransferEngine, is_moe_model
+        engine = getattr(self, 'weight_transfer_engine', None)
+        if not isinstance(engine, TwinkleDeltaIPCWeightTransferEngine):
+            raise RuntimeError("CUDA delta requires engine_args['weight_transfer_config']="
+                               "{'backend': 'twinkle_delta_ipc'} when constructing the sampler")
+        engine._validate_configuration()
+        if is_moe_model(engine.model_config.hf_config):
+            raise ValueError('Twinkle FSDP delta export does not yet implement backend-specific MoE HF conversion')
+        return {'tp': self.model_runner.parallel_config.tensor_parallel_size, 'device': 'cuda'}
+
+    def delta_ipc_endpoint(self):
+        if not hasattr(self, '_delta_ipc_endpoint'):
+            import uuid
+            self._delta_ipc_endpoint = f'ipc:///tmp/twinkle-delta-{uuid.uuid4().hex}.sock'
+        return self._delta_ipc_endpoint
+
+    def cuda_delta_receiver_metadata(self) -> 'DeltaWorkerMetadata':
+        from ray.util import get_node_ip_address
+        return {
+            'node_ip': get_node_ip_address(),
+            'device_uuid': str(torch.cuda.get_device_properties(self.device).uuid),
+            'cuda_visible_device': _cuda_visible_device(self.device),
+            'zmq_handle': self.delta_ipc_endpoint(),
+        }
+
+    def update_twinkle_delta_weights(self):
+        self.update_weights({'zmq_handle': self.delta_ipc_endpoint()})
 
     def monkey_patch_model(self):
         from twinkle.patch.vllm_moe_loader import VLLMMoEWeights

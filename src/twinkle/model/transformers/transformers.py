@@ -28,6 +28,8 @@ import twinkle.module.scheduler
 from twinkle import DeviceMesh, Platform, remote_class, remote_function
 from twinkle.checkpoint_engine import CheckpointEngine
 from twinkle.checkpoint_engine.mixin import CheckpointEngineMixin
+from twinkle.checkpoint_engine.delta.backends import FSDP2DeltaBackend
+from twinkle.checkpoint_engine.delta.trainer import CudaDeltaTrainerMixin
 from twinkle.data_format import InputFeature, ModelOutput, SampleResponse, SamplingParams, Trajectory
 from twinkle.hub import HubOperation
 from twinkle.infra import collect_dp_and_flatten, collect_tensor_dict
@@ -284,7 +286,8 @@ def _read_hf_state_dict(checkpoint_dir: str) -> Dict[str, torch.Tensor]:
 
 
 @remote_class()
-class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
+class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, CudaDeltaTrainerMixin,
+                       FSDP2DeltaBackend):
     """The transformers model wrapper.
 
     Args:
@@ -2187,6 +2190,12 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
         # Get state dict from unwrapped model
         model = self.strategy.unwrap_model(self.model)
 
+        def _checkpoint_tensor(tensor):
+            from torch.distributed.tensor import DTensor
+            if isinstance(tensor, DTensor):
+                tensor = tensor.to(Torch.get_device(None), non_blocking=True)
+            return Torch.to_local_tensor(tensor)
+
         def _normalize(name: str, keep_base_layer: bool) -> str:
             name = name.replace('base_model.model.', '')
             if not keep_base_layer:
@@ -2231,7 +2240,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
                     for name, tensor in model.state_dict().items():
                         if _is_lora_key(name):
                             continue
-                        tensor = Torch.to_local_tensor(tensor)
+                        tensor = _checkpoint_tensor(tensor)
                         name = _normalize(name, keep_base_layer=False)
                         names.append(name)
                         yield name, tensor
@@ -2247,7 +2256,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
                 def weight_generator():
                     names = []
                     for name, tensor in lora_state_dict.items():
-                        tensor = Torch.to_local_tensor(tensor)
+                        tensor = _checkpoint_tensor(tensor)
                         name = _normalize(name, keep_base_layer=True)
                         names.append(name)
                         yield name, tensor
@@ -2258,15 +2267,17 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin):
             # ``enable_lora`` (``merge_and_sync=False``), rename base weights to
             # the ``.base_layer.`` form for every module vLLM has LoRA-wrapped
             # (detected via ``model_keys``); otherwise send canonical names.
+            from twinkle.checkpoint_engine.delta.backends.fsdp import convert_weight_keys
+
             add_base_layer = not merge_and_sync
-            state_dict = model.state_dict()
+            state_dict = convert_weight_keys(model.state_dict(), model)
 
             def weight_generator():
                 names = []
                 for name, tensor in state_dict.items():
                     if _is_lora_key(name):
                         continue
-                    tensor = Torch.to_local_tensor(tensor)
+                    tensor = _checkpoint_tensor(tensor)
                     name = _normalize(name, keep_base_layer=False)
                     if add_base_layer:
                         name = _add_base_layer_suffix(name)

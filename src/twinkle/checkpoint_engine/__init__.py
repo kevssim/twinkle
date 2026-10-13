@@ -16,6 +16,7 @@ Usage:
 """
 
 from .base import CheckpointEngine, TensorMeta
+from .delta import DeltaShardedCheckpointEngine, DeltaSyncConfig
 from .hccl_checkpoint_engine import HCCLCheckpointEngine
 from .ipc_checkpoint_engine import IPCCheckpointEngine
 from .manager import CheckpointEngineManager, CheckpointEngineMode
@@ -32,4 +33,6 @@ __all__ = [
     'HCCLCheckpointEngine',
     'IPCCheckpointEngine',
     'TensorMeta',
+    'DeltaSyncConfig',
+    'DeltaShardedCheckpointEngine',
 ]

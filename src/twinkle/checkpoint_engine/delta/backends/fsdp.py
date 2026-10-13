@@ -52,7 +52,9 @@ def validate_fsdp2(owner) -> None:
            for dim in ('tp_world_size', 'pp_world_size', 'ep_world_size')):
         raise ValueError('FSDP delta export requires training TP=PP=EP=1')
     state = model.state_dict()
-    if not any(isinstance(param, DTensor) for param in state.values()):
+    # FSDP leaves the model unwrapped on a single rank; its plain tensors export as unsharded parameters.
+    single_rank = getattr(owner.device_mesh, 'world_size', None) == 1
+    if not single_rank and not any(isinstance(param, DTensor) for param in state.values()):
         raise ValueError('delta_sharded requires a wrapped FSDP2 DTensor model')
     if any(param.numel() >= 1 << 31 for param in state.values()):
         raise ValueError('delta_sharded indices require fewer than 2^31 elements per tensor')

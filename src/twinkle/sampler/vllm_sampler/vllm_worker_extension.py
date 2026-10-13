@@ -373,15 +373,18 @@ class TwinkleWorkerExtension:
                     weights.append((name, tensor))
                     del partial_tensors[name]
 
-            Torch.synchronize()
+            # Wait for this worker's own clones out of the shared buffer. Pass the device
+            # explicitly: TP workers inherit the actor's LOCAL_RANK, so the default would
+            # point at the wrong card.
+            Torch.synchronize(self.device)
+
+            # Every rank must finish reading before the driver acks: the ack lets the
+            # sender overwrite the buffer with the next bucket.
+            if tp_size > 1:
+                dist.barrier(group=cpu_group)
 
             if is_driver:
                 socket.send(b'')
-
-            # Ensure all ranks finish reading the buffer before the driver
-            # proceeds to the next bucket (which overwrites the buffer).
-            if tp_size > 1:
-                dist.barrier(group=cpu_group)
 
             if lora_mode:
                 lora_bucket_accum.extend(weights)

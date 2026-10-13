@@ -176,6 +176,22 @@ def test_default_two_card_fsdp_passes_parallelism_check(fsdp_owner):
         validate_fsdp2(fsdp_owner)
 
 
+def test_single_rank_trainer_accepts_unsharded_model(fsdp_owner):
+    fsdp_owner.device_mesh = DeviceMesh.from_sizes(world_size=1, fsdp_size=1, device_type='cuda')
+    fsdp_owner.model.state_dict = lambda: {'w': torch.ones(4, dtype=torch.bfloat16)}
+    validate_fsdp2(fsdp_owner)
+
+
+def test_single_rank_trainer_uses_rank_zero_without_process_group(monkeypatch):
+    from twinkle.checkpoint_engine.delta import trainer as delta_trainer
+    monkeypatch.setattr(delta_trainer.dist, 'is_initialized', lambda: False)
+    assert FSDPDeltaTrainer._delta_rank() == 0
+    trainer = FSDPDeltaTrainer()
+    trainer.validate_delta_backend = Mock()
+    trainer._validate_delta_ranks()
+    assert trainer._delta_metadata_group is None
+
+
 @pytest.mark.parametrize('size', [None, 0, 1])
 def test_disabled_parallel_dimensions_pass_parallelism_check(fsdp_owner, size):
     fsdp_owner.device_mesh = SimpleNamespace(tp_world_size=size, pp_world_size=size, ep_world_size=size)
@@ -348,6 +364,7 @@ def test_trainer_validation_failure_releases_metadata_group(monkeypatch):
 
     trainer = FSDPDeltaTrainer()
     group = object()
+    monkeypatch.setattr(delta_trainer.dist, 'is_initialized', lambda: True)
     monkeypatch.setattr(delta_trainer.dist, 'new_group', Mock(return_value=group))
     destroy = Mock()
     monkeypatch.setattr(delta_trainer.dist, 'destroy_process_group', destroy)

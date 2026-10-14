@@ -32,15 +32,39 @@ class DeltaParam:
     val_end: int
 
 
+def _xor_tree(t: torch.Tensor) -> int:
+    """Device-side XOR fold of a tensor's raw bytes (log2(n) rounds, one sync).
+
+    Works on any device (including NPU), unlike ``torch.hash_tensor`` which only
+    has CPU/CUDA kernels. The fold is out-of-place, so the argument's storage is
+    never mutated, and the result is a pure function of the bytes, independent
+    of dtype, so sender and receiver agree anywhere.
+    """
+    if t.numel() == 0:
+        return 0
+    flat = t.contiguous().reshape(-1)
+    v = flat.view(torch.uint8) if flat.dtype != torch.uint8 else flat
+    # Halving XOR fold; an odd middle element carries to the next round.
+    while v.numel() > 1:
+        n = v.numel()
+        half = n // 2
+        if n % 2 == 0:
+            v = v[:half] ^ v[half:]
+        else:
+            v = torch.cat((v[:half] ^ v[half + 1 :], v[half : half + 1]))
+    return int(v.item())
+
+
 def checksum(positions: torch.Tensor, values: torch.Tensor) -> int:
     """Wire-corruption check; sender computes pre-flush, receiver post-recv.
 
-    Uses ``torch.hash_tensor`` (XOR-reduce over uint64 bitcast); one reduction
-    plus one ``.item()`` sync per argument.
+    XOR tree over the bytes of each argument (device-side, one ``.item()`` sync
+    per argument). The same function runs on both ends, so the value is stable
+    across dtypes and devices.
     """
-    p = int(torch.hash_tensor(positions).item()) if positions.numel() else 0
-    v = int(torch.hash_tensor(values).item()) if values.numel() else 0
-    return p ^ (v << 1)
+    p = _xor_tree(positions)
+    v = _xor_tree(values)
+    return (p ^ (v << 1)) & ((1 << 64) - 1)
 
 
 # ---------- encode --------------------------------------------------------

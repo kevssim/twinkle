@@ -3,7 +3,8 @@
 
 Layout:
     config.py    DeltaSyncConfig and the TypedDicts exchanged between trainer and rollout
-    engine.py    DeltaShardedCheckpointEngine: gather, bucket and broadcast the changed elements
+    pipeline.py  DeltaSyncMixin: transport-agnostic gather/bucket/flush pipeline and seed/steady state machine
+    engine.py    DeltaShardedCheckpointEngine: NCCL transport (hooks + rollout receive) over the pipeline
     wire.py      DeltaFlush / DeltaParam wire structures and checksum
     gather.py    sparse gather of per-rank deltas to rank 0
     spec.py      ShardSpec / BlockPlacement: where a local shard sits in the full tensor

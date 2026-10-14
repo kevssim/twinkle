@@ -121,6 +121,9 @@ class TwinkleWorkerExtension:
         if getattr(config, 'backend', None) == 'twinkle_delta_ipc':
             from .delta_weight_transfer import register_twinkle_delta_weight_transfer_engine
             register_twinkle_delta_weight_transfer_engine()
+        elif getattr(config, 'backend', None) == 'twinkle_delta_hccl':
+            from .delta_weight_transfer import register_twinkle_delta_hccl_weight_transfer_engine
+            register_twinkle_delta_hccl_weight_transfer_engine()
 
         return super().__new__(cls)
 
@@ -128,12 +131,13 @@ class TwinkleWorkerExtension:
         from .delta_weight_transfer import TwinkleDeltaIPCWeightTransferEngine, is_moe_model
         engine = getattr(self, 'weight_transfer_engine', None)
         if not isinstance(engine, TwinkleDeltaIPCWeightTransferEngine):
-            raise RuntimeError("CUDA delta requires engine_args['weight_transfer_config']="
-                               "{'backend': 'twinkle_delta_ipc'} when constructing the sampler")
+            raise RuntimeError("Delta sync requires engine_args['weight_transfer_config'] when constructing the "
+                               "sampler: {'backend': 'twinkle_delta_ipc'} on CUDA or "
+                               "{'backend': 'twinkle_delta_hccl'} on Ascend NPU")
         engine._validate_configuration()
         if is_moe_model(engine.model_config.hf_config):
             raise ValueError('Twinkle FSDP delta export does not yet implement backend-specific MoE HF conversion')
-        return {'tp': self.model_runner.parallel_config.tensor_parallel_size, 'device': 'cuda'}
+        return {'tp': self.model_runner.parallel_config.tensor_parallel_size, 'device': engine.device.type}
 
     def delta_ipc_endpoint(self):
         if not hasattr(self, '_delta_ipc_endpoint'):
@@ -150,8 +154,17 @@ class TwinkleWorkerExtension:
             'zmq_handle': self.delta_ipc_endpoint(),
         }
 
-    def update_twinkle_delta_weights(self):
-        self.update_weights({'zmq_handle': self.delta_ipc_endpoint()})
+    def update_twinkle_delta_weights(self, update_info: Optional[List[Dict]] = None):
+        """Run one delta weight-update session.
+
+        ``None``: CUDA IPC path, this worker's local zmq endpoint is used. A list of per-worker
+        dicts (HCCL path, e.g. ``[{'group_rank': 1}, {'group_rank': 2}]``) is forwarded as is;
+        ``WorkerBase.update_weights`` is expected to pick the entry for this worker's rank.
+        """
+        if update_info is None:
+            self.update_weights({'zmq_handle': self.delta_ipc_endpoint()})
+        else:
+            self.update_weights(update_info)
 
     def monkey_patch_model(self):
         from twinkle.patch.vllm_moe_loader import VLLMMoEWeights

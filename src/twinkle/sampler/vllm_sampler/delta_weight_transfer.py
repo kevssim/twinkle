@@ -31,7 +31,9 @@ if TYPE_CHECKING:
     )
 
 TWINKLE_DELTA_WEIGHT_TRANSFER_BACKEND = "twinkle_delta_ipc"
+TWINKLE_DELTA_HCCL_WEIGHT_TRANSFER_BACKEND = "twinkle_delta_hccl"
 _REGISTERED = False
+_HCCL_REGISTERED = False
 
 
 def _checkpoint_patch_api():
@@ -118,62 +120,20 @@ def decode_delta_payload(
 ) -> tuple[str, list[CheckpointWeightPatch]]:
     """Validate and decode one DeltaFlush into vLLM checkpoint patches."""
 
-    from twinkle.checkpoint_engine.delta.wire import checksum
+    from twinkle.checkpoint_engine.delta.decode import decode_delta_wire
 
     CheckpointWeightPatch, _ = _checkpoint_patch_api()
-    tensors = dict(named_tensors)
-    try:
-        spec_tensor = tensors["__delta_spec__"]
-        values = tensors["__values__"]
-        spec = json.loads(bytes(spec_tensor.detach().cpu().numpy().tobytes()).decode())
-    except KeyError as exc:
-        raise ValueError(f"DeltaFlush is missing {exc.args[0]}") from exc
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError("DeltaFlush contains an invalid JSON spec") from exc
-
-    encoding = spec["encoding"]
-    if encoding not in {"dense", "indices"}:
-        raise ValueError(f"Unsupported DeltaFlush encoding: {encoding!r}")
-    positions = tensors.get("__positions__")
-    if positions is None:
-        positions = torch.empty(0, dtype=torch.uint8, device=values.device)
-    if encoding == "dense" and positions.numel():
-        raise ValueError("Dense DeltaFlush must not contain positions")
-    if encoding == "indices" and "__positions__" not in tensors:
-        raise ValueError("Indices DeltaFlush requires __positions__")
-
-    got_checksum = checksum(positions, values)
-    expected_checksum = int(spec["checksum"])
-    if got_checksum != expected_checksum:
-        raise RuntimeError(
-            f"Delta checksum mismatch in vLLM consumer: got {got_checksum}, expected {expected_checksum}"
+    encoding, patches = decode_delta_wire(named_tensors)
+    return encoding, [
+        CheckpointWeightPatch(
+            name=p.name,
+            shape=p.shape,
+            dtype=p.dtype,
+            values=p.values,
+            indices=p.positions,
         )
-
-    patches: list[CheckpointWeightPatch] = []
-    for param_spec in spec["params"]:
-        name = param_spec["name"]
-        dtype = getattr(torch, param_spec["dtype"])
-        patch_values = values[param_spec["val_start"] : param_spec["val_end"]]
-        if encoding == "dense":
-            patch_indices = None
-        else:
-            if param_spec["pos_width"] != 4:
-                raise ValueError(f"{name}: indices encoding requires pos_width=4")
-            pos_bytes = positions[param_spec["pos_start"] : param_spec["pos_end"]]
-            if pos_bytes.numel() != patch_values.numel() * 4:
-                raise ValueError(f"{name}: position and value slices have inconsistent lengths")
-            patch_indices = pos_bytes.view(torch.int32)
-
-        patches.append(
-            CheckpointWeightPatch(
-                name=name,
-                shape=tuple(param_spec["shape"]),
-                dtype=dtype,
-                values=patch_values,
-                indices=patch_indices,
-            )
-        )
-    return encoding, patches
+        for p in patches
+    ]
 
 
 class TwinkleDeltaIPCWeightTransferEngine(WeightTransferEngine):
@@ -182,6 +142,7 @@ class TwinkleDeltaIPCWeightTransferEngine(WeightTransferEngine):
     init_info_cls = TwinkleDeltaIPCInitInfo
     update_info_cls = TwinkleDeltaIPCUpdateInfo
     supports_draft_weight_update = False
+    required_device_type = "cuda"
 
     def __init__(
         self,
@@ -194,10 +155,13 @@ class TwinkleDeltaIPCWeightTransferEngine(WeightTransferEngine):
         self._session_encoding: str | None = None
         self._update_failed = False
 
+    def _device_error_message(self) -> str:
+        return "Twinkle delta weight transfer requires CUDA"
+
     def _validate_configuration(self) -> None:
         require_vllm_delta_support()
-        if self.device.type != 'cuda':
-            raise NotImplementedError("Twinkle delta weight transfer requires CUDA")
+        if self.device.type != self.required_device_type:
+            raise NotImplementedError(self._device_error_message())
         if self.parallel_config.data_parallel_size != 1:
             raise NotImplementedError("Twinkle delta weight transfer requires data_parallel_size=1")
         if self.parallel_config.pipeline_parallel_size != 1:
@@ -251,42 +215,46 @@ class TwinkleDeltaIPCWeightTransferEngine(WeightTransferEngine):
             raise callback_error
         return payload
 
-    def receive_weights(self, update_info: TwinkleDeltaIPCUpdateInfo) -> None:
+    def _decode_and_apply(self, payload: list[tuple[str, torch.Tensor]]) -> None:
+        """Decode one flush's named tensors into checkpoint patches and apply them."""
         from twinkle.sampler.vllm_sampler.weight_update_utils import (
             drop_tied_alias_patches,
             prepare_sparse_weight_loaders,
         )
 
+        encoding, patches = decode_delta_payload(payload)
+        patches = drop_tied_alias_patches(self.model, patches)
+
+        if self._session_encoding is None:
+            self._session_encoding = encoding
+            if encoding == "dense":
+                from vllm.model_executor.model_loader.reload import (
+                    initialize_layerwise_reload,
+                )
+
+                initialize_layerwise_reload(self.model)
+        elif encoding != self._session_encoding:
+            raise ValueError(
+                "One weight update cannot mix dense and sparse DeltaFlush payloads "
+                f"({self._session_encoding!r} then {encoding!r})"
+            )
+
+        if encoding == "indices":
+            prepare_sparse_weight_loaders(self.model)
+        _, load_checkpoint_weight_patches = _checkpoint_patch_api()
+        # The trusted producer emits every changed position at most once;
+        # skip vLLM's sort-based duplicate check on the rollout device.
+        load_checkpoint_weight_patches(
+            self.model,
+            patches,
+            validate_unique_indices=False,
+        )
+
+    def receive_weights(self, update_info: TwinkleDeltaIPCUpdateInfo) -> None:
         assert update_info.zmq_handle is not None
         try:
             payload = self._receive_payload(zmq_handle=update_info.zmq_handle)
-            encoding, patches = decode_delta_payload(payload)
-            patches = drop_tied_alias_patches(self.model, patches)
-
-            if self._session_encoding is None:
-                self._session_encoding = encoding
-                if encoding == "dense":
-                    from vllm.model_executor.model_loader.reload import (
-                        initialize_layerwise_reload,
-                    )
-
-                    initialize_layerwise_reload(self.model)
-            elif encoding != self._session_encoding:
-                raise ValueError(
-                    "One weight update cannot mix dense and sparse DeltaFlush payloads "
-                    f"({self._session_encoding!r} then {encoding!r})"
-                )
-
-            if encoding == "indices":
-                prepare_sparse_weight_loaders(self.model)
-            _, load_checkpoint_weight_patches = _checkpoint_patch_api()
-            # The trusted producer emits every changed position at most once;
-            # skip vLLM's sort-based duplicate check on the rollout GPU.
-            load_checkpoint_weight_patches(
-                self.model,
-                patches,
-                validate_unique_indices=False,
-            )
+            self._decode_and_apply(payload)
         except BaseException:
             # An earlier flush may already have changed runtime weights, so a
             # later update would start from an unknown partial state.
@@ -335,3 +303,124 @@ def register_twinkle_delta_weight_transfer_engine() -> None:
     )
     _REGISTERED = True
 
+
+@dataclass
+class TwinkleDeltaHCCLInitInfo(WeightTransferInitInfo):
+    """Rendezvous endpoints of the trainer's HCCL delta broadcast group."""
+
+    dist_ip: str
+    dist_port: int
+    zmq_ip: str
+    zmq_port: int
+    topic: str = "bucket_metadata"
+    world_size: int = 1
+
+
+@dataclass
+class TwinkleDeltaHCCLUpdateInfo(WeightTransferUpdateInfo):
+    """This worker's rank in the trainer's HCCL delta broadcast group."""
+
+    group_rank: int
+
+
+class TwinkleDeltaHCCLWeightTransferEngine(TwinkleDeltaIPCWeightTransferEngine):
+    """Consume Twinkle DeltaFlush payloads straight from the trainer's HCCL broadcasts (Ascend NPU).
+
+    The vLLM worker joins the trainer's broadcast group itself: one manifest subscription plus
+    one or two broadcasts per flush. The SUB is connected before the communicator is built, and
+    both are created once and reused across sessions.
+    """
+
+    init_info_cls = TwinkleDeltaHCCLInitInfo
+    update_info_cls = TwinkleDeltaHCCLUpdateInfo
+    required_device_type = "npu"
+
+    def __init__(self, config, vllm_config, device, model) -> None:
+        super().__init__(config, vllm_config, device, model)
+        self._rendezvous: TwinkleDeltaHCCLInitInfo | None = None
+        self._manifest_sub = None
+        self._comm = None
+        self._group_rank: int | None = None
+
+    def _device_error_message(self) -> str:
+        return "Twinkle delta HCCL weight transfer requires Ascend NPU ('npu' device)"
+
+    def init_transfer_engine(self, init_info: TwinkleDeltaHCCLInitInfo) -> None:
+        self._validate_configuration()
+        self._rendezvous = init_info
+
+    def _ensure_channel(self, group_rank: int):
+        """Create (once) and return the (manifest SUB, communicator) pair, SUB first."""
+        from twinkle.checkpoint_engine.delta.hccl_receiver import build_delta_hccl_communicator
+        from twinkle.checkpoint_engine.zmq_pubsub import connect_subscriber
+
+        if self._comm is None:
+            if self._rendezvous is None:
+                raise RuntimeError("init_transfer_engine must run before receive_weights")
+            rv = self._rendezvous
+            self._manifest_sub = connect_subscriber(rv.zmq_ip, rv.zmq_port, rv.topic)
+            try:
+                self._comm = build_delta_hccl_communicator(
+                    rv.dist_ip, rv.dist_port, group_rank, rv.world_size, self.device
+                )
+            except BaseException:
+                self._close_sub()
+                raise
+            self._group_rank = group_rank
+        elif group_rank != self._group_rank:
+            raise RuntimeError(
+                f"HCCL delta group_rank changed between sessions ({self._group_rank} -> {group_rank})"
+            )
+        return self._manifest_sub, self._comm
+
+    def receive_weights(self, update_info: TwinkleDeltaHCCLUpdateInfo) -> None:
+        from twinkle.checkpoint_engine.delta.hccl_receiver import pump_hccl_delta_session
+
+        try:
+            sub, comm = self._ensure_channel(update_info.group_rank)
+            pump_hccl_delta_session(sub, comm, self.device, on_flush=self._decode_and_apply)
+        except BaseException:
+            self._update_failed = True
+            raise
+
+    def _close_sub(self) -> None:
+        sub, self._manifest_sub = self._manifest_sub, None
+        if sub is None:
+            return
+        context = getattr(sub, "context", None)
+        try:
+            sub.close(linger=0)
+        except Exception:
+            pass
+        if context is not None:
+            try:
+                context.term()
+            except Exception:
+                pass
+
+    def shutdown(self) -> None:
+        comm, self._comm = self._comm, None
+        if comm is not None:
+            try:
+                comm.destroyComm(comm.comm)
+            except Exception:
+                pass
+        self._close_sub()
+        self._group_rank = None
+        self._rendezvous = None
+        super().shutdown()
+
+
+def register_twinkle_delta_hccl_weight_transfer_engine() -> None:
+    """Register the HCCL adapter before vLLM creates its worker-side engine."""
+
+    global _HCCL_REGISTERED
+    if _HCCL_REGISTERED:
+        return
+    from vllm.distributed.weight_transfer import WeightTransferEngineFactory
+
+    WeightTransferEngineFactory.register_engine(
+        TWINKLE_DELTA_HCCL_WEIGHT_TRANSFER_BACKEND,
+        TwinkleDeltaHCCLWeightTransferEngine,
+    )
+    _HCCL_REGISTERED = True

@@ -33,15 +33,14 @@ def test_resolver_gpu():
     assert resolve_delta_engine_cls('GPU') is DeltaShardedCheckpointEngine
 
 
-def test_resolver_npu_not_implemented(monkeypatch):
-    monkeypatch.delitem(sys.modules, HCCL_MODULE, raising=False)
-    try:
-        import importlib.util
-        exists = importlib.util.find_spec(HCCL_MODULE) is not None
-    except ModuleNotFoundError:
-        exists = False
-    if exists:
-        pytest.skip('HCCL delta module exists')
+def test_resolver_npu_real_engine():
+    from twinkle.checkpoint_engine.delta.hccl_engine import DeltaHCCLCheckpointEngine
+    assert resolve_delta_engine_cls('NPU') is DeltaHCCLCheckpointEngine
+
+
+def test_resolver_npu_module_missing_not_implemented(monkeypatch):
+    # sys.modules[name] = None makes the import raise ModuleNotFoundError(name=HCCL_MODULE)
+    monkeypatch.setitem(sys.modules, HCCL_MODULE, None)
     with pytest.raises(NotImplementedError, match=NOT_IMPLEMENTED):
         resolve_delta_engine_cls('NPU')
 
@@ -89,9 +88,16 @@ def test_manager_full_sync_does_not_resolve_delta(monkeypatch):
     assert manager.delta_engine_cls is None
 
 
-def test_manager_npu_fails_early_without_cuda_only_error(monkeypatch):
+def test_manager_npu_constructs_with_hccl_engine(monkeypatch):
     fake_platform(monkeypatch, 'NPU')
-    monkeypatch.delitem(sys.modules, HCCL_MODULE, raising=False)
+    from twinkle.checkpoint_engine.delta.hccl_engine import DeltaHCCLCheckpointEngine
+    manager = CheckpointEngineManager(*actors(), platform='NPU', mode='standalone', sync_backend='delta_sharded')
+    assert manager.delta_engine_cls is DeltaHCCLCheckpointEngine
+
+
+def test_manager_npu_module_missing_fails_early(monkeypatch):
+    fake_platform(monkeypatch, 'NPU')
+    monkeypatch.setitem(sys.modules, HCCL_MODULE, None)
     with pytest.raises(NotImplementedError, match=NOT_IMPLEMENTED):
         CheckpointEngineManager(*actors(), platform='NPU', mode='standalone', sync_backend='delta_sharded')
 
@@ -152,7 +158,7 @@ def test_trainer_device_follows_platform(monkeypatch, name, device):
 
 def test_trainer_npu_without_transport_fails_before_process_group(monkeypatch):
     fake_platform(monkeypatch, 'NPU')
-    monkeypatch.delitem(sys.modules, HCCL_MODULE, raising=False)
+    monkeypatch.setitem(sys.modules, HCCL_MODULE, None)
     new_group = Mock()
     monkeypatch.setattr(delta_trainer.dist, 'is_initialized', lambda: True)
     monkeypatch.setattr(delta_trainer.dist, 'new_group', new_group)

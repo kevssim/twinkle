@@ -5,6 +5,8 @@ Layout:
     config.py    DeltaSyncConfig and the TypedDicts exchanged between trainer and rollout
     pipeline.py  DeltaSyncMixin: transport-agnostic gather/bucket/flush pipeline and seed/steady state machine
     engine.py    DeltaShardedCheckpointEngine: NCCL transport (hooks + rollout receive) over the pipeline
+    hccl_engine.py  DeltaHCCLCheckpointEngine: HCCL (Ascend NPU) sender transport over the pipeline
+    ../zmq_pubsub.py  zmq PUB/SUB manifest-channel helpers shared by the NCCL and HCCL engines
     platform.py  resolve_delta_engine_cls: GPU -> NCCL engine, NPU -> HCCL engine (lazy import)
     wire.py      DeltaFlush / DeltaParam wire structures and checksum
     gather.py    sparse gather of per-rank deltas to rank 0

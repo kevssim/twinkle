@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional, Type, Union
 
 from twinkle import DeviceMesh, get_logger, remote_class, remote_function, requires
 from twinkle.checkpoint_engine import CheckpointEngineMixin
-from twinkle.checkpoint_engine.delta.rollout import CudaDeltaSamplerMixin
+from twinkle.checkpoint_engine.delta.rollout import DeltaSamplerMixin
 from twinkle.data_format import (InputFeature, PoolingParams, PoolingResponse, SampledSequence, SampleResponse,
                                  SamplingParams, Trajectory)
 from twinkle.hub import HubOperation
@@ -77,7 +77,7 @@ _MAX_CONCURRENCY = max(1, int(os.environ.get('TWINKLE_SAMPLER_MAX_CONCURRENCY') 
 
 
 @remote_class(max_concurrency=_MAX_CONCURRENCY)
-class vLLMSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, PartialRolloutMixin, CudaDeltaSamplerMixin):
+class vLLMSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, PartialRolloutMixin, DeltaSamplerMixin):
     """A vLLM-based sampler using VLLMEngine (AsyncLLM).
 
     This sampler automatically configures vLLM based on available GPUs.

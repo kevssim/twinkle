@@ -124,7 +124,7 @@ class TwinkleWorkerExtension:
 
         return super().__new__(cls)
 
-    def validate_cuda_delta_worker(self) -> 'DeltaWorkerCapabilities':
+    def validate_delta_worker(self) -> 'DeltaWorkerCapabilities':
         from .delta_weight_transfer import TwinkleDeltaIPCWeightTransferEngine, is_moe_model
         engine = getattr(self, 'weight_transfer_engine', None)
         if not isinstance(engine, TwinkleDeltaIPCWeightTransferEngine):
@@ -141,7 +141,7 @@ class TwinkleWorkerExtension:
             self._delta_ipc_endpoint = f'ipc:///tmp/twinkle-delta-{uuid.uuid4().hex}.sock'
         return self._delta_ipc_endpoint
 
-    def cuda_delta_receiver_metadata(self) -> 'DeltaWorkerMetadata':
+    def delta_receiver_metadata(self) -> 'DeltaWorkerMetadata':
         from ray.util import get_node_ip_address
         return {
             'node_ip': get_node_ip_address(),

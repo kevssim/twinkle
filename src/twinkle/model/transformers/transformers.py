@@ -29,7 +29,7 @@ from twinkle import DeviceMesh, Platform, remote_class, remote_function
 from twinkle.checkpoint_engine import CheckpointEngine
 from twinkle.checkpoint_engine.mixin import CheckpointEngineMixin
 from twinkle.checkpoint_engine.delta.backends import FSDP2DeltaBackend
-from twinkle.checkpoint_engine.delta.trainer import CudaDeltaTrainerMixin
+from twinkle.checkpoint_engine.delta.trainer import DeltaTrainerMixin
 from twinkle.data_format import InputFeature, ModelOutput, SampleResponse, SamplingParams, Trajectory
 from twinkle.hub import HubOperation
 from twinkle.infra import collect_dp_and_flatten, collect_tensor_dict
@@ -286,7 +286,7 @@ def _read_hf_state_dict(checkpoint_dir: str) -> Dict[str, torch.Tensor]:
 
 
 @remote_class()
-class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, CudaDeltaTrainerMixin,
+class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, DeltaTrainerMixin,
                        FSDP2DeltaBackend):
     """The transformers model wrapper.
 

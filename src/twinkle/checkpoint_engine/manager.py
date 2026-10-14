@@ -227,15 +227,15 @@ class CheckpointEngineManager:
                 logger.info('Base model sync completed, subsequent syncs will be LoRA-only')
 
     def _prepare_delta_transport(self):
-        capabilities = self.sampler.validate_cuda_delta_sampler(self.delta_config)
+        capabilities = self.sampler.validate_delta_sampler(self.delta_config)
         replicas = capabilities if isinstance(capabilities, list) else [capabilities]
-        workers = self.sampler.cuda_delta_sampler_metadata()
+        workers = self.sampler.delta_sampler_metadata()
         if len(workers) != sum(replica['tp'] for replica in replicas):
             raise ValueError('delta topology does not include every rollout TP worker')
         devices = {(worker['node_ip'], worker['device_uuid']) for worker in workers}
         if len(devices) != len(workers):
             raise ValueError('delta checkpoint receivers must occupy distinct rollout GPUs')
-        metadata = self.model.prepare_cuda_delta_sync(self.delta_config)
+        metadata = self.model.prepare_delta_sync(self.delta_config)
         return dict(metadata, world_size=len(workers) + 1, rollout_workers=workers), len(replicas)
 
     def _sync_delta_weights(self, merge_and_sync):
@@ -248,15 +248,15 @@ class CheckpointEngineManager:
         if seed:
             endpoint, replica_count = self._prepare_delta_transport()
         try:
-            self.sampler.begin_cuda_delta_sync()
+            self.sampler.begin_delta_sync()
             if seed:
-                trainer_init = self.model.init_cuda_delta_transport(endpoint)
-                sampler_init = self.sampler.init_cuda_delta_sampler_transport(endpoint)
+                trainer_init = self.model.init_delta_transport(endpoint)
+                sampler_init = self.sampler.init_delta_sampler_transport(endpoint)
                 trainer_init()
                 sampler_init()
                 self._delta_replica_count = replica_count
-            sender = self.model.send_cuda_delta_weights()
-            receiver = self.sampler.receive_cuda_delta_weights()
+            sender = self.model.send_delta_weights()
+            receiver = self.sampler.receive_delta_weights()
             metrics = sender()
             worker_metrics = receiver()
             results = worker_metrics if isinstance(worker_metrics, list) else [worker_metrics]
@@ -300,7 +300,7 @@ class CheckpointEngineManager:
 
     def _close_delta_session(self):
         errors = []
-        close_methods = (self.sampler.close_cuda_delta_sampler, self.model.close_cuda_delta_trainer)
+        close_methods = (self.sampler.close_delta_sampler, self.model.close_delta_trainer)
         for close in close_methods:
             try:
                 close()

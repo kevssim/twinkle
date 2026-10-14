@@ -20,7 +20,7 @@ from twinkle.checkpoint_engine.delta.backends import FSDP2DeltaBackend
 from twinkle.checkpoint_engine.delta.backends.fsdp import validate_fsdp2
 from twinkle.checkpoint_engine.delta.engine import DeltaShardedCheckpointEngine, _GatherQueue
 from twinkle.checkpoint_engine.delta.export import shard_delta_indices
-from twinkle.checkpoint_engine.delta.trainer import CudaDeltaTrainerMixin
+from twinkle.checkpoint_engine.delta.trainer import DeltaTrainerMixin
 from twinkle.model.transformers.strategy.native_fsdp import NativeFSDPStrategy
 
 
@@ -150,7 +150,7 @@ def test_hf_delta_export_requires_seed():
         list(hf_delta_export(raw(), {}, _hf_entry_identity))
 
 
-class FSDPDeltaTrainer(CudaDeltaTrainerMixin, FSDP2DeltaBackend):
+class FSDPDeltaTrainer(DeltaTrainerMixin, FSDP2DeltaBackend):
     """A model host: lifecycle mixin plus the FSDP2 export backend."""
 
 
@@ -352,8 +352,8 @@ def test_trainer_prepare_reuses_engine_between_workflow_rounds():
 
     trainer._initialize_delta_engine = Mock(side_effect=initialize)
     config = DeltaSyncConfig()
-    first = trainer.prepare_cuda_delta_sync(config)
-    second = trainer.prepare_cuda_delta_sync(config)
+    first = trainer.prepare_delta_sync(config)
+    second = trainer.prepare_delta_sync(config)
     assert first == second == dict(device='cuda', master_metadata=master_metadata)
     trainer._initialize_delta_engine.assert_called_once_with(config)
 

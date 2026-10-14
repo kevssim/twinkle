@@ -139,7 +139,7 @@ def test_worker_requires_native_delta_backend(adapter, monkeypatch):
     monkeypatch.setitem(sys.modules, 'twinkle.sampler.vllm_sampler.delta_weight_transfer', adapter)
     worker = SimpleNamespace(weight_transfer_engine=None)
     with pytest.raises(RuntimeError, match='weight_transfer_config'):
-        TwinkleWorkerExtension.validate_cuda_delta_worker(worker)
+        TwinkleWorkerExtension.validate_delta_worker(worker)
 
 
 def test_worker_allows_dense_model_and_tp_beyond_previous_allowlist(adapter, monkeypatch):
@@ -149,7 +149,7 @@ def test_worker_allows_dense_model_and_tp_beyond_previous_allowlist(adapter, mon
     engine.model_config.hf_config = SimpleNamespace(model_type='llama')
     worker = SimpleNamespace(weight_transfer_engine=engine,
                              model_runner=SimpleNamespace(parallel_config=SimpleNamespace(tensor_parallel_size=4)))
-    assert TwinkleWorkerExtension.validate_cuda_delta_worker(worker) == {'tp': 4, 'device': 'cuda'}
+    assert TwinkleWorkerExtension.validate_delta_worker(worker) == {'tp': 4, 'device': 'cuda'}
 
 
 class Embedding:

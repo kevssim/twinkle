@@ -80,7 +80,7 @@ class CudaDeltaReceiver:
         self.engine.close()
 
 
-class CudaDeltaSamplerMixin:
+class DeltaSamplerMixin:
     _delta_config: DeltaSyncConfig
     _delta_job_failed: bool = False
     _delta_weight_transfer_initialized: bool = False
@@ -101,7 +101,7 @@ class CudaDeltaSamplerMixin:
         await self.engine.engine.reset_encoder_cache()
 
     @remote_function(dispatch='all', lazy_collect=False)
-    def begin_cuda_delta_sync(self) -> None:
+    def begin_delta_sync(self) -> None:
         async def begin():
             self.engine._delta_unavailable = True
             await self.engine.pause_delta_generation(self._delta_config.timeout_seconds)
@@ -128,13 +128,13 @@ class CudaDeltaSamplerMixin:
         self._run_in_loop(self.engine.pause_delta_generation(self._delta_config.timeout_seconds))
 
     @remote_function(dispatch='all', lazy_collect=False)
-    def validate_cuda_delta_sampler(self, config: DeltaSyncConfig) -> DeltaWorkerCapabilities:
+    def validate_delta_sampler(self, config: DeltaSyncConfig) -> DeltaWorkerCapabilities:
         self._delta_config = config
         if self._delta_job_failed:
             raise RuntimeError('delta sampler failed; restart the entire training/rollout job before reseeding')
         if config.free_cache_engine and not self.engine.enable_sleep_mode:
             raise ValueError('delta KV cache release requires enable_sleep_mode=True or free_cache_engine=False')
-        results = self._run_in_loop(self._delta_rpc('validate_cuda_delta_worker'))
+        results = self._run_in_loop(self._delta_rpc('validate_delta_worker'))
         if not results or any(result != results[0] for result in results):
             raise ValueError('inconsistent delta worker capabilities')
         if len(results) != results[0]['tp']:
@@ -142,8 +142,8 @@ class CudaDeltaSamplerMixin:
         return results[0]
 
     @remote_function(dispatch='all', collect='flatten', lazy_collect=False)
-    def cuda_delta_sampler_metadata(self) -> list[DeltaWorkerMetadata]:
-        return self._run_in_loop(self._delta_rpc('cuda_delta_receiver_metadata'))
+    def delta_sampler_metadata(self) -> list[DeltaWorkerMetadata]:
+        return self._run_in_loop(self._delta_rpc('delta_receiver_metadata'))
 
     def _delta_receiver_placements(
         self, metadata: list[DeltaWorkerMetadata], endpoint: DeltaTransportEndpoint,
@@ -174,10 +174,10 @@ class CudaDeltaSamplerMixin:
             }}).remote(self._delta_config, endpoint, placement)
 
     @remote_function(dispatch='all', lazy_collect=True)
-    def init_cuda_delta_sampler_transport(self, endpoint: DeltaTransportEndpoint) -> None:
+    def init_delta_sampler_transport(self, endpoint: DeltaTransportEndpoint) -> None:
         import ray
 
-        metadata = self._run_in_loop(self._delta_rpc('cuda_delta_receiver_metadata'))
+        metadata = self._run_in_loop(self._delta_rpc('delta_receiver_metadata'))
         placements = self._delta_receiver_placements(metadata, endpoint)
         actor = ray.remote(num_cpus=0, num_gpus=0)(CudaDeltaReceiver)
         self._delta_receivers = []
@@ -204,7 +204,7 @@ class CudaDeltaSamplerMixin:
             await asyncio.gather(receivers, return_exceptions=True)
 
     @remote_function(dispatch='all', lazy_collect=True)
-    def receive_cuda_delta_weights(self) -> dict[str, bool]:
+    def receive_delta_weights(self) -> dict[str, bool]:
         async def receive():
             first = await self._next_delta_flush()
             if first is None:
@@ -231,7 +231,7 @@ class CudaDeltaSamplerMixin:
         return self._run_in_loop(receive())
 
     @remote_function(dispatch='all', lazy_collect=False)
-    def close_cuda_delta_sampler(self) -> None:
+    def close_delta_sampler(self) -> None:
         import ray
 
         self.engine._delta_unavailable = True

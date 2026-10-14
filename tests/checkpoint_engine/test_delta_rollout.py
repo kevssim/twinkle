@@ -8,12 +8,12 @@ from unittest.mock import AsyncMock, Mock, call
 import pytest
 import torch
 
-from twinkle.checkpoint_engine.delta.rollout import CudaDeltaReceiver, CudaDeltaSamplerMixin
+from twinkle.checkpoint_engine.delta.rollout import CudaDeltaReceiver, DeltaSamplerMixin
 from twinkle.sampler.vllm_sampler.vllm_engine import VLLMEngine
 from twinkle.sampler.vllm_sampler.vllm_worker_extension import _cuda_visible_device
 
 
-class LocalCudaSampler(CudaDeltaSamplerMixin):
+class LocalCudaSampler(DeltaSamplerMixin):
     def _run_in_loop(self, coroutine):
         return asyncio.run(coroutine)
 
@@ -33,8 +33,8 @@ def test_zero_change_skips_native_update_but_restores_kv_and_generation():
         sleep=AsyncMock(), wake_up=AsyncMock(), reset_prefix_cache=AsyncMock(return_value=True),
         resume_generation=AsyncMock()))
     sampler._delta_rpc = AsyncMock()
-    sampler.begin_cuda_delta_sync()
-    assert sampler.receive_cuda_delta_weights() == {'changed': False}
+    sampler.begin_delta_sync()
+    assert sampler.receive_delta_weights() == {'changed': False}
     sampler.publish_delta_sampler()
     sampler._delta_rpc.assert_not_called()
     sampler.engine.pause_delta_generation.assert_awaited_once_with(1)
@@ -52,7 +52,7 @@ def test_sampler_coordinates_native_update_and_gpu_local_senders():
     sampler.engine = SimpleNamespace(pause_delta_generation=AsyncMock(), engine=SimpleNamespace(
         reset_prefix_cache=AsyncMock(return_value=True), reset_mm_cache=AsyncMock(), reset_encoder_cache=AsyncMock()))
     sampler._delta_rpc = AsyncMock()
-    assert sampler.receive_cuda_delta_weights() == {'changed': True}
+    assert sampler.receive_delta_weights() == {'changed': True}
     assert [call.args[0] for call in sampler._delta_rpc.await_args_list] == [
         'init_weight_transfer_engine', 'start_weight_update', 'update_twinkle_delta_weights', 'finish_weight_update']
     for receiver in sampler._delta_receivers:
@@ -67,7 +67,7 @@ def test_receiver_stream_disagreement_fails_before_native_update():
     sampler._delta_receivers = [receiver_stub([None]), receiver_stub([{'is_last': True}])]
     sampler._delta_rpc = AsyncMock()
     with pytest.raises(ValueError, match='disagree'):
-        sampler.receive_cuda_delta_weights()
+        sampler.receive_delta_weights()
     sampler._delta_rpc.assert_not_called()
 
 
@@ -79,7 +79,7 @@ def test_cache_reset_failure_does_not_resume_generation():
     sampler.engine = SimpleNamespace(engine=SimpleNamespace(
         reset_prefix_cache=AsyncMock(return_value=False), resume_generation=AsyncMock()))
     with pytest.raises(RuntimeError, match='prefix cache reset failed'):
-        sampler.receive_cuda_delta_weights()
+        sampler.receive_delta_weights()
     sampler.engine.engine.resume_generation.assert_not_called()
 
 
@@ -88,7 +88,7 @@ def test_without_kv_release_pause_and_resume_still_run():
     sampler._delta_config = SimpleNamespace(timeout_seconds=1, free_cache_engine=False)
     sampler.engine = SimpleNamespace(pause_delta_generation=AsyncMock(), engine=SimpleNamespace(
         sleep=AsyncMock(), wake_up=AsyncMock(), resume_generation=AsyncMock()))
-    sampler.begin_cuda_delta_sync()
+    sampler.begin_delta_sync()
     sampler.publish_delta_sampler()
     sampler.engine.pause_delta_generation.assert_awaited_once()
     sampler.engine.engine.resume_generation.assert_awaited_once()
@@ -175,7 +175,7 @@ def test_topology_places_one_receiver_on_each_vllm_gpu(monkeypatch, use_worker_s
     sampler = LocalCudaSampler()
     sampler._delta_rpc = AsyncMock(return_value=metadata)
     sampler._delta_config = SimpleNamespace(timeout_seconds=1)
-    sampler.init_cuda_delta_sampler_transport({'world_size': 3, 'master_metadata': 'master',
+    sampler.init_delta_sampler_transport({'world_size': 3, 'master_metadata': 'master',
                                               'rollout_workers': metadata})
     assert [item[1:] for item in created] == [(1, 'ipc:///tmp/rank0.sock'), (2, 'ipc:///tmp/rank1.sock')]
     expected_selectors = ['2', '3'] if use_worker_selector else ['GPU-0', 'GPU-1']
@@ -204,7 +204,7 @@ def test_sampler_dp_allows_independent_rollout_replicas():
     sampler.device_mesh = SimpleNamespace(data_world_size=2)
     sampler.engine = SimpleNamespace(enable_sleep_mode=True)
     sampler._delta_rpc = AsyncMock(return_value=[dict(tp=2, device='cuda')] * 2)
-    assert sampler.validate_cuda_delta_sampler(DeltaSyncConfig()) == dict(tp=2, device='cuda')
+    assert sampler.validate_delta_sampler(DeltaSyncConfig()) == dict(tp=2, device='cuda')
 
 
 def test_submission_barrier_waits_for_request_already_past_gate():

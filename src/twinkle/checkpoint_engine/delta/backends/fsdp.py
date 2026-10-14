@@ -37,8 +37,9 @@ def validate_fsdp2(owner) -> None:
     from twinkle.model.transformers.strategy.accelerate import AccelerateStrategy
     from twinkle.model.transformers.strategy.native_fsdp import NativeFSDPStrategy
 
-    if Platform.get_platform().__name__ != 'GPU':
-        raise ValueError('CUDA delta requires CUDA trainer actors')
+    platform_name = Platform.get_platform().__name__
+    if platform_name not in ('GPU', 'NPU'):
+        raise ValueError(f'delta_sharded requires GPU or NPU trainer actors, got platform {platform_name!r}')
     if not isinstance(owner.strategy, (NativeFSDPStrategy, AccelerateStrategy)):
         raise ValueError('delta_sharded requires native or Accelerate FSDP2')
     model = owner.strategy.unwrap_model(owner.model)

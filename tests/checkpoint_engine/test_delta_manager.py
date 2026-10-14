@@ -69,19 +69,6 @@ def test_delta_rejects_local_deployment():
         CheckpointEngineManager(SimpleNamespace(), SimpleNamespace(), sync_backend='delta_sharded')
 
 
-def test_delta_rejects_npu_deployment(monkeypatch):
-    from twinkle import Platform
-
-    class NPU:
-        pass
-
-    monkeypatch.setattr(Platform, 'get_platform', staticmethod(lambda platform=None: NPU))
-    model = Mock(_actors=[1, 2])
-    sampler = Mock(_actors=[3])
-    with pytest.raises(ValueError, match='CUDA only'):
-        CheckpointEngineManager(model, sampler, platform='NPU', sync_backend='delta_sharded')
-
-
 def test_seed_then_sparse_reuses_transport():
     manager, model, sampler = manager_pair()
     manager.sync_weights()

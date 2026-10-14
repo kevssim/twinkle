@@ -1,12 +1,18 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Configuration for the verl CUDA delta checkpoint engine."""
+"""Configuration for the delta checkpoint engine."""
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TypedDict
+from typing import TYPE_CHECKING, TypedDict, Union
 from typing_extensions import NotRequired
 
-from ..nccl_checkpoint_engine import MasterMetadata
+if TYPE_CHECKING:
+    from ..hccl_checkpoint_engine import MasterMetadata as HCCLMasterMetadata
+    from ..nccl_checkpoint_engine import MasterMetadata
+
+    DeltaMasterMetadata = Union[MasterMetadata, HCCLMasterMetadata]
+else:
+    DeltaMasterMetadata = object
 
 SPARSE_ELEMENT_BYTES = 6
 
@@ -30,13 +36,13 @@ class DeltaSyncConfig:
 
 class DeltaTransportEndpoint(TypedDict):
     world_size: int
-    master_metadata: MasterMetadata
+    master_metadata: DeltaMasterMetadata
     rollout_workers: list[DeltaWorkerMetadata]
 
 
 class DeltaTrainerMetadata(TypedDict):
     device: str
-    master_metadata: MasterMetadata | None
+    master_metadata: DeltaMasterMetadata | None
 
 
 class DeltaWorkerCapabilities(TypedDict):

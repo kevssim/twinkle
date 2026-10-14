@@ -6,7 +6,7 @@ from typing import List, Literal, Optional
 
 from twinkle import Platform, get_logger
 from .base import CheckpointEngine
-from .delta import DeltaSyncConfig
+from .delta import DeltaSyncConfig, resolve_delta_engine_cls
 from .mixin import CheckpointEngineMixin
 
 logger = get_logger()
@@ -92,8 +92,10 @@ class CheckpointEngineManager:
             raise ValueError('delta_sharded requires standalone trainer and rollout actors')
         self.sync_backend = sync_backend
         self.delta_config = delta_config or DeltaSyncConfig()
-        if sync_backend == 'delta_sharded' and Platform.get_platform(platform).__name__ != 'GPU':
-            raise ValueError('delta_sharded currently supports CUDA only')
+        self.delta_engine_cls = None
+        if sync_backend == 'delta_sharded':
+            # Fail at construction, not mid-sync, when the platform has no delta transport.
+            self.delta_engine_cls = resolve_delta_engine_cls(Platform.get_platform(platform).__name__)
         self._delta_replica_count = None
         self._delta_round = 0
         self._delta_failed = False

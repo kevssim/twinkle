@@ -3,6 +3,8 @@ import os
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Type, TypeVar, Union
 
 from twinkle import DeviceGroup, Platform, find_free_port, find_node_ip, requires
+from twinkle.utils.loader import run_worker_setup_hook
+from .. import _torch_setup
 from .resource_manager import ResourceManager
 
 T = TypeVar('T')
@@ -140,19 +142,32 @@ class RayHelper:
         return RayHelper.ray_inited() and ray._private.worker.global_worker.mode == ray._private.worker.WORKER_MODE
 
     @staticmethod
-    def execute_all_sync(method_name: str, workers_and_args: List[Tuple[Any, List[Any], Dict[str, Any]]]):
-        """Execute method and return results."""
+    def execute_all_sync(method_name: str, workers_and_args: List[Tuple[Any, List[Any], Dict[str, Any]]], *,
+                         on_submit: Optional[Callable] = None, timeout=None):
+        """Execute method and return results.
+
+        ``timeout`` is passed to ``ray.get(list, timeout=)``, whose semantics are
+        the **total** wall-clock time to collect the whole list -- different from
+        ``LazyCollect``'s per-future timing (see ``do_get_and_collect_func``).
+        The two paths are each bounded on their own; the total-time semantics here
+        are strictly tighter.
+        """
         import ray
-        return ray.get(RayHelper.execute_all_async(method_name, workers_and_args))
+        return ray.get(RayHelper.execute_all_async(method_name, workers_and_args, on_submit=on_submit), timeout=timeout)
 
     @staticmethod
-    def execute_all_async(method_name: str, workers_and_args: List[Tuple[Any, List[Any], Dict[str, Any]]]):
+    def execute_all_async(method_name: str, workers_and_args: List[Tuple[Any, List[Any], Dict[str, Any]]], *,
+                          on_submit: Optional[Callable] = None):
         """Execute method and return futures."""
         output = []
         for worker_and_args in workers_and_args:
             worker, args, kwargs = worker_and_args
             remote_call = getattr(worker, method_name)
-            output.append(remote_call.remote(*args, **kwargs))
+            result = remote_call.remote(*args, **kwargs)
+            output.append(result)
+            # 逐个登记，后续 RPC 发送失败也不能丢失已发出的 refs。
+            if on_submit is not None:
+                on_submit(worker, result)
         return output
 
     @staticmethod
@@ -225,6 +240,23 @@ class RayHelper:
                 """Lazily collect results, support repeated calls (with caching)"""
                 return self._get_result()
 
+            def ready(self) -> bool:
+                """Whether every referenced task has finished, WITHOUT fetching any payload.
+
+                A control-plane probe only: it exists so a driver can time a side effect (e.g. releasing an
+                adapter pin) to the true completion of a lazily-collected call, while the payload keeps
+                flowing as a reference to a downstream actor. ``ray.wait(timeout=0)`` inspects task status and
+                never materialises the result, so ``_result`` stays untouched and no data returns to the
+                caller. A FAILED task also reports ready (``ray.wait`` surfaces completion, not success); the
+                exception is raised later, at the real :meth:`__call__` collect.
+                """
+                import ray
+                refs = [future for future in self._futures if isinstance(future, ray.ObjectRef)]
+                if not refs:
+                    return True
+                ready, _ = ray.wait(refs, num_returns=len(refs), timeout=0)
+                return len(ready) == len(refs)
+
             def __iter__(self):
                 """Support iteration: automatically collect results then iterate"""
                 return iter(self._get_result())
@@ -269,9 +301,9 @@ class RayHelper:
                        execute: Literal['all', 'peer', 'first'],
                        *args,
                        instance_id,
-                       seed=42,
-                       full_determinism=False,
+                       extra_torch_kwargs: Optional[Dict[str, Any]] = None,
                        max_concurrency: Optional[int] = None,
+                       worker_slots: Optional[List[int]] = None,
                        **kwargs) -> List[T]:
         # TODO when will remote create remote?
         # Should it peer create peer? or peer create all?
@@ -288,6 +320,14 @@ class RayHelper:
         if isinstance(ranks, int):
             ranks = list(range(ranks))
         assert len(placement_groups) == len(ranks)
+        if worker_slots is not None:
+            slots = tuple(worker_slots)
+            if any(type(slot) is not int or not 0 <= slot < len(ranks) for slot in slots) or len(set(slots)) != len(slots):
+                raise ValueError(f'worker_slots must be unique indices in [0, {len(ranks)}), got {slots!r}.')
+            if not slots:
+                return []
+            placement_groups = [placement_groups[slot] for slot in slots]
+            ranks = [ranks[slot] for slot in slots]
         key = f'{group}-{worker_cls.__class__.__name__}-{instance_id}'
         if execute == 'peer':
             # Create the peer worker
@@ -331,10 +371,8 @@ class RayHelper:
                     ','.join([str(r) for r in deploy_pg['gpu_rank']]),
                     'TWINKLE_MODE':
                     'ray',
-                    'TWINKLE_SEED':
-                    str(seed),
-                    'TWINKLE_FULL_DETERMINISM':
-                    str(int(full_determinism)),
+                    _torch_setup.EXTRA_TORCH_KWARGS_ENV:
+                    _torch_setup.to_env_value(extra_torch_kwargs),
                 })
 
                 env_vars['MASTER_ADDR'] = ip
@@ -349,7 +387,11 @@ class RayHelper:
                     # blocking continuous-work methods off the actor's event loop.
                     env_vars['TWINKLE_ACTOR_MAX_CONCURRENCY'] = str(max_concurrency)
 
-                runtime_env = RuntimeEnv(env_vars=env_vars)
+                # Ray serialises runtime_env to JSON; a callable setup hook is rejected by Ray 2.58
+                # ("Object of type function is not JSON serializable"). Pass the import path instead.
+                runtime_env = RuntimeEnv(
+                    env_vars=env_vars,
+                    worker_process_setup_hook='twinkle.utils.loader.run_worker_setup_hook')
 
                 worker_options = {
                     'scheduling_strategy':
@@ -379,7 +421,12 @@ class RayHelper:
                 if max_concurrency is not None:
                     worker_options['max_concurrency'] = max_concurrency
 
-                worker = worker_cls.options(**worker_options).remote(*args, **kwargs)
+                try:
+                    worker = worker_cls.options(**worker_options).remote(*args, **kwargs)
+                except BaseException:
+                    for created in workers:
+                        ray.kill(created, no_restart=True)
+                    raise
                 workers.append(worker)
         else:
             world_size = len(ranks)
@@ -398,8 +445,7 @@ class RayHelper:
                     'CLUSTER_NAME': cluster_name,
                     'WORKER_NAME': worker_name,
                     'TWINKLE_MODE': 'ray',
-                    'TWINKLE_SEED': str(seed),
-                    'TWINKLE_FULL_DETERMINISM': str(int(full_determinism)),
+                    _torch_setup.EXTRA_TORCH_KWARGS_ENV: _torch_setup.to_env_value(extra_torch_kwargs),
                     **_visible_device_env
                 })
                 if max_concurrency is not None:
@@ -407,7 +453,11 @@ class RayHelper:
                     # blocking continuous-work methods off the actor's event loop.
                     env_vars['TWINKLE_ACTOR_MAX_CONCURRENCY'] = str(max_concurrency)
 
-                runtime_env = RuntimeEnv(env_vars=env_vars)
+                # Ray serialises runtime_env to JSON; a callable setup hook is rejected by Ray 2.58
+                # ("Object of type function is not JSON serializable"). Pass the import path instead.
+                runtime_env = RuntimeEnv(
+                    env_vars=env_vars,
+                    worker_process_setup_hook='twinkle.utils.loader.run_worker_setup_hook')
 
                 worker_options = {
                     'scheduling_strategy':
@@ -421,6 +471,11 @@ class RayHelper:
                 if max_concurrency is not None:
                     worker_options['max_concurrency'] = max_concurrency
 
-                worker = worker_cls.options(**worker_options).remote(*args, **kwargs)
+                try:
+                    worker = worker_cls.options(**worker_options).remote(*args, **kwargs)
+                except BaseException:
+                    for created in workers:
+                        ray.kill(created, no_restart=True)
+                    raise
                 workers.append(worker)
         return workers

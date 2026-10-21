@@ -33,6 +33,29 @@ class GRPOLoss(Loss):
         entropy_coef: float = 0.0,
         ignore_index: int = -100,
         enable_sampling_replay: bool = False,
+        *,
+        # -- advanced on-policy controls --------------------------------------------------------
+        # Every one defaults to "off", so a GRPOLoss built with none of them is byte-for-byte the
+        # plain surrogate above. They are the constructor-parameterised form of the controls the
+        # legacy ``GRPOTrainer`` applied inline (and dev carried in ``_ConfiguredGRPOLoss`` /
+        # ``_AdvancedGRPOLoss``): sequence-level IS, dual-clip, entropy filter/logging, truncated-IS
+        # rollout correction, off-policy sequence masking, FIPO future-KL weighting and SDAR distillation.
+        importance_sampling_level: str = 'token',
+        delta: Optional[float] = None,
+        top_entropy_quantile: float = 1.0,
+        log_entropy: bool = False,
+        rollout_importance_sampling_mode: Optional[str] = None,
+        rollout_importance_sampling_threshold: float = 2.0,
+        log_rollout_offpolicy_metrics: bool = False,
+        off_policy_sequence_mask_delta: Optional[float] = None,
+        overlong_filter: bool = False,
+        loss_type: str = 'grpo',
+        fipo_decay_rate: float = 32.0,
+        fipo_clip_range: Optional[float] = 0.2,
+        fipo_clip_high_only: bool = True,
+        fipo_safety_threshold: Optional[float] = 4.0,
+        sdar_loss_coef: float = 0.0,
+        sdar_gate_beta: float = 5.0,
         **kwargs,
     ):
         self.epsilon = epsilon
@@ -44,9 +67,54 @@ class GRPOLoss(Loss):
             raise ValueError('sampling replay does not support a GRPO KL penalty (beta must be 0)')
         if enable_sampling_replay and entropy_coef != 0.0:
             raise ValueError('sampling replay does not support a GRPO entropy bonus')
-        # Gate the expensive entropy compute path in the model forward.
-        self.require_entropy = entropy_coef > 0.0
         self.ignore_index = ignore_index
+
+        self.importance_sampling_level = importance_sampling_level
+        self.delta = delta
+        self.top_entropy_quantile = top_entropy_quantile
+        self.log_entropy = log_entropy
+        self.rollout_importance_sampling_mode = rollout_importance_sampling_mode
+        self.rollout_importance_sampling_threshold = rollout_importance_sampling_threshold
+        self.log_rollout_offpolicy_metrics = log_rollout_offpolicy_metrics
+        self.off_policy_sequence_mask_delta = off_policy_sequence_mask_delta
+        self.overlong_filter = overlong_filter
+        self.loss_type = loss_type
+        self.fipo_gamma = 2.0**(-1.0 / fipo_decay_rate)
+        self.fipo_clip_range = fipo_clip_range
+        self.fipo_clip_high_only = fipo_clip_high_only
+        self.fipo_safety_threshold = fipo_safety_threshold
+        self.sdar_loss_coef = sdar_loss_coef
+        self.sdar_gate_beta = sdar_gate_beta
+        # ``_advanced`` selects the configured surrogate pipeline (see ``_configured_grpo``). It covers
+        # exactly the controls the base ``_reduce_loss`` path cannot express: dual-clip, entropy
+        # filter/logging, overlong filtering, truncated-IS rollout correction / off-policy diagnostics,
+        # off-policy sequence masking and FIPO. ``importance_sampling_level`` is deliberately NOT here --
+        # the base ``_compute_log_importance_weights`` already branches on it (token/sequence/sequence_token),
+        # so a plain GSPO run stays on the ±5-clamped base path exactly as before; only when one of the
+        # controls below is active does the ±20-clamped configured pipeline take over (which then also
+        # reads ``importance_sampling_level``).
+        self._advanced = (loss_type == 'fipo' or delta is not None or top_entropy_quantile < 1.0 or log_entropy
+                          or overlong_filter or rollout_importance_sampling_mode is not None
+                          or log_rollout_offpolicy_metrics or off_policy_sequence_mask_delta is not None)
+        # ``_distill_wrap`` marks the SDAR auxiliary objective, which reads the rollout logits/logps.
+        self._distill_wrap = sdar_loss_coef > 0.0
+        # The configured pipeline recomputes the surrogate and aggregation itself and never calls
+        # ``_reduce_loss``, so pairing it with a variant whose objective LIVES in an overridden
+        # ``_reduce_loss`` (REAL / DRO / DPPO / GeoMean / ClipCov / KLCov) would silently downgrade that
+        # variant to plain GRPO. Refuse the combo here -- one drift-free place, and a structural check so
+        # a future ``_reduce_loss`` variant is covered without editing a name list. Variants that override
+        # only ``_compute_per_token_loss`` (e.g. GPG) still compose, since the pipeline calls that hook.
+        if self._advanced and type(self)._reduce_loss is not GRPOLoss._reduce_loss:
+            raise ValueError(
+                f'{type(self).__name__} is a group-/sequence-level objective (it overrides `_reduce_loss`) '
+                'that the advanced GRPO ratio/entropy/rollout controls would bypass. Drop the conflicting '
+                'control (importance_sampling_level / delta / top_entropy_quantile / log_entropy / '
+                'overlong_filter / rollout_importance_sampling_mode / log_rollout_offpolicy_metrics / '
+                'off_policy_sequence_mask_delta / fipo) to use this loss_type.')
+        # Gate the expensive forward paths: entropy for the bonus OR the advanced entropy
+        # logging/filtering; logits for the SDAR auxiliary term.
+        self.require_entropy = entropy_coef > 0.0 or log_entropy or top_entropy_quantile < 1.0
+        self.require_logits = self._distill_wrap
 
     def micro_batch_scale(self, inputs, indices):
         return len(indices) / len(inputs)
@@ -58,10 +126,14 @@ class GRPOLoss(Loss):
         loss_mask: 'torch.Tensor',
     ) -> 'torch.Tensor':
         """
-        Compute log importance sampling weights.
+        Compute log importance sampling weights at ``self.importance_sampling_level``.
 
-        Override this method in subclasses for different IS strategies.
-        Default: token-level importance sampling.
+        Three levels share this one base-path implementation (the advanced ``_configured_grpo``
+        pipeline has its own ±20-clamped ``_advanced_importance_weights`` twin):
+          * ``'token'`` (default): per-token log ratio.
+          * ``'sequence'``: the mask-averaged log ratio broadcast to every token (GSPO).
+          * ``'sequence_token'``: GSPO-token -- grad flows through the per-token logp while the
+            sequence weight rides along detached (``logp - sg[logp] + sg[seq]``).
 
         Args:
             per_token_logps: [batch, seq_len] current policy log probabilities
@@ -75,7 +147,15 @@ class GRPOLoss(Loss):
         log_ratio = per_token_logps - per_token_old_logps
         # Clamp for numerical stability (±5 bounds ratio to [exp(-5), exp(5)] ≈ [0.007, 148])
         log_ratio = torch.clamp(log_ratio, min=-5.0, max=5.0)
-        return log_ratio
+        if self.importance_sampling_level == 'token':
+            return log_ratio
+        sequence = ((log_ratio * loss_mask).sum(-1) / loss_mask.sum(-1).clamp(min=1.0)).unsqueeze(-1)
+        if self.importance_sampling_level == 'sequence':
+            return sequence
+        if self.importance_sampling_level == 'sequence_token':
+            return per_token_logps - per_token_logps.detach() + sequence.detach()
+        raise ValueError(f'Unknown importance_sampling_level={self.importance_sampling_level!r}. '
+                         "Expected 'token', 'sequence' or 'sequence_token'.")
 
     def _compute_per_token_loss(
         self,
@@ -202,14 +282,16 @@ class GRPOLoss(Loss):
             elif n_sample == n_pos:
                 # Response-only form (e.g. old_logps from vLLM).
                 result[i, pos] = sample
-            elif n_sample >= seq_len:
-                # Full-sequence form (e.g. ref_logps right-padded with ignore-value).
-                result[i, pos] = sample[:seq_len][mask[i]]
+            elif n_pos == 0 or (n_sample > 0 and pos[-1].item() < n_sample):
+                # Variable-length full-sequence form. The processor right-pads the
+                # batch, but per-sample RL fields from Tinker remain unpadded. They
+                # are valid when every selected mask position exists in this row.
+                result[i, pos] = sample[pos]
             else:
                 raise AssertionError(f'data/mask length mismatch at sample {i}: '
                                      f'n_pos={n_pos}, n_sample={n_sample}, seq_len={seq_len} '
-                                     '(expected n_sample == n_pos for response-only form, '
-                                     'or n_sample >= seq_len for full-sequence form)')
+                                     '(expected n_sample == n_pos for response-only form, or all masked positions '
+                                     'to exist in the per-sample full-sequence form)')
 
         return result
 
@@ -246,7 +328,7 @@ class GRPOLoss(Loss):
                              'they are trainable but have no sampling mask to replay against.')
         return loss_mask
 
-    def __call__(
+    def _base_grpo(
         self,
         inputs: Dict,
         outputs: Dict,
@@ -383,6 +465,240 @@ class GRPOLoss(Loss):
 
         return LossOutput(loss=loss, num_tokens=self._loss_num_tokens(loss_mask))
 
+    # ── Advanced on-policy controls ────────────────────────────────────────────
+    # A faithful port of the legacy ``GRPOTrainer`` surrogate (carried in dev as ``_ConfiguredGRPOLoss``
+    # / ``_AdvancedGRPOLoss``). It runs on the legacy numerics -- a ±20 stability clamp on the log
+    # importance ratio and a clamped (k3) reference-KL -- which deliberately differ from the base path's
+    # ±5 clamp and unclamped KL, so it is kept separate from ``_reduce_loss`` rather than merged into
+    # it. Reached only when an advanced control is on (``self._advanced`` / ``self._distill_wrap``).
+
+    def __call__(
+        self,
+        inputs: Dict,
+        outputs: Dict,
+        *,
+        old_logps: Optional[Union['torch.Tensor', List[List[float]]]] = None,
+        ref_logps: Optional['torch.Tensor'] = None,
+        advantages: Optional[Union['torch.Tensor', List[float], np.ndarray]] = None,
+        rollout_logps: Optional[Union['torch.Tensor', List[List[float]]]] = None,
+        truncated: Optional[List[bool]] = None,
+        teacher_logps: Optional[Union['torch.Tensor', List[List[float]]]] = None,
+        **kwargs,
+    ):
+        """Compute the GRPO loss, applying any advanced controls this instance was built with.
+
+        The extra keyword arguments are supplied by the RL training loop for every GRPO step (so the
+        signature is stable whether or not a control is active): ``rollout_logps`` (the sampler's own
+        log-probs, for truncated-IS correction and off-policy diagnostics), ``truncated`` (per-row
+        overlong flags), and ``teacher_logps`` (SDAR's privileged teacher). With every control off this
+        is exactly :meth:`_base_grpo`.
+        """
+        if not (self._advanced or self._distill_wrap):
+            return self._base_grpo(inputs, outputs, old_logps=old_logps, ref_logps=ref_logps,
+                                   advantages=advantages, **kwargs)
+
+        if self._advanced:
+            result = self._configured_grpo(
+                inputs, outputs, old_logps=old_logps, ref_logps=ref_logps, advantages=advantages,
+                rollout_logps=rollout_logps, truncated=truncated, **kwargs)
+        else:
+            result = self._base_grpo(
+                inputs, outputs, old_logps=old_logps, ref_logps=ref_logps, advantages=advantages, **kwargs)
+
+        loss = result['loss']
+        channel_loss = result.get('channel_loss')
+        if self._distill_wrap:
+            loss = self._add_sdar(loss, inputs, outputs, teacher_logps)
+            result = LossOutput(loss=loss, num_tokens=0)
+        else:
+            result = LossOutput(loss=loss, num_tokens=result['num_tokens'])
+        if channel_loss is not None:
+            result['channel_loss'] = channel_loss
+        return result
+
+    def _configured_grpo(
+        self,
+        inputs: Dict,
+        outputs: Dict,
+        *,
+        old_logps=None,
+        ref_logps=None,
+        advantages=None,
+        rollout_logps=None,
+        truncated=None,
+        **kwargs,
+    ) -> LossOutput:
+        """The configured surrogate: dual-clip / entropy / FIPO / rollout-IS / off-policy controls.
+
+        Requires ``outputs['logps']`` (the forward supplies them under ``require_logps``) and scores the
+        trainable positions given by ``labels`` alone -- matching the ported legacy path, which does not
+        intersect with ``completion_mask`` the way the base :meth:`_resolve_loss_mask` does.
+        """
+        import torch
+        labels = inputs['labels']
+        if not torch.is_tensor(labels):
+            labels = torch.as_tensor(labels)
+        if labels.dim() == 1:
+            labels = labels.unsqueeze(0)
+        logps = outputs.get('logps')
+        if logps is None:
+            raise RuntimeError('The advanced GRPO controls require outputs["logps"].')
+        alignment_mask = labels.ne(self.ignore_index)
+        device, dtype = logps.device, logps.dtype
+        old = (logps.detach() if old_logps is None else self._pad_and_align_to_batch(
+            old_logps, alignment_mask, device, dtype))
+        advantages = self._pad_and_align_to_batch(advantages, alignment_mask, device, dtype)
+        mask = alignment_mask.clone()
+
+        channel_loss: Dict[str, 'torch.Tensor'] = {}
+        entropy_mask = None
+        if self.require_entropy:
+            entropies = outputs.get('entropies')
+            if entropies is None:
+                raise RuntimeError('Entropy logging/filtering requires outputs["entropies"].')
+            if self.log_entropy:
+                count = alignment_mask.sum().detach().float()
+                channel_loss['entropy'] = torch.stack(
+                    ((entropies * alignment_mask).sum().detach().float(), count))
+            if self.top_entropy_quantile < 1.0 and alignment_mask.any():
+                threshold = torch.quantile(
+                    entropies[alignment_mask].float(), 1.0 - self.top_entropy_quantile)
+                entropy_mask = entropies.ge(threshold)
+
+        if truncated is not None:
+            truncated_mask = torch.as_tensor(truncated, dtype=torch.bool, device=device).reshape(-1, 1)
+            mask = mask & ~truncated_mask
+
+        log_ratio, ratio = self._advanced_importance_weights(logps, old, mask)
+        per_token_loss = self._dual_clip_per_token_loss(ratio, advantages, logps)
+        if self.loss_type == 'fipo':
+            per_token_loss = per_token_loss * self._fipo_weights(log_ratio, ratio, advantages, mask)
+        if entropy_mask is not None:
+            per_token_loss = per_token_loss * entropy_mask
+
+        if self.beta > 0.0 and ref_logps is not None:
+            ref = self._pad_and_align_to_batch(ref_logps, alignment_mask, device, dtype)
+            ref_delta = torch.clamp(ref - logps, min=-20.0, max=20.0)
+            per_token_kl = torch.clamp(torch.exp(ref_delta) - ref_delta - 1.0, min=-10.0, max=10.0)
+            per_token_loss = per_token_loss + self.beta * per_token_kl
+
+        rollout = None
+        if rollout_logps is not None:
+            rollout = self._pad_and_align_to_batch(rollout_logps, alignment_mask, device, dtype)
+            rollout_log_ratio = old - rollout
+            if self.log_rollout_offpolicy_metrics:
+                count = mask.sum().detach().float()
+                channel_loss['rollout_log_ratio'] = torch.stack(
+                    ((rollout_log_ratio.abs() * mask).sum().detach().float(), count))
+            if self.rollout_importance_sampling_mode is not None:
+                per_token_loss = per_token_loss * self._rollout_is_weights(rollout_log_ratio, mask)
+        elif self.rollout_importance_sampling_mode is not None:
+            raise ValueError('rollout_importance_sampling_mode requires rollout_logps from the sampler.')
+
+        if self.off_policy_sequence_mask_delta is not None:
+            old_policy = rollout if rollout is not None else old
+            sequence_delta = ((old_policy - logps) * mask).sum(-1) / mask.sum(-1).clamp(min=1.0)
+            sequence_advantage = (advantages * mask).sum(-1) / mask.sum(-1).clamp(min=1.0)
+            keep = ~((sequence_delta > self.off_policy_sequence_mask_delta) & (sequence_advantage < 0))
+            mask = mask & keep.unsqueeze(-1)
+
+        if self.loss_type == 'fipo':
+            loss = (per_token_loss * mask).sum() / mask.sum().clamp(min=1.0)
+        else:
+            loss = self._aggregate_loss(per_token_loss, mask, **kwargs)
+        result = LossOutput(loss=loss, num_tokens=0)
+        if channel_loss:
+            result['channel_loss'] = channel_loss
+        return result
+
+    def _advanced_importance_weights(self, logps, old_logps, mask):
+        """Token / sequence / sequence-token log importance weights, plus the raw clamped log ratio.
+
+        The raw ``log_ratio`` is returned alongside the weights because FIPO's future-KL weighting
+        consumes it directly. The ±20 clamp is the legacy stability bound for this pipeline.
+        """
+        import torch
+        log_ratio = torch.clamp(logps - old_logps, min=-20.0, max=20.0)
+        if self.importance_sampling_level == 'token':
+            log_weights = log_ratio
+        else:
+            sequence = ((log_ratio * mask).sum(-1) / mask.sum(-1).clamp(min=1.0)).unsqueeze(-1)
+            if self.importance_sampling_level == 'sequence':
+                log_weights = sequence
+            elif self.importance_sampling_level == 'sequence_token':
+                # GSPO-token: grad flows through the per-token logp, the sequence weight is a constant.
+                log_weights = logps - logps.detach() + sequence.detach()
+            else:
+                raise ValueError(f'Unknown importance_sampling_level={self.importance_sampling_level!r}.')
+        return log_ratio, torch.exp(log_weights)
+
+    def _dual_clip_per_token_loss(self, ratio, advantages, logps):
+        """PPO clip with an optional dual-clip floor ``delta`` on the raw ratio (legacy ordering)."""
+        import torch
+        if self.delta is None or self.loss_type not in {'grpo', 'dapo', 'fipo', 'bnpo', 'dr_grpo'}:
+            return self._compute_per_token_loss(ratio, advantages, logps)
+        clipped_ratio = torch.clamp(ratio, 1 - self.epsilon, 1 + self.epsilon_high)
+        dual_clipped_ratio = torch.clamp(ratio, max=self.delta)
+        return -torch.min(dual_clipped_ratio * advantages, clipped_ratio * advantages)
+
+    def _rollout_is_weights(self, log_ratio, mask):
+        """Truncated importance-sampling weights correcting the policy-vs-sampler (rollout) gap."""
+        import torch
+        ratio = torch.exp(torch.clamp(log_ratio, min=-20.0, max=20.0))
+        mode = self.rollout_importance_sampling_mode
+        threshold = self.rollout_importance_sampling_threshold
+        if mode == 'token_truncate':
+            return torch.clamp(ratio, max=threshold)
+        if mode == 'token_mask':
+            return torch.where(ratio <= threshold, ratio, torch.zeros_like(ratio))
+        sequence = torch.exp((torch.log(ratio.clamp(min=1e-10)) * mask).sum(-1)
+                             / mask.sum(-1).clamp(min=1.0))
+        if mode == 'sequence_truncate':
+            return torch.clamp(sequence, max=threshold).unsqueeze(-1).expand_as(ratio)
+        if mode == 'sequence_mask':
+            return ratio * (sequence <= threshold).unsqueeze(-1)
+        return ratio
+
+    def _fipo_weights(self, log_ratio, ratio, advantages, mask):
+        """FIPO's detached future-KL influence weight (block-matmul of the decayed future log-ratio)."""
+        import torch
+        future_delta = log_ratio.masked_fill(~mask, 0.0)
+        if self.delta is not None:
+            # Dual-clip participation: high-ratio tokens do not contribute to the future KL.
+            future_delta = torch.where(ratio > self.delta, torch.zeros_like(future_delta), future_delta)
+        seq_len = future_delta.shape[1]
+        positions = torch.arange(seq_len, device=log_ratio.device).unsqueeze(1)
+        future_kl = torch.zeros_like(future_delta)
+        for start in range(0, seq_len, 128):
+            end = min(seq_len, start + 128)
+            block_positions = torch.arange(start, end, device=log_ratio.device).unsqueeze(0)
+            distance = block_positions - positions
+            decay = torch.pow(
+                torch.as_tensor(self.fipo_gamma, dtype=log_ratio.dtype, device=log_ratio.device),
+                distance.clamp(min=0))
+            decay = decay * (distance >= 0).to(log_ratio.dtype)
+            future_kl += torch.matmul(future_delta[:, start:end], decay.t())
+        weights = torch.exp(future_kl.masked_fill(~mask, 0.0))
+        if self.fipo_clip_range:
+            lower = 1.0 if self.fipo_clip_high_only else 1.0 - self.fipo_clip_range
+            weights = torch.clamp(weights, min=lower, max=1.0 + self.fipo_clip_range)
+        if self.fipo_safety_threshold is not None:
+            unsafe = (advantages < 0) & (ratio > self.fipo_safety_threshold)
+            weights = torch.where(unsafe, torch.clamp(weights, min=0.8, max=1.0), weights)
+        return weights.detach()
+
+    def _add_sdar(self, loss, rl_inputs, rl_outputs, teacher_logps):
+        """Add SDAR's confidence-gated teacher-distillation term on the rollout rows."""
+        if teacher_logps is None or self.sdar_loss_coef <= 0:
+            return loss
+        from twinkle.loss.sdar import compute_sdar_loss
+        student_logps = rl_outputs['logps']
+        response_mask = rl_inputs['labels'].ne(self.ignore_index)
+        teacher = self._pad_and_align_to_batch(
+            teacher_logps, response_mask, student_logps.device, student_logps.dtype)
+        sdar_loss, _ = compute_sdar_loss(student_logps, teacher, response_mask, self.sdar_gate_beta)
+        return loss + self.sdar_loss_coef * sdar_loss
+
 
 class PPOLoss(GRPOLoss):
     """PPO clipped policy loss.
@@ -418,24 +734,16 @@ class PPOLoss(GRPOLoss):
 
 
 class GSPOLoss(GRPOLoss):
-    """
-    GRPO with sequence-level importance sampling.
+    """GRPO with sequence-level importance sampling (GSPO).
 
-    Instead of per-token IS weights, uses the average log ratio over the sequence.
+    A thin alias for ``GRPOLoss(importance_sampling_level='sequence')``: the base
+    ``_compute_log_importance_weights`` already branches on the level, so GSPO only pins the default.
+    Kept as a distinct class because twinkle's loss registry resolves the ``'gspo'`` name to it.
     """
 
-    def _compute_log_importance_weights(
-        self,
-        per_token_logps: 'torch.Tensor',
-        per_token_old_logps: 'torch.Tensor',
-        loss_mask: 'torch.Tensor',
-    ) -> 'torch.Tensor':
-        """Sequence-level importance sampling: use mean log ratio."""
-        import torch
-        log_ratio = per_token_logps - per_token_old_logps
-        log_ratio = torch.clamp(log_ratio, min=-5.0, max=5.0)
-        seq_level_log_weights = ((log_ratio * loss_mask).sum(-1) / loss_mask.sum(-1).clamp(min=1.0)).unsqueeze(-1)
-        return seq_level_log_weights
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault('importance_sampling_level', 'sequence')
+        super().__init__(*args, **kwargs)
 
 
 class SAPOLoss(GRPOLoss):

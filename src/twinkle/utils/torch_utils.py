@@ -550,29 +550,29 @@ def split_cp_inputs(inputs: 'torch.Tensor', cu_seqlens: Optional['torch.Tensor']
     return torch.cat(new_inputs, dim=dim)
 
 
-def first_tensor(obj):
-    """Extract the first tensor from a model output (tensor, tuple, NamedTuple, dict).
+def get_length_grouped_indices(lengths, batch_size, mega_batch_mult=None, generator=None):
+    """Indices whose every ``batch_size``-slice holds similar lengths: permute, sort each mega-batch by
+    length, and put the longest batch first so an OOD-length batch surfaces early.
 
-    Useful when consuming heterogeneous outputs from ``get_image_features`` and similar
-    methods across different model architectures.  Tries common HF output attributes
-    (``pooler_output``, ``last_hidden_state``) first, then falls back to iterating.
+    Borrowed from ``transformers.trainer_pt_utils.get_length_grouped_indices`` (Apache-2.0).
     """
     import torch
-    if isinstance(obj, torch.Tensor):
-        return obj
-    if hasattr(obj, 'pooler_output') and obj.pooler_output is not None:
-        t = obj.pooler_output
-        if isinstance(t, list):
-            return torch.cat(t, dim=0) if t else None
-        return t
-    if hasattr(obj, 'last_hidden_state') and obj.last_hidden_state is not None:
-        return obj.last_hidden_state
-    if isinstance(obj, (tuple, list)) and obj:
-        for item in obj:
-            if isinstance(item, torch.Tensor):
-                return item
-    if isinstance(obj, dict):
-        for v in obj.values():
-            if isinstance(v, torch.Tensor):
-                return v
-    return None
+    # Default for mega_batch_mult: 50 or the number to get 4 megabatches, whichever is smaller.
+    if mega_batch_mult is None:
+        mega_batch_mult = min(len(lengths) // (batch_size * 4), 50)
+        # Just in case, for tiny datasets
+        if mega_batch_mult == 0:
+            mega_batch_mult = 1
+
+    indices = torch.randperm(len(lengths), generator=generator)
+    megabatch_size = mega_batch_mult * batch_size
+    megabatches = [indices[i: i + megabatch_size].tolist() for i in range(0, len(lengths), megabatch_size)]
+    megabatches = [sorted(megabatch, key=lambda i: lengths[i], reverse=True) for megabatch in megabatches]
+
+    # Each megabatch is sorted by descending length, so the longest element is its first; swap the two
+    # firsts so the megabatch holding the overall longest element comes first.
+    megabatch_maximums = [lengths[megabatch[0]] for megabatch in megabatches]
+    max_idx = torch.argmax(torch.tensor(megabatch_maximums)).item()
+    megabatches[0][0], megabatches[max_idx][0] = megabatches[max_idx][0], megabatches[0][0]
+
+    return [i for megabatch in megabatches for i in megabatch]

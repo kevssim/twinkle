@@ -35,6 +35,7 @@ from twinkle import DeviceMesh, get_logger, remote_class, remote_function, requi
 from twinkle.data_format import InputFeature, SampleResponse, SamplingParams, Trajectory
 from twinkle.hub import HubOperation
 from twinkle.patch import Patch, apply_patch
+from twinkle.perf import timed
 from twinkle.sampler import generation
 from twinkle.sampler.base import Sampler
 
@@ -153,6 +154,7 @@ class TransformersSampler(Sampler):
     # ------------------------------------------------------------------ sampling
 
     @remote_function(dispatch='slice_dp', collect='flatten', lazy_collect=False)
+    @timed
     def sample(
         self,
         inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
@@ -282,10 +284,12 @@ class TransformersSampler(Sampler):
         return self._run_in_loop(self._own_engine().get_state_keys())
 
     @remote_function(dispatch='all', collect='first')
+    @timed
     def sleep(self, level: int = 1) -> None:
         self._run_in_loop(self._own_engine().sleep(level=level))
 
     @remote_function(dispatch='all', collect='first')
+    @timed
     def wake_up(self, tags: List[str] = None) -> None:
         self._run_in_loop(self._own_engine().wake_up(tags=tags))
 

@@ -132,6 +132,9 @@ class NPU(Platform):
                     check=True,
                 )
             except subprocess.CalledProcessError:
+                # Last resort: dual-chip Ascend boards (e.g. Atlas 300I Duo) expose two chip-level
+                # ids per physical card, and `npu-smi info -t board` is indexed by the physical card,
+                # so the board index is half the visible (chip-level) device id.
                 result = subprocess.run(
                     ['npu-smi', 'info', '-t', 'board', '-i', str(device_id // 2)],
                     capture_output=True,

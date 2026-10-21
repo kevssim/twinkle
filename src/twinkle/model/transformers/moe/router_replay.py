@@ -100,6 +100,27 @@ def resolve_router_replay_action(action: Any) -> Optional[RouterReplayAction]:
     raise TypeError(f'router_replay_action must be a str, RouterReplayAction or None, got {type(action).__name__}.')
 
 
+def resolve_router_replay_mode(mode: Any, *, allow_record: bool = False) -> Optional[RouterReplayAction]:
+    """Resolve the dev-side mode scalar (``'R2'`` / ``'R3'``) to this backend's replay action.
+
+    The model layer owns the mode->action mapping, so the driver passes the SAME scalar on the R2 capture
+    pass and on the training forward and each call self-judges its action: ``'R3'`` always REPLAYS (the
+    sampler exported the generating-pass routing, which every replay forward must carry); ``'R2'`` RECORDs
+    on the capture pass (a ``forward_only`` whose inputs carry no routing yet -- *allow_record* is the
+    call-kind flag) and REPLAYS on the training forward (whose batch carries the just-recorded routing,
+    so a missing ``routed_experts`` still fails loudly at ``_router_replay_setup``). ``None`` /
+    ``'disabled'`` disable replay for this forward. Mirrors
+    ``twinkle.model.megatron.moe.router_replay.resolve_router_replay_mode``.
+    """
+    if mode is None or mode == 'disabled':
+        return None
+    if mode == 'R3':
+        return RouterReplayAction.REPLAY_FORWARD
+    if mode == 'R2':
+        return RouterReplayAction.RECORD if allow_record else RouterReplayAction.REPLAY_FORWARD
+    raise ValueError(f'Unknown router_replay_mode {mode!r}; expected one of disabled/R2/R3.')
+
+
 def set_router_replay_data(
     routed_experts: torch.Tensor,
     model: nn.Module,

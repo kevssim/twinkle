@@ -153,6 +153,8 @@ class SamplingParams:
                 params['stop_token_ids'] = list(self.stop)
             else:
                 params['stop'] = list(self.stop)
+            if self.include_stop_str_in_output:
+                params['no_stop_trim'] = True
 
         return params
 

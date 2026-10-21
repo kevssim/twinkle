@@ -1,10 +1,10 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import contextlib
 import gc
-import os
 
 import torch
 import torch.nn as nn
-from transformers import PreTrainedConfig
+from transformers import PretrainedConfig
 from typing import Any, Dict, List, Literal, Optional
 
 from twinkle import DeviceMesh, Platform, torch_util
@@ -36,6 +36,63 @@ def finalize_model_grads_for_lora(model, *args, **kwargs):
     return None
 
 
+# transformer_engine has no per-call FlashAttention version selector; the only lever is its
+# module-level availability flags. Pinning asserts the requested build is installed, then
+# switches the others OFF so TE's dispatcher can only pick the requested one (legacy does the
+# same, megatron_args.py:905-915).
+_FLASH_PIN_FLAGS = {2: 'is_installed', 3: 'v3_is_installed', 4: 'v4_is_installed'}
+_FLASH_PIN_PREFIXES = ('flash_attention_', 'flash_')
+
+
+def _flash_version_pin(attn_impl: Optional[str]) -> Optional[int]:
+    """The FlashAttention major version ``attn_impl`` pins, or None when it pins nothing.
+
+    Accepts both spellings (Megatron ``flash_3`` / transformers ``flash_attention_3``) so the
+    same intent resolves identically. Unversioned names ('flash', 'flash_attn', 'sdpa', ...)
+    -> None.
+    """
+    if attn_impl is None:
+        return None
+    key = str(attn_impl).lower()
+    for prefix in _FLASH_PIN_PREFIXES:
+        if key.startswith(prefix) and key[len(prefix):].isdigit():
+            return int(key[len(prefix):])
+    return None
+
+
+def _apply_flash_version_pin(attn_impl: Optional[str]) -> Optional[int]:
+    """Force transformer_engine to use exactly the FlashAttention version ``attn_impl`` pins.
+
+    Returns the pinned version, or None when nothing was pinned (TE keeps its own choice).
+    MUST run in the process that builds the model: these are transformer_engine module
+    globals, so a driver-side call would not reach a Ray worker.
+    """
+    version = _flash_version_pin(attn_impl)
+    if version is None:
+        return None
+    from transformer_engine.pytorch.attention.dot_product_attention.utils import FlashAttentionUtils as fa_utils
+
+    if version not in _FLASH_PIN_FLAGS:
+        raise NotImplementedError(
+            f'attn_impl={attn_impl!r} pins FlashAttention v{version}, which transformer_engine has no '
+            f'availability flag for. Supported: {sorted(_FLASH_PIN_FLAGS)}.')
+    # Only flags this TE build actually defines: v4_is_installed is absent on older versions, and a
+    # bare getattr would surface as AttributeError instead of an actionable message.
+    present = {v: flag for v, flag in _FLASH_PIN_FLAGS.items() if hasattr(fa_utils, flag)}
+    if version not in present:
+        raise ValueError(f'attn_impl={attn_impl!r} requests flash-attn v{version}, but the installed '
+                         f'transformer_engine has no {_FLASH_PIN_FLAGS[version]!r} flag, so this version cannot be '
+                         f'selected. Versions this TE build can pin: {sorted(present)}.')
+    installed = {v: getattr(fa_utils, flag) for v, flag in present.items()}
+    if not installed[version]:
+        raise ValueError(f'attn_impl={attn_impl!r} requests flash-attn v{version}, which is not installed. '
+                         f'Detected: ' + ', '.join(f'FA{v}={state}' for v, state in sorted(installed.items())))
+    for other, flag in present.items():
+        if other != version:
+            setattr(fa_utils, flag, False)
+    return version
+
+
 class MegatronStrategy:
 
     #: ddp_config keys that select a sharded (Megatron-FSDP) data-parallel wrapper instead of plain
@@ -43,56 +100,16 @@ class MegatronStrategy:
     #: it from ``use_megatron_fsdp`` -- so a config carrying either key means the same thing here.
     _FSDP_KEYS = ('use_megatron_fsdp', 'use_custom_fsdp')
 
-    #: What to raise CUDA_DEVICE_MAX_CONNECTIONS to for FSDP. megatron only requires "> 1"; 32 is
-    #: the value its own error message suggests, and matches legacy Megatron-SWIFT.
-    _FSDP_DEVICE_MAX_CONNECTIONS = '32'
-
     @classmethod
     def uses_fsdp(cls, ddp_config: Optional[Dict[str, Any]]) -> bool:
         """Whether this ddp_config asks for Megatron-FSDP rather than DDP.
 
-        Public because the decision is needed before a strategy instance exists (see
-        ``apply_process_env``) and it must not be spelled out twice: the wrapper class, the
-        checkpoint sharding type and the device-connection count all have to agree, and they are
-        chosen at three different points in the run.
+        Public because the verdict is needed at several points where no strategy instance exists
+        yet: the wrapper class choice, the checkpoint sharding type and the optimizer wiring all
+        have to agree, and they are decided at different points in the run.
         """
         ddp_config = ddp_config or {}
         return any(ddp_config.get(key) for key in cls._FSDP_KEYS)
-
-    @classmethod
-    def apply_process_env(cls, ddp_config: Optional[Dict[str, Any]] = None) -> None:
-        """Set the environment megatron needs latched BEFORE the CUDA context is created.
-
-        Must run before ``torch_util.set_device()``, which creates the context: the CUDA driver reads
-        CUDA_DEVICE_MAX_CONNECTIONS when it builds the context, so writing it afterwards is silently
-        a no-op. That is why this is a classmethod called by the model rather than something the
-        strategy's ``__init__`` does -- the strategy is only constructed after the device is set.
-
-        CUDA_DEVICE_MAX_CONNECTIONS caps the hardware work queues per context, and the two
-        data-parallel modes want opposite things from it:
-
-        - DDP with tensor parallelism wants ``1``, which forces kernels to be issued in call order so
-          that a collective launched just before a GEMM really does overlap with it. megatron is
-          explicit that this ordering is "necessary for a speedup but not for correctness"
-          (tensor_parallel/layers.py) and only *warns* when the value is something else.
-        - FSDP wants more than 1, because it issues several parameter all-gathers concurrently to
-          overlap them with compute, and a single queue serializes those instead.
-
-        So this is a performance knob in both directions: choosing the wrong one is slow, not wrong.
-        """
-        os.environ['TOKENIZERS_PARALLELISM'] = 'true'
-        if not cls.uses_fsdp(ddp_config):
-            os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '1'
-            return
-        # Only override the value the framework itself would have chosen. Someone who picked their
-        # own connection count knows their topology better than we do -- except for '1', which is
-        # the single value FSDP cannot work with, and is also exactly what twinkle's own Ray worker
-        # bootstrap leaves behind.
-        current = os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS')
-        if current in (None, '1'):
-            os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = cls._FSDP_DEVICE_MAX_CONNECTIONS
-            logger.info(f'Megatron-FSDP requires CUDA_DEVICE_MAX_CONNECTIONS > 1; set to '
-                        f'{cls._FSDP_DEVICE_MAX_CONNECTIONS} (was {current!r}). Export your own value to override.')
 
     def __init__(
         self,
@@ -102,7 +119,7 @@ class MegatronStrategy:
         mixed_precision: Literal['no', 'fp16', 'bf16'] = 'bf16',
         seed: int = 42,
         variable_seq_lengths: bool = True,
-        config: PreTrainedConfig = None,
+        config: PretrainedConfig = None,
         ddp_config: Dict[str, Any] = None,
         bridge_backend='mcore-bridge',
         align_grad_reduce: bool = True,
@@ -132,8 +149,7 @@ class MegatronStrategy:
         # (the model-building) process -- in Ray mode the worker, not the driver. attn_impl is a
         # caller field name ModelConfig does not have, so it is consumed here and never forwarded
         # into the config; the kernel choice arrives separately as attention_backend.
-        from .._flash_attn import apply_flash_version_pin
-        pinned = apply_flash_version_pin(attn_impl)
+        pinned = _apply_flash_version_pin(attn_impl)
         if pinned is not None:
             logger.info(f'Forcing Flash Attention v{pinned} as the attention backend.')
         if config is None:
@@ -473,7 +489,7 @@ class MegatronStrategy:
 
     def get_model_config(
         self,
-        hf_config: PreTrainedConfig,
+        hf_config: PretrainedConfig,
         parallel_kwargs: Dict[str, Any],
         **kwargs,
     ):
@@ -523,6 +539,85 @@ class MegatronStrategy:
                     warmed += 1
         torch_util.synchronize()
         logger.info(f'NCCL communicator warm-up done ({warmed} groups).')
+
+    @contextlib.contextmanager
+    def transactional_grad_schedule(self, model_chunks: List[nn.Module], *, forward_only: bool,
+                                    transactional: bool, loss_weight: float, finalize_gradients: bool,
+                                    completing_pending: bool, global_normalizer, **kwargs):
+        """Temporarily rewrite this strategy's gradient hooks for one schedule, then restore them.
+
+        The mcore ``config`` object is shared by every later step on this worker, so any
+        per-call surgery (a scaled loss, a no-sync pass, a deferred finalize) must be
+        undone even when the schedule raises. Owning that invariant here keeps the model
+        layer from reaching into ``strategy.config`` internals: the model only decides
+        WHAT this pass is (the keyword flags), this strategy decides HOW the hooks bend.
+
+        Args:
+            model_chunks: The model's chunks; those exposing ``no_sync`` enter it for a
+                deferred-finalize pass (DDP bucket traffic pauses with the hooks).
+            forward_only: A log-prob pass never touches the hooks.
+            transactional: Scale the loss by ``loss_weight / normalizer / ga_steps``.
+            loss_weight: Caller's per-pass loss weight (unscaled).
+            finalize_gradients: False defers: gradients accumulate without syncing.
+            completing_pending: True runs the stored finalize with ``num_tokens=None``.
+            global_normalizer: Token normalizer the transactional scale divides by.
+        """
+        config = self.config
+        original_grad_scale_func = config.grad_scale_func
+        original_no_sync_func = config.no_sync_func
+        original_grad_sync_func = config.grad_sync_func
+        original_finalize_model_grads_func = config.finalize_model_grads_func
+
+        scale = float(loss_weight)
+        if transactional:
+            gradient_accumulation_steps = int(kwargs.get('gradient_accumulation_steps') or 1)
+            if gradient_accumulation_steps < 1:
+                raise ValueError('gradient_accumulation_steps must be positive')
+            scale = scale / global_normalizer.clamp(min=1) / gradient_accumulation_steps
+
+        def transaction_grad_scale(value):
+            if original_grad_scale_func is not None:
+                value = original_grad_scale_func(value)
+            return value * scale
+
+        def disabled_no_sync():
+            return contextlib.nullcontext()
+
+        def disabled_grad_sync(*args, **kwargs):
+            return None
+
+        def disabled_finalize(*args, **kwargs):
+            return None
+
+        def finalize_accumulated_gradients(model, num_tokens=None, **finalize_kwargs):
+            return original_finalize_model_grads_func(model, None, **finalize_kwargs)
+
+        outer_no_sync = contextlib.ExitStack()
+        try:
+            with outer_no_sync:
+                if not forward_only and (transactional or loss_weight != 1.0):
+                    config.grad_scale_func = transaction_grad_scale
+                if not forward_only and not finalize_gradients:
+                    for model_chunk in model_chunks:
+                        if hasattr(model_chunk, 'no_sync'):
+                            outer_no_sync.enter_context(model_chunk.no_sync())
+                    if isinstance(original_no_sync_func, list):
+                        config.no_sync_func = [disabled_no_sync for _ in original_no_sync_func]
+                    else:
+                        config.no_sync_func = disabled_no_sync
+                    if isinstance(original_grad_sync_func, list):
+                        config.grad_sync_func = [disabled_grad_sync for _ in original_grad_sync_func]
+                    else:
+                        config.grad_sync_func = disabled_grad_sync
+                    config.finalize_model_grads_func = disabled_finalize
+                elif completing_pending and original_finalize_model_grads_func is not None:
+                    config.finalize_model_grads_func = finalize_accumulated_gradients
+                yield
+        finally:
+            config.grad_scale_func = original_grad_scale_func
+            config.no_sync_func = original_no_sync_func
+            config.grad_sync_func = original_grad_sync_func
+            config.finalize_model_grads_func = original_finalize_model_grads_func
 
     @torch.no_grad()
     def offload_to_cpu(self, model: List[nn.Module], optimizer: Any = None) -> None:

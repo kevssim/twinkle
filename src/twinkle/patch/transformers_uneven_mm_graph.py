@@ -42,12 +42,38 @@ Usage:
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
 from twinkle.patch import Patch
-from twinkle.utils.torch_utils import first_tensor
 
 if TYPE_CHECKING:
     import torch
 
 _MARKER = '_twinkle_uneven_mm_graph'
+
+
+def _first_tensor(obj):
+    """Extract the first tensor from a ``get_image_features``-style output.
+
+    Different model architectures return a bare tensor, a ModelOutput, a tuple or a dict; try the
+    common HF output attributes first, then fall back to iterating the container.
+    """
+    import torch
+    if isinstance(obj, torch.Tensor):
+        return obj
+    if hasattr(obj, 'pooler_output') and obj.pooler_output is not None:
+        t = obj.pooler_output
+        if isinstance(t, list):
+            return torch.cat(t, dim=0) if t else None
+        return t
+    if hasattr(obj, 'last_hidden_state') and obj.last_hidden_state is not None:
+        return obj.last_hidden_state
+    if isinstance(obj, (tuple, list)) and obj:
+        for item in obj:
+            if isinstance(item, torch.Tensor):
+                return item
+    if isinstance(obj, dict):
+        for v in obj.values():
+            if isinstance(v, torch.Tensor):
+                return v
+    return None
 
 
 class MultimodalUnevenGraphPatch(Patch):
@@ -98,7 +124,7 @@ class MultimodalUnevenGraphPatch(Patch):
             dtype = output.dtype if isinstance(output, torch.Tensor) else next(model.parameters()).dtype
             dummy_kwargs = self.template.dummy_mm_inputs(device=device, dtype=dtype)
             feats_out = model.get_image_features(**dummy_kwargs)
-            feats = first_tensor(feats_out)
+            feats = _first_tensor(feats_out)
             if feats is None:
                 return output
             if isinstance(output, torch.Tensor):

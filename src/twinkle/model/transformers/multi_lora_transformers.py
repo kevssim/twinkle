@@ -43,7 +43,14 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
             max_length: int = 8192,
             target_modules: Union[List[str], str] = 'all-linear',
             model_loader: Optional[ModelLoaderProtocol] = None,
+            acc_strategy: str = 'token',
+            model_arch: Optional[Dict[str, Any]] = None,
             **kwargs):
+        new_special_tokens = kwargs.pop('new_special_tokens', None)
+        if new_special_tokens:
+            # Tenants share one frozen base tokenizer/embedding, so the vocab cannot be grown here;
+            # pre-grow the tokenizer or use the single-tenant TransformersModel.
+            raise ValueError('new_special_tokens is not supported on the multi-LoRA model.')
         os.environ['TOKENIZERS_PARALLELISM'] = 'true'
         self._try_init_process_group()
         super(PreTrainedModel, self).__init__()
@@ -54,6 +61,17 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
         self._memory_efficient_init = memory_efficient_init
         self._router_replay_enabled = bool(kwargs.pop('enable_router_replay', False))
         self._router_replay_applied = False
+        # ``_acc_strategy`` and ``model_arch`` are read by inherited ``TransformersModel`` code -- the
+        # former by ``_construct_default_optimizer_group`` (reached from ``_register_adapter``, i.e. every
+        # ``add_adapter_to_model``) and the latter by the Muon/GaLore param-group builder and the
+        # multimodal ``'all-linear'`` expansion. This fork overrides ``__init__`` wholesale instead of
+        # forwarding kwargs to ``super().__init__()``, so it has to set both itself; ``model_arch`` gets the
+        # same role normalization the base applies.
+        self._acc_strategy = acc_strategy
+        self.model_arch = dict(model_arch or {})
+        for _role in ('language_model', 'vision_tower', 'aligner'):
+            _value = self.model_arch.get(_role)
+            self.model_arch[_role] = [_value] if isinstance(_value, str) else list(_value or [])
         self._decide_strategy(strategy)
         self.grad_scaler_config = grad_scaler_config
         self.lora_config = lora_config
@@ -327,8 +345,9 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
     # must block until it lands, or the run's final save is torn down with the actor before writing.
     @remote_function(collect='first', lazy_collect=False)
     def save(self, name, output_dir: Optional[str] = None, interval=1, **kwargs):
-        self._check_adapter_valid(kwargs.get('adapter_name'))
-        with self.multi_adapter.save_context(kwargs.get('adapter_name')):
+        adapter_name = kwargs.get('adapter_name')
+        self._check_adapter_valid(adapter_name)
+        with self._adapter_context(adapter_name), self.multi_adapter.save_context(adapter_name):
             checkpoint_dir = super().save(name, output_dir, interval, **kwargs)
         if dist.is_initialized():
             dist.barrier()
@@ -338,7 +357,7 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
     def load(self, name: str, output_dir: Optional[str] = None, **kwargs):
         adapter_name = kwargs.get('adapter_name')
         self._check_adapter_valid(adapter_name)
-        with self.multi_adapter.save_context(kwargs.get('adapter_name')):
+        with self._adapter_context(adapter_name), self.multi_adapter.save_context(adapter_name):
             load_optimizer = kwargs.get('load_optimizer', False)
             if output_dir is None:
                 if os.path.exists(name):

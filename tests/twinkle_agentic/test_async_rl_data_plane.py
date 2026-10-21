@@ -4,9 +4,10 @@ import asyncio
 
 import pytest
 
-from twinkle_agentic.async_rl import LoraContext, TQDataPlane
-from twinkle_agentic.async_rl.data_plane import build_rollout_group_sample_write
-from twinkle_agentic.async_rl.types import PartitionAdmission, PromptGroup
+from twinkle_agentic.async_rl.legacy.types import LoraContext
+from twinkle_agentic.async_rl.legacy.data_plane import TQDataPlane
+from twinkle_agentic.async_rl.legacy.data_plane import build_rollout_group_sample_write
+from twinkle_agentic.async_rl.legacy.types import PartitionAdmission, PromptGroup
 
 
 def _context() -> LoraContext:

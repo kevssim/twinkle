@@ -4,12 +4,12 @@ from datetime import timedelta
 from typing import Any, Dict, Literal, Mapping, Optional
 
 from twinkle import DeviceMesh
-from .load_context import fsdp_pretrained_load_context
+from twinkle.model.state_dict_utils import collect_local_state, is_saveable_adapter_key
+from .base import TransformerStrategyBase
+from ..feature_hooks import fsdp_pretrained_load_context
 
-MODULES_TO_SAVE_SEGMENT = '.modules_to_save.'
 
-
-class AccelerateStrategy:
+class AccelerateStrategy(TransformerStrategyBase):
     """A training strategy that uses `accelerate` to wrap models.
 
     Args:
@@ -117,12 +117,6 @@ class AccelerateStrategy:
         if tp_size != device_mesh.world_size:
             raise ValueError(f'Pure TP requires tp_size ({tp_size}) to equal the mesh world size '
                              f'({device_mesh.world_size}).')
-
-    def capture_pre_ep_state_if_needed(self, model, *, enable_ep: bool) -> None:
-        return
-
-    def prepare_adapter_config(self, config_or_dir, *, enable_ep: bool):
-        return config_or_dir
 
     @staticmethod
     def _parallelism_config_from_device_mesh(device_mesh: DeviceMesh):
@@ -301,15 +295,11 @@ class AccelerateStrategy:
         optimizer.load_state_dict(optim_state)
 
     def get_full_state_dict(self, model) -> dict:
-        """Collect full state dict."""
+        """Collect full state dict, including persistent buffers."""
         from twinkle.utils import torch_util
         unwrapped = self.unwrap_model(model)
-        state_dict = {}
-        for name, param in unwrapped.named_parameters():
-            local = torch_util.to_local_tensor(param)
-            state_dict[name] = local.cpu()
-            del local
-        return state_dict
+        state = collect_local_state(unwrapped, include_buffers=True)
+        return {name: torch_util.to_local_tensor(tensor).cpu() for name, tensor in state.items()}
 
     def load_full_state_dict(self, model, state_dict) -> None:
         """Load a full (non-sharded) state dict into the model in-place.
@@ -320,9 +310,11 @@ class AccelerateStrategy:
         fsdp_plugin = self._get_fsdp_plugin()
         if fsdp_plugin is not None and fsdp_plugin.fsdp_version == 2:
             from torch.distributed.checkpoint.state_dict import set_model_state_dict
+
+            from .weight_state import with_tied_weight_aliases
             set_model_state_dict(
                 model,
-                state_dict,
+                with_tied_weight_aliases(self.unwrap_model(model), state_dict),
                 options=self._prepare_full_optimizer_state_dict_options(for_load=True),
             )
             return
@@ -330,26 +322,16 @@ class AccelerateStrategy:
         unwrapped.load_state_dict(state_dict, strict=False)
 
     def get_adapter_state_dict(self, model, adapter_name: str) -> dict:
-        """Collect LoRA parameters and fully trained PEFT modules."""
+        """Collect LoRA parameters, trained modules_to_save copies, and their buffers."""
         from twinkle.utils import torch_util
         unwrapped = self.unwrap_model(model)
-        state_dict = {}
         adapter_suffix = f'.{adapter_name}.'
-        for name, param in unwrapped.named_parameters():
-            if not _is_saveable_adapter_key(name) or adapter_suffix not in name:
-                continue
-            local = torch_util.to_local_tensor(param)
-            state_dict[name] = local.cpu()
-            del local
-        return state_dict
-
-
-def _is_lora_state_key(name: str) -> bool:
-    return 'lora_A' in name or 'lora_B' in name or 'lora_embedding' in name
-
-
-def _is_saveable_adapter_key(name: str) -> bool:
-    return _is_lora_state_key(name) or MODULES_TO_SAVE_SEGMENT in name
+        state = collect_local_state(unwrapped, include_buffers=True)
+        return {
+            name: torch_util.to_local_tensor(tensor).cpu()
+            for name, tensor in state.items()
+            if is_saveable_adapter_key(name) and adapter_suffix in name
+        }
 
 
 def _move_optimizer_state(optimizer, device) -> None:

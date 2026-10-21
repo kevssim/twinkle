@@ -1,7 +1,9 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import hashlib
+import importlib
 import importlib.util
 import inspect
+import os
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -15,6 +17,30 @@ T = TypeVar('T')
 #: Resolved plugin path (or hub id) -> imported module, so loading the same plugin twice is a no-op
 #: rather than a re-import, and two different plugins never collide on a shared module name.
 _LOADED_MODULES: Dict[str, ModuleType] = {}
+
+#: Env var carrying a ``module:attr`` worker-startup hook the driver registers. A Ray worker inherits it
+#: through its ``runtime_env`` (``os.environ.copy()``), and :func:`run_worker_setup_hook` resolves and calls
+#: it once per worker process -- BEFORE any actor argument is deserialised. The indirection (a dotted path
+#: in the environment, resolved lazily) keeps twinkle agnostic of whoever registers the hook: swift points
+#: it at its own plugin reloader so an ``--external_plugins`` file the driver imported is re-imported --
+#: and its ``@register`` side effects re-run -- in every worker.
+WORKER_SETUP_HOOK_ENV = 'TWINKLE_WORKER_SETUP_HOOK'
+
+
+def run_worker_setup_hook() -> None:
+    """Ray ``worker_process_setup_hook``: invoke the driver-registered setup hook, if any.
+
+    Runs once per worker process at startup, before tasks/actor arguments are handled. A plugin module the
+    driver loaded rides into worker arguments by reference (cloudpickle), so it must be importable here
+    first; re-importing it also re-runs its registration side effects. The target is read from
+    ``WORKER_SETUP_HOOK_ENV`` (which the worker inherited through its runtime_env), so twinkle never needs
+    to know the downstream framework that registered it. A no-op when nothing is registered.
+    """
+    target = os.environ.get(WORKER_SETUP_HOOK_ENV)
+    if not target:
+        return
+    module_name, _, attr = target.partition(':')
+    getattr(importlib.import_module(module_name), attr)()
 
 
 def _unique_module_name(path: Path) -> str:

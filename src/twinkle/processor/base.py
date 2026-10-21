@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Literal, Optional, Union
 
 from twinkle import DeviceMesh, Platform, remote_class, remote_function, torch_util
 from twinkle.data_format import InputFeature
+from twinkle.perf import timed
 from twinkle.utils.transformers_utils import is_flash_attention_implementation
 
 
@@ -77,7 +78,7 @@ class InputProcessor:
             self.collate_fn,
             self.to_transformers_dict,
             self.add_extra_padding_free_args,
-            self.prepare_transformers_padding_free_patch,
+            self.prepare_gdn_padding_free_args,
             self.drop_causal_4d_mask,
             self.split_cp,
             self.apply_transformers_sp,
@@ -85,6 +86,7 @@ class InputProcessor:
         ]
 
     @remote_function()
+    @timed
     def __call__(self, inputs: Union[InputFeature, List[InputFeature]],
                  **kwargs) -> Union[InputFeature, List[InputFeature]]:
         for pipe in self.process_pipeline:
@@ -167,6 +169,11 @@ class InputProcessor:
         pooling (with padding-free / SP gather awareness) and writes the
         pooled ``[n_seqs, H]`` tensor to ``outputs['embeddings']``; the raw
         per-token ``outputs['features']`` is consumed and removed.
+
+        For ``task='seq_cls'``/``'reranker'`` the model outputs per-token scores
+        ``[B, T, num_labels]`` (TransformersValuePatch skips HF's internal pooling);
+        this method pools them to ``[n_seqs, num_labels]`` via the same packed-aware
+        last-valid-token logic as embedding.
         """
         sp_strategy = kwargs.get('sp_strategy')
         task = kwargs.get('task', 'causal_lm')
@@ -174,6 +181,8 @@ class InputProcessor:
             return self._postprocess_embedding(inputs, outputs, sp_strategy=sp_strategy)
         if task == 'generative_reranker':
             return self._postprocess_generative_reranker(inputs, outputs, sp_strategy=sp_strategy)
+        if task in ('seq_cls', 'reranker'):
+            return self._postprocess_seq_cls(inputs, outputs, sp_strategy=sp_strategy)
         if self.framework == 'transformers' and sp_strategy is not None:
             return sp_strategy.gather_loss_tensors(inputs, outputs)
         return inputs, outputs
@@ -228,6 +237,24 @@ class InputProcessor:
         assert logits is not None, (
             "outputs['logits'] missing; ensure TransformersGenerativeRerankerPatch is applied and the "
             'reranker loss sets require_logits=True.')
+        pooled, _ = self._pool_last_valid_token(logits, inputs, sp_strategy=sp_strategy)
+        outputs = copy(outputs)
+        outputs['logits'] = pooled.contiguous()
+        return inputs, outputs
+
+    def _postprocess_seq_cls(self,
+                             inputs: Dict[str, Any],
+                             outputs: Dict[str, Any],
+                             sp_strategy=None) -> tuple[Dict[str, Any], Dict[str, Any]]:
+        """Pool per-token seq_cls/reranker scores ``[B, T, num_labels]`` to ``[n_seqs, num_labels]``.
+
+        Same last-valid-token logic as embedding/generative_reranker, packed-aware.
+        TransformersValuePatch(squeeze_single=False) surfaces the per-token scores;
+        this method reduces them so the loss sees one score per sequence.
+        """
+        logits = outputs.get('logits')
+        assert logits is not None, (
+            "outputs['logits'] missing; ensure TransformersValuePatch is applied for task='seq_cls'/'reranker'.")
         pooled, _ = self._pool_last_valid_token(logits, inputs, sp_strategy=sp_strategy)
         outputs = copy(outputs)
         outputs['logits'] = pooled.contiguous()
@@ -472,11 +499,8 @@ class InputProcessor:
                 _inp['packed_seq_params'] = self._get_packed_seq_params(_inp['position_ids'])
         return inputs
 
-    def prepare_transformers_padding_free_patch(self, inputs: List[InputFeature], **kwargs) -> List[InputFeature]:
-        if self.framework != 'transformers':
-            return inputs
-        model = kwargs.get('model')
-        if model is None:
+    def prepare_gdn_padding_free_args(self, inputs: List[InputFeature], **kwargs) -> List[InputFeature]:
+        if self.framework != 'transformers' or not kwargs.get('gdn_padding_free_enabled', False):
             return inputs
         padding_free = bool(self.padding_free or self._any_packing(inputs))
         if not padding_free or bool(kwargs.get('enable_sp', False)):
@@ -488,19 +512,6 @@ class InputProcessor:
             raise RuntimeError('Transformers padding_free/packed batches require a FlashAttention backend; '
                                f'got attn_implementation={attn_implementation!r}. SDPA/eager attention cannot isolate '
                                'logical sequences after they are concatenated into one physical row.')
-
-        if not getattr(model, '_twinkle_gdn_padding_free_patched', False):
-            from twinkle.patch import apply_patch
-            from twinkle.patch.gdn_padding_free import GatedDeltaNetPaddingFreePatch
-
-            apply_patch(
-                model,
-                GatedDeltaNetPaddingFreePatch,
-                hf_config=kwargs.get('hf_config'),
-                enable_sp=False,
-            )
-            if not getattr(model, '_twinkle_gdn_padding_free_patched', False):
-                return inputs
 
         for _inp in inputs:
             position_ids = _inp.get('position_ids')
@@ -670,9 +681,11 @@ class InputProcessor:
 
         For ``task='embedding'`` the outputs are already pooled to ``[n_seqs, H]``
         by ``postprocess_tensor_sp``, so this is a no-op. Same for
-        ``task='generative_reranker'``, whose logits are already reduced to ``[n_seqs, 1]``.
+        ``task='generative_reranker'``, whose logits are already reduced to ``[n_seqs, 1]``,
+        and ``task='seq_cls'``/``'reranker'``, whose per-token scores are pooled to
+        ``[n_seqs, num_labels]`` by ``_postprocess_seq_cls``.
         """
-        if task in ('embedding', 'generative_reranker'):
+        if task in ('embedding', 'generative_reranker', 'seq_cls', 'reranker'):
             return inputs, outputs
         labels = inputs.get('labels')
         position_ids = inputs.get('position_ids')
@@ -792,33 +805,49 @@ class InputProcessor:
                         continue
                 feat[key] = torch.full((length, ), pad_value, dtype=torch.long, device=device)
 
-    #: Audio fields whose leading dim is the audio count and must survive collate under the batched
-    #: Qwen-audio contract (see _collate_macro_batch). The gemma4 channels-last contract instead
-    #: relies on the blanket squeeze folding a single-audio leading dim away, so the squeeze is only
-    #: skipped for these fields when the batch is on the Qwen-audio contract.
-    _QWEN_AUDIO_FIELDS = ('input_features', 'feature_attention_mask')
+    #: Audio fields whose leading dim is the audio count under the per-audio-batched contract
+    #: (see _collate_macro_batch); the blanket squeeze must not fold that dim away. The
+    #: plane-masked contract instead RELIES on the squeeze folding a single-audio leading dim.
+    #:
+    #: TODO (template-layer cleanup): this constant and the probe in _collate_macro_batch are
+    #: model knowledge that does not belong in a processor (task-related, model-agnostic). The
+    #: field-name probe decides which model family produced the batch -- today only the qwen-side
+    #: template emits ``feature_attention_mask`` and only the gemma-side template emits
+    #: ``input_features_mask``, so the name is a proxy for the model -- and the reshape branch
+    #: below bakes in the consuming model's layout (trailing singleton, mask expanded to the
+    #: feature plane). End state: every template emits batch-concat-ready audio fields (dim-0
+    #: concat yields the layout its model consumes: the gemma template applies the trailing
+    #: singleton and the plane-expanded mask itself; the qwen-side shape already concatenates
+    #: correctly), and this class drops the probe, this constant and both reshape branches,
+    #: keeping only "audio fields skip the blanket squeeze and concat on dim 0". Land it with
+    #: the template migration: the legacy gemma collator and test_multimodal assertions consume
+    #: these fields and must change in the same commit.
+    _PER_AUDIO_BATCHED_FIELDS = ('input_features', 'feature_attention_mask')
 
     def _collate_macro_batch(self, inputs: List[InputFeature]) -> InputFeature:
         # Two mutually-exclusive audio contracts share the `input_features` field name and are told
-        # apart by the mask field that rides alongside it:
-        #   * gemma4 (mcore-bridge mm_gpts/gemma4.py) pairs `input_features` with `input_features_mask`
-        #     and wants channels-last features -- per-sample 2-D [plane0, plane1] given a trailing
-        #     singleton, the 1-D mask expanded to the feature plane, batch folded into dim 0.
-        #   * Qwen2.5-Omni / Qwen-audio pairs `input_features` with `feature_attention_mask` and
-        #     transformers' Qwen2_5OmniThinker.get_audio_features wants per-audio-batched
-        #     [N, freq, time] features + [N, time] mask, plain dim-0 concat (no reshape).
-        # Detect the contract once, before the squeeze: the squeeze would strip Qwen-audio's leading
-        # audio-count dim ([1, freq, time] -> [freq, time]), which the concat then folds into dim 0
-        # ([freq*N, time, 1]) and get_audio_features rejects against the [N, time] mask.
-        qwen_audio = any('feature_attention_mask' in _input for _input in inputs)
+        # apart by the mask field that rides alongside it -- the producer (the model's template)
+        # emits one pair or the other, so the field name IS the contract marker:
+        #   * plane-masked pairs `input_features` with `input_features_mask`: per-sample features
+        #     are 2-D [plane0, plane1], the 1-D [plane0] mask is expanded to the feature plane, the
+        #     features get a trailing singleton, and the batch folds into dim 0 (channels-last).
+        #   * per-audio-batched pairs `input_features` with `feature_attention_mask`: per-sample
+        #     features are [n_audios, freq, time] with a [n_audios, time] mask; the leading
+        #     audio-count dim stays intact and the concat below stacks both on dim 0.
+        # Detect the contract before the squeeze: the squeeze would strip the audio-count dim
+        # ([1, freq, time] -> [freq, time]), the concat would then fold the audios into dim 0
+        # ([freq*n, time, 1]), and the [n, time] mask could no longer describe the result.
+        # TODO: this probe is a model-family check in disguise -- see _PER_AUDIO_BATCHED_FIELDS
+        # for the cleanup plan.
+        per_audio_batched = any('feature_attention_mask' in _input for _input in inputs)
         # Work on local copies so squeezing doesn't mutate the caller's original samples.
         squeezed = []
         for _input in inputs:
             _input = dict(_input)
             for key in list(_input.keys()):
                 if isinstance(_input[key], torch.Tensor):
-                    if qwen_audio and key in self._QWEN_AUDIO_FIELDS:
-                        continue  # keep the audio-count leading dim intact for get_audio_features
+                    if per_audio_batched and key in self._PER_AUDIO_BATCHED_FIELDS:
+                        continue  # keep the audio-count leading dim intact
                     _input[key] = _input[key].squeeze()
             squeezed.append(_input)
         inputs = squeezed
@@ -882,10 +911,10 @@ class InputProcessor:
             if values:
                 _values = []
                 for i, value in enumerate(values):
-                    if not qwen_audio:
-                        # gemma4 channels-last audio contract: per-sample features are 2-D and get a
-                        # trailing singleton; the 1-D mask is expanded to the feature plane. Batch is
-                        # folded into dim 0 by the concat below.
+                    if not per_audio_batched:
+                        # Plane-masked audio contract: per-sample features are 2-D and get a
+                        # trailing singleton; the 1-D mask is expanded to the feature plane. Batch
+                        # is folded into dim 0 by the concat below.
                         if field == 'input_features':  # [freq_bins, time_steps] -> [freq_bins, time_steps, num_features]
                             assert len(value.shape) == 2
                             value = value.unsqueeze(-1)
@@ -894,10 +923,10 @@ class InputProcessor:
                             input_features_shape = vlm_fields['input_features'][i].shape
                             assert value.shape[0] == input_features_shape[0]
                             value = value.unsqueeze(1).expand(input_features_shape[:2])
-                    # Qwen-audio contract: `input_features` is already [N, freq, time] and
-                    # `feature_attention_mask` is [N, time] (both kept un-squeezed above); the concat
-                    # below stacks them on dim 0 into the [sum(N), freq, time] / [sum(N), time] layout
-                    # get_audio_features expects. No reshape here.
+                    # Per-audio-batched contract: `input_features` is already [n, freq, time] and
+                    # `feature_attention_mask` is [n, time] (both kept un-squeezed above); the concat
+                    # below stacks them on dim 0 into the [sum(n), freq, time] / [sum(n), time]
+                    # layout the audio encoder consumes. No reshape here.
                     if value.dim() == 1:
                         # image_thw may be squeezed
                         value = value.unsqueeze(0)

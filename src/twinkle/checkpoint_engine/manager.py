@@ -1,13 +1,17 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 # Adapted from https://github.com/volcengine/verl/blob/main/verl/checkpoint_engine/base.py
+import threading
 from contextlib import contextmanager
 from time import perf_counter
 from typing import List, Literal, Optional
+
+from twinkle.infra import get_worker_id
 
 from twinkle import Platform, get_logger
 from .base import CheckpointEngine
 from .delta import DeltaSyncConfig, resolve_delta_engine_cls
 from .mixin import CheckpointEngineMixin
+from .zmq_auth import generate_auth_key
 
 logger = get_logger()
 
@@ -80,6 +84,9 @@ class CheckpointEngineManager:
         mode: CheckpointEngineMode = 'auto',
         sync_backend: Literal['full', 'delta_sharded'] = 'full',
         delta_config: Optional[DeltaSyncConfig] = None,
+        channel: str = 'default',
+        colocate_trainer_ranks: Optional[List[int]] = None,
+        receiver_worker_ids: Optional[List[str]] = None,
     ) -> None:
         self.model = model
         self.sampler = sampler
@@ -102,11 +109,39 @@ class CheckpointEngineManager:
         self._delta_round = 0
         self._delta_failed = False
         self.last_delta_metrics = None
+        self._sync_lock = threading.RLock()
+        self.receiver_worker_ids = self._validate_receiver_ids(receiver_worker_ids)
+        self._receiver_snapshot = self.receiver_worker_ids
+        self._channel_closed = False
+        if not isinstance(channel, str) or not channel:
+            raise ValueError(f'checkpoint channel must be a non-empty string, got {channel!r}.')
+        self.channel = channel
+        if colocate_trainer_ranks is not None:
+            if self.mode != 'colocate':
+                raise ValueError('colocate_trainer_ranks is valid only for mode="colocate".')
+            colocate_trainer_ranks = self._validate_colocate_ranks(colocate_trainer_ranks, self.receiver_worker_ids)
+        elif self.mode == 'colocate' and self.receiver_worker_ids is not None:
+            raise ValueError(
+                'mode="colocate" with an explicit receiver_worker_ids subset also requires '
+                'colocate_trainer_ranks: an arbitrary subset cannot be paired with trainer ranks by '
+                'the uniform default topology, and a mismatched pair would hang on the first bucket.')
+        self.colocate_trainer_ranks = (None if colocate_trainer_ranks is None
+                                       else tuple(colocate_trainer_ranks))
+        self.backend = None if self.mode == 'naive' else self.backend_cls.backend_name
+        # Signs the engine's control frames. Generated here and delivered to both sides through the
+        # Ray control path, so a peer that guessed the endpoint path still cannot inject frames.
+        self._auth_key = generate_auth_key()
 
-        if self.mode == 'colocate':
-            # Each side builds its own engine inside its worker, so both have to be told which one.
-            self.model.set_checkpoint_engine_backend('ipc')
-            self.sampler.set_checkpoint_engine_backend('ipc')
+        if self.mode != 'naive':
+            try:
+                self._activate_checkpoint_channel()
+            except BaseException:
+                try:
+                    self.close()
+                except Exception:
+                    logger.warning('Failed to fully close checkpoint channel %s after initialization failure.',
+                                   channel, exc_info=True)
+                raise
 
         # LoRA sync state: tracks whether the first full sync has been done.
         # After the first sync, only LoRA adapter weights are transferred.
@@ -164,7 +199,104 @@ class CheckpointEngineManager:
         else:
             raise NotImplementedError
 
+    def _validate_receiver_ids(self, worker_ids):
+        if worker_ids is None:
+            return None
+        if self.mode == 'naive':
+            raise ValueError('receiver_worker_ids requires Ray checkpoint receivers.')
+        worker_ids = tuple(worker_ids)
+        if any(not isinstance(worker_id, str) for worker_id in worker_ids):
+            raise ValueError('receiver_worker_ids must contain stable actor ID strings.')
+        known = {get_worker_id(actor) for actor in self.sampler._actors}
+        if len(set(worker_ids)) != len(worker_ids) or set(worker_ids) - known:
+            raise ValueError(f'receiver_worker_ids contains duplicate or unknown actor IDs: {worker_ids!r}.')
+        return worker_ids
+
+    def _validate_colocate_ranks(self, ranks, worker_ids):
+        ranks = tuple(ranks)
+        count = self.sampler.device_mesh.data_world_size if worker_ids is None else len(worker_ids)
+        if any(type(rank) is not int or not 0 <= rank < self.model.device_mesh.world_size for rank in ranks):
+            raise ValueError('Each IPC receiver requires a physical trainer sender rank within the trainer world.')
+        if len(ranks) != count or len(set(ranks)) != len(ranks):
+            raise ValueError('Each IPC receiver requires one unique physical trainer sender rank.')
+        return ranks
+
+    def set_receiver_workers(self, worker_ids, *, colocate_trainer_ranks=None):
+        """Register the receiver set for the next sync; communication changes are applied
+        lazily, only inside sync_weights."""
+        with self._sync_lock:
+            worker_ids = self._validate_receiver_ids(worker_ids)
+            if colocate_trainer_ranks is not None:
+                if self.mode != 'colocate':
+                    raise ValueError('colocate_trainer_ranks requires mode="colocate".')
+                self.colocate_trainer_ranks = self._validate_colocate_ranks(colocate_trainer_ranks, worker_ids)
+            elif self.mode == 'colocate':
+                if worker_ids is not None and worker_ids != self.receiver_worker_ids:
+                    # A changed receiver subset with stale ranks pairs receivers with trainers that
+                    # share no GPU; the mismatch would only surface -- as a hang -- inside sync.
+                    raise ValueError(
+                        'Changing receiver_worker_ids in mode="colocate" requires colocate_trainer_ranks '
+                        'for the new set; the previous ranks no longer describe the pairing.')
+                if worker_ids is None:
+                    # Back to the full receiver set: the uniform default topology applies again.
+                    self.colocate_trainer_ranks = None
+            self.receiver_worker_ids = worker_ids
+
+    def _sampler_call(self, method, *args, **kwargs):
+        if self._receiver_snapshot is not None:
+            kwargs['_worker_ids'] = self._receiver_snapshot
+        return getattr(self.sampler, method)(*args, **kwargs)
+
+    def _activate_checkpoint_channel(self) -> None:
+        if self._channel_closed:
+            self._receiver_snapshot = self.receiver_worker_ids
+        self._channel_closed = False
+        self.model.activate_checkpoint_engine(self.backend, self.channel, auth_key=self._auth_key)
+        self._sampler_call('activate_checkpoint_engine', self.backend, self.channel, auth_key=self._auth_key)
+
+    def _close_checkpoint_channel(self):
+        if self.mode != 'naive':
+            try:
+                self.model.reset_checkpoint_engine(self.channel, self.backend)
+            finally:
+                self._sampler_call('reset_checkpoint_engine', self.channel, self.backend)
+
+    def close(self) -> None:
+        """Tear down this channel, cleaning only the receiver snapshot that the last sync used."""
+        with self._sync_lock:
+            if self._channel_closed:
+                return
+            try:
+                self._close_checkpoint_channel()
+            finally:
+                self._receiver_snapshot = ()
+                self._channel_closed = True
+                self.base_sync_done = False
+
     def sync_weights(self, merge_and_sync=True):
+        with self._sync_lock:
+            if self._channel_closed or self.receiver_worker_ids != self._receiver_snapshot:
+                self.close()
+                self._receiver_snapshot = self.receiver_worker_ids
+                self.base_sync_done = False
+            if self._receiver_snapshot == ():
+                return
+            try:
+                self._sync_weights(merge_and_sync)
+            except BaseException:
+                # A failed sync can leave the transport half-torn -- a NCCL group in error state, a
+                # dead socket -- and the next sync only rebuilds on membership change. Close here so
+                # the next attempt rebuilds the channel instead of reusing the broken one.
+                try:
+                    self.close()
+                except Exception:
+                    # Mirror __init__: a failing close (e.g. the remote actor already died) must
+                    # not replace the original sync failure -- warn and re-raise the root cause.
+                    logger.warning('Failed to fully close checkpoint channel %s after sync failure.',
+                                   self.channel, exc_info=True)
+                raise
+
+    def _sync_weights(self, merge_and_sync=True):
         """
         Synchronize the weights between the model and the sampler.
 
@@ -192,19 +324,27 @@ class CheckpointEngineManager:
             self._sync_weights_naive(merge_and_sync)
             return
 
+        self._activate_checkpoint_channel()
         model_metadata = self.model.prepare_checkpoint_engine([True]
                                                               + [False] * (self.model.device_mesh.world_size - 1))
-        self.sampler.prepare_checkpoint_engine(False)
+        self._sampler_call('prepare_checkpoint_engine', False)
+        model_world_size = self.model.device_mesh.world_size
+        sampler_world_size = (self.sampler.device_mesh.data_world_size if self._receiver_snapshot is None
+                              else len(self._receiver_snapshot))
+        topology_kwargs = {}
+        if self.colocate_trainer_ranks is not None:
+            topology_kwargs['sender_ranks'] = self.colocate_trainer_ranks
         model_kwargs, sampler_kwargs = self.backend_cls.build_topology(
-            self.model.device_mesh.world_size,
-            self.sampler.device_mesh.data_world_size,
+            model_world_size,
+            sampler_world_size,
             [model_metadata],
+            **topology_kwargs,
         )
         # Launch both init calls concurrently — TCPStore server (model rank 0)
         # blocks until all clients (sampler ranks) connect, so these MUST NOT
         # be serialised.  lazy_collect=True makes them return futures.
         model_init = self.model.init_checkpoint_process_group(**model_kwargs)
-        sampler_init = self.sampler.init_checkpoint_process_group(**sampler_kwargs)
+        sampler_init = self._sampler_call('init_checkpoint_process_group', **sampler_kwargs)
         model_init()  # wait for model init to complete
         sampler_init()  # wait for sampler init to complete
 
@@ -218,12 +358,13 @@ class CheckpointEngineManager:
 
         model_result = self.model.send_weights(
             base_sync_done=self.base_sync_done, merge_and_sync=merge_and_sync, model_keys=self._model_keys)
-        sampler_result = self.sampler.receive_weights(base_sync_done=self.base_sync_done, peft_config=peft_config)
+        sampler_result = self._sampler_call('receive_weights', base_sync_done=self.base_sync_done,
+                                           peft_config=peft_config)
         model_result()
         sampler_result()
 
         self.model.finalize_checkpoint_engine()
-        self.sampler.finalize_checkpoint_engine()
+        self._sampler_call('finalize_checkpoint_engine')
 
         if not self.base_sync_done:
             self.base_sync_done = True
@@ -342,7 +483,7 @@ class CheckpointEngineManager:
             return
 
         if hasattr(self.sampler, 'get_state_keys'):
-            self._model_keys = self.sampler.get_state_keys()
+            self._model_keys = self._sampler_call('get_state_keys')
 
         if self._model_keys is None:
             self._model_keys = []
@@ -396,3 +537,82 @@ class CheckpointEngineManager:
             self.base_sync_done = True
             if not merge_and_sync:
                 logger.info('Base model sync completed, subsequent syncs will be LoRA-only')
+
+    # ── Paired EMA sync (policy → reference) ────────────────────────────────
+
+    def sync_ema(self, alpha: float):
+        """Synchronize reference weights as an EMA of policy weights.
+
+        Each policy rank k and reference rank k form an independent 2-rank NCCL group:
+        policy sends its LOCAL shard parameters, reference receives and applies
+        ``param.mul_(alpha).add_(received, alpha=1-alpha)``.  Peak memory per rank is two engine
+        buckets -- the engine allocates its staging buffers before the send/receive roles split,
+        so the unused direction's buffer is paid for too (configurable, default 2x3 GB),
+        independent of model size.
+
+        Requires policy and reference to have the SAME parallel_spec (identical sharding),
+        so local parameter names and shapes match one-to-one across the pair.
+
+        The receiver side is always the full reference world: this method routes every remote
+        call through :meth:`_sampler_call`, so a manager constructed with ``receiver_worker_ids``
+        would filter them -- construct EMA managers without a receiver subset.
+
+        Args:
+            alpha: EMA decay factor.  ``ref = alpha * ref + (1 - alpha) * policy``.
+                   Closer to 1 means slower tracking.
+        """
+        with self._sync_lock:
+            if self.mode == 'naive':
+                self._sync_ema_naive(alpha)
+                return
+
+            self._activate_checkpoint_channel()
+            world_size = self.model.device_mesh.world_size
+            ref_world_size = self.sampler.device_mesh.world_size
+            if world_size != ref_world_size:
+                raise ValueError(
+                    f'Paired EMA requires policy and reference to have the same world_size '
+                    f'(policy={world_size}, reference={ref_world_size}); use the same parallel_spec.')
+
+            # Phase 1: all policy ranks prepare as master (each gets a unique TCPStore port).
+            all_metadata = self.model.prepare_ema_sender()
+            if not isinstance(all_metadata, list):
+                all_metadata = [all_metadata]
+            # Reference ranks prepare as non-master (allocate receive buffers).
+            # Scalar False: dispatch='slice' broadcasts it identically to every rank.
+            self._sampler_call('prepare_checkpoint_engine', False)
+
+            # Phase 2: init paired 2-rank groups (policy rank k = NCCL rank 0, ref rank k = rank 1).
+            model_init = self.model.init_checkpoint_process_group(
+                rank=[0] * world_size,
+                world_size=[2] * world_size,
+                master_metadata=all_metadata,
+            )
+            sampler_init = self._sampler_call(
+                'init_checkpoint_process_group',
+                rank=[1] * world_size,
+                world_size=[2] * world_size,
+                master_metadata=all_metadata,
+            )
+            model_init()
+            sampler_init()
+
+            # Phase 3: concurrent send (local shard) / receive+EMA.
+            send_future = self.model.send_weights(local=True)
+            recv_future = self._sampler_call('receive_weights_ema', alpha)
+            send_future()
+            recv_future()
+
+            # Phase 4: finalize.
+            self.model.finalize_checkpoint_engine()
+            self._sampler_call('finalize_checkpoint_engine')
+
+    def _sync_ema_naive(self, alpha: float):
+        """In-process EMA: iterate policy's local params and blend into reference's."""
+        import torch
+        policy_state = dict(self.model._get_local_state_dict())
+        ref_state = dict(self.sampler._get_local_state_dict())
+        with torch.no_grad():
+            for name, policy_param in policy_state.items():
+                ref_param = ref_state[name]
+                ref_param.data.mul_(alpha).add_(policy_param.data, alpha=1.0 - alpha)

@@ -225,7 +225,10 @@ def append_ids(
     result = dict(pif)
 
     input_ids = list(result.get('input_ids') or [])
-    labels = list(result.get('labels') or [])
+    # ``labels`` can be an ndarray (``np.roll`` output), whose truth value is ambiguous;
+    # test for None explicitly instead of ``or`` so array inputs still convert.
+    labels = result.get('labels')
+    labels = list(labels) if labels is not None else []
     # labels arrive in output/shifted order (post _roll_labels). Unroll by
     # one position (shift right by 1) to get back to input order.
     if labels:

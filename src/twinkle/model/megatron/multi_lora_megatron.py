@@ -19,6 +19,7 @@ from twinkle import DeviceMesh, Platform, remote_class, remote_function, require
 from twinkle.data_format import InputFeature, Trajectory
 from twinkle.hub import HubOperation
 from twinkle.infra import collect_tensor_dict
+from twinkle.infra._torch_setup import seed_from_env
 from twinkle.loss import Loss
 from twinkle.metric import Metric
 from twinkle.processor import InputProcessor
@@ -26,7 +27,7 @@ from twinkle.utils import get_logger
 from twinkle.utils.safetensors import load_state_dict, save_state_dict
 from ..base import ModelLoaderProtocol
 from ..multi_lora import MultiLora
-from ._mindspeed_runtime import ensure_mindspeed_adaptor_patched
+from .utils._mindspeed_runtime import ensure_mindspeed_adaptor_patched
 from .megatron import MegatronModel
 from .strategy import MegatronStrategy
 
@@ -55,8 +56,11 @@ class MultiLoraMegatronModel(MegatronModel):
         **kwargs,
     ):
         requires('megatron_core')
-        # Same ordering constraint as MegatronModel: must precede the CUDA context creation below.
-        MegatronStrategy.apply_process_env(ddp_config)
+        new_special_tokens = kwargs.pop('new_special_tokens', None)
+        if new_special_tokens:
+            # Tenants share one frozen base tokenizer/embedding, so the vocab cannot be grown here;
+            # pre-grow the tokenizer or use the single-tenant MegatronModel.
+            raise ValueError('new_special_tokens is not supported on the multi-LoRA model.')
         nn.Module.__init__(self)
         from twinkle.patch.megatron_peft import MegatronPeft
 
@@ -70,6 +74,9 @@ class MultiLoraMegatronModel(MegatronModel):
         self.use_distributed_optimizer = False
         self.variable_seq_lengths = kwargs.get('variable_seq_lengths', True)
         self.optimizer_group = {}
+        # Same ordering constraint as MegatronModel: must precede the CUDA context creation below.
+        if MegatronStrategy.uses_fsdp(ddp_config):
+            os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '32'
         torch_util.set_device()
         self._try_init_process_group()
         ensure_mindspeed_adaptor_patched()
@@ -82,7 +89,7 @@ class MultiLoraMegatronModel(MegatronModel):
             'recompute_num_layers': recompute_num_layers,
             'variable_seq_lengths': self.variable_seq_lengths,
         })
-        seed = kwargs.pop('seed', None) or int(os.environ.get('TWINKLE_SEED', 42))
+        seed = kwargs.pop('seed', None) or seed_from_env(42)
         model_loader: Optional[ModelLoaderProtocol] = kwargs.pop('model_loader', None)
         if config is not None:
             self.hf_config = config
@@ -297,7 +304,7 @@ class MultiLoraMegatronModel(MegatronModel):
         if optimizer_config is not None and 'iteration' in state_dict:
             optimizer_config.cur_step = state_dict['iteration']
 
-    @remote_function(dispatch='all', collect='first', sync=True)
+    @remote_function(dispatch='all', collect='first', sync=True, timeout=3600)
     def save(self, name, output_dir: Optional[str] = None, interval=1, **kwargs):
         adapter_name = kwargs.pop('adapter_name', None)
         self._check_adapter_valid(adapter_name)
@@ -337,6 +344,7 @@ class MultiLoraMegatronModel(MegatronModel):
                     'cur_step': optimizer_config.cur_step,
                     'consumed_train_samples': kwargs.get('consumed_train_samples', 0),
                     'gradient_accumulation_steps': optimizer_config.gradient_accumulation_steps,
+                    'component_states': kwargs.get('component_states', {}),
                 }
                 rank = dist.get_rank() if dist.is_initialized() else 0
                 if rank == 0:
@@ -371,6 +379,9 @@ class MultiLoraMegatronModel(MegatronModel):
                 adapter_name=real_adapter_name,
                 converter=self.multi_adapter.load_lora_converter)
 
+        optimizer_config = self.optimizer_group.get(adapter_name)
+        if optimizer_config is not None and optimizer_config.optimizer is not None:
+            optimizer_config.optimizer.reload_model_params()
         if load_optimizer:
             with self.optimizer_context(real_adapter_name):
                 self._load_multi_lora_optimizer(checkpoint_dir, adapter_name=adapter_name, **kwargs)
@@ -381,7 +392,7 @@ class MultiLoraMegatronModel(MegatronModel):
     # lazy_collect=False: see TransformersModel.resume_from_checkpoint -- the driver consumes the returned
     # training-state dict immediately, so the lazy callable default would break it. Keeps this multi-LoRA
     # megatron variant backend-equivalent with the others.
-    @remote_function(dispatch='all', collect='first', sync=True, lazy_collect=False)
+    @remote_function(dispatch='all', collect='first', sync=True, lazy_collect=False, timeout=3600)
     def resume_from_checkpoint(self, checkpoint_dir, *, resume_only_model=False, **kwargs):
         adapter_name = kwargs.pop('adapter_name', None)
         self._check_adapter_valid(adapter_name)
@@ -393,6 +404,7 @@ class MultiLoraMegatronModel(MegatronModel):
                 'cur_step': 0,
                 'consumed_train_samples': 0,
                 'gradient_accumulation_steps': optimizer_config.gradient_accumulation_steps,
+                'component_states': {},
             }
 
         trainer_state_path = os.path.join(checkpoint_dir, 'trainer_state.json')
@@ -406,18 +418,23 @@ class MultiLoraMegatronModel(MegatronModel):
             optimizer_config.cur_step = trainer_state['cur_step']
             optimizer_config.gradient_accumulation_steps = trainer_state['gradient_accumulation_steps']
 
-        return {
+        result = {
             'cur_step': trainer_state['cur_step'],
             'consumed_train_samples': trainer_state['consumed_train_samples'],
             'gradient_accumulation_steps': trainer_state['gradient_accumulation_steps'],
         }
+        if 'component_states' in trainer_state:
+            result['component_states'] = trainer_state['component_states']
+        return result
 
     @remote_function(execute='first')
     def get_state_dict(self, **kwargs):
         self._check_adapter_valid(kwargs.get('adapter_name'))
-        return self.multi_adapter.get_state_dict(**kwargs)
+        # MultiLora.get_state_dict takes the tenant name positionally; kwargs here
+        # only ever carries adapter_name.
+        return self.multi_adapter.get_state_dict(kwargs.get('adapter_name'))
 
-    @remote_function(dispatch='all', sync=True)
+    @remote_function(dispatch='all', sync=True, timeout=3600)
     def add_adapter_to_model(
         self,
         adapter_name: str,
@@ -426,15 +443,15 @@ class MultiLoraMegatronModel(MegatronModel):
     ):
         # prevent opening requires_grad of the base model
         # prevent loading malicious code
-        assert not isinstance(
-            config_or_dir, str
-        ), 'config_or_dir does not support str, because loading config from modelhub may causing unexpected behavior'
-        assert isinstance(config_or_dir, LoraConfig), 'config_or_dir must be a LoraConfig instance'
+        if isinstance(config_or_dir, str):
+            raise ValueError('config_or_dir does not support str, '
+                             'because loading config from modelhub may causing unexpected behavior')
+        if not isinstance(config_or_dir, LoraConfig):
+            raise ValueError('config_or_dir must be a LoraConfig instance')
         # Limit the max peft version in pyproject.toml, in case any newer version opens some untested module grad.
         config_or_dir.modules_to_save = None
         config_or_dir.bias = 'none'
         config_or_dir.init_lora_weights = False
-        config_or_dir.modules_to_save = None
         config_or_dir.trainable_token_indices = None
         self.optimizer_group[adapter_name] = self._construct_default_optimizer_group()
         self.optimizer_group[adapter_name].adapter_name = adapter_name

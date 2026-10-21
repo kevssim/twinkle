@@ -251,7 +251,10 @@ class Template:
             raise ValueError(f'appended_as must be one of {_APPEND_ROLES}, got {appended_as!r}')
         result = copy.deepcopy(prompt_input_feature)
         prompt_ids = result['input_ids']
-        labels = list(result.get('labels') or [])
+        # ``labels`` can be an ndarray (``_roll_labels`` uses ``np.roll``), whose truth value is
+        # ambiguous -- test for None explicitly instead of ``or`` so array inputs still convert.
+        labels = result.get('labels')
+        labels = list(labels) if labels is not None else []
         if not labels:
             # A bare token-in-token-out prefix (raw ``input_ids``, no ``labels``) records no provenance:
             # every prompt token is context the completion continues and none of it is trainable. Default
@@ -485,9 +488,10 @@ class Template:
                     btype = block.get('type')
                     # OpenAI vision/audio parts nest the media reference one level down --
                     # {"type": "image_url", "image_url": {"url": ...}} (likewise video_url/audio_url).
-                    # Unwrap them in place to twinkle's {"type": <media>, "url": ...} so the reference is
-                    # preprocessed into pixels exactly like the native format; left untouched the block
-                    # reaches the chat template as an unknown type and the media is silently dropped.
+                    # Unwrap them in place to twinkle's {"type": <media>, "url": ...} so the media runs
+                    # the same preprocess path as the native format (per-instance resolution knobs,
+                    # base64 materialization) and reaches the vllm/sglang extractors, which dispatch on
+                    # a bare "image"/"video" type and would otherwise never pick the reference up.
                     if btype in ('image_url', 'video_url', 'audio_url'):
                         payload = block.pop(btype, None) or {}
                         block['url'] = payload.get('url') if isinstance(payload, dict) else payload
@@ -872,7 +876,7 @@ class Template:
             if isinstance(trajectories[0], Mapping) and len(self._get_trajectory_keys(trajectories[0], False)) > 0:
                 # Convert row→columnar, process with columnar logic, convert back
                 columnar = self.map_row_to_col(trajectories)
-                encoded = self.batch_encode(columnar, add_generation_prompt)
+                encoded = self.batch_encode(columnar, add_generation_prompt, **kwargs)
                 return self.map_col_to_row(encoded)
 
         if isinstance(trajectories, Mapping):
@@ -883,7 +887,7 @@ class Template:
                 # Nested format: encode each trajectory list separately, keep other columns
                 return {
                     key:
-                    self.batch_encode(trajectories[key], add_generation_prompt)
+                    self.batch_encode(trajectories[key], add_generation_prompt, **kwargs)
                     if key in traj_keys else trajectories[key]
                     for key in trajectories
                 }

@@ -40,7 +40,15 @@ from .types import PartitionAdmission
 
 
 class WeightSyncStrategy(ABC):
-    """Publishes newly-trained weights and returns their version-pinning handle."""
+    """Publishes newly-trained weights and returns their version-pinning handle.
+
+    Owned by the dev-side controller (``swift.dev.recipe.rl.streaming.StreamingPublisher``), NOT by the
+    ``StreamingDriver``: the driver was purified into a rollout pump that holds no weight/model control, so the
+    controller keeps this strategy and hands its bound :meth:`publish` to ``StreamingDriver.request_publish``
+    once per publication. The driver then calls it as ``push(window)`` inside its own version/window bracket
+    (close the oldest window before, bump the version + drop stale + prune after) -- the strategy never lives
+    on the driver and the driver never decides the cadence.
+    """
 
     @abstractmethod
     def publish(self, admission: PartitionAdmission) -> str | None:

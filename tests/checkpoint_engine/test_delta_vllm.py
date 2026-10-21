@@ -122,6 +122,64 @@ def test_sparse_update_uses_native_patch_loader_without_reload(adapter):
     reload.finalize_layerwise_reload.assert_not_called()
 
 
+def ascend_gdn_model(dim=6, width=4):
+    """Mimic vllm-ascend ops/gdn.py: conv1d.weight [D, 1, W] plus a packed [W, D] copy."""
+    conv1d = torch.nn.Module()
+    conv1d.weight = torch.nn.Parameter(torch.randn(dim, 1, width).to(torch.bfloat16), requires_grad=False)
+    packed = conv1d.weight.view(dim, width).transpose(0, 1).contiguous()
+    conv1d.register_parameter('ascend_conv1d_weight', torch.nn.Parameter(packed, requires_grad=False))
+    model = torch.nn.Module()
+    model.layers = torch.nn.ModuleList([torch.nn.Module()])
+    model.layers[0].conv1d = conv1d
+    return model, conv1d
+
+
+def expected_packed(conv1d):
+    weight = conv1d.weight
+    return weight.view(weight.size(0), weight.size(2)).transpose(0, 1).contiguous()
+
+
+@pytest.mark.parametrize('encoding, refreshed', [('indices', True), ('dense', False)])
+def test_sparse_update_refreshes_ascend_packed_conv_weight(adapter, encoding, refreshed):
+    model, conv1d = ascend_gdn_model()
+    stale = conv1d.ascend_conv1d_weight.detach().clone()
+    loader = sys.modules['vllm.model_executor.model_loader.checkpoint_weight_patch']
+
+    def write_source(*_, **__):
+        # The checkpoint patch API only writes the source parameter.
+        flat = conv1d.weight.data.view(-1)
+        flat[[1, 9]] = -flat[[1, 9]] + 1
+
+    loader.load_checkpoint_weight_patches.side_effect = write_source
+    config = SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_size=1, pipeline_parallel_size=1),
+                             model_config=SimpleNamespace(dtype=torch.bfloat16))
+    engine = adapter.TwinkleDeltaIPCWeightTransferEngine(None, config, torch.device('cuda'), model)
+    engine._receive_payload = Mock(return_value=named_flush(encoding))
+    engine.start_weight_update()
+    engine.receive_weights(adapter.TwinkleDeltaIPCUpdateInfo(zmq_handle='ipc:///tmp/test.sock'))
+    assert not torch.equal(stale, expected_packed(conv1d))  # the source really changed
+    packed_ptr = conv1d.ascend_conv1d_weight.data_ptr()
+    engine.finish_weight_update()
+    assert conv1d.ascend_conv1d_weight.data_ptr() == packed_ptr  # refreshed in place
+    if refreshed:
+        assert torch.equal(conv1d.ascend_conv1d_weight.view(torch.int16), expected_packed(conv1d).view(torch.int16))
+    else:  # dense: finalize_layerwise_reload (mocked here) owns the repack
+        assert torch.equal(conv1d.ascend_conv1d_weight, stale)
+
+
+def test_refresh_derived_weights_rejects_unknown_packed_layout(adapter):
+    from twinkle.sampler.vllm_sampler.weight_update_utils import refresh_derived_weights
+    model, conv1d = ascend_gdn_model()
+    conv1d.ascend_conv1d_weight = torch.nn.Parameter(torch.zeros(6, 4, dtype=torch.bfloat16), requires_grad=False)
+    with pytest.raises(RuntimeError, match='unsupported packed conv layout'):
+        refresh_derived_weights(model)
+
+
+def test_refresh_derived_weights_is_noop_without_packed_weights(adapter):
+    from twinkle.sampler.vllm_sampler.weight_update_utils import refresh_derived_weights
+    assert refresh_derived_weights(torch.nn.Linear(2, 2)) == 0
+
+
 def test_partial_update_failure_poisoned_across_sessions(adapter):
     engine = transfer_engine(adapter)
     engine._receive_payload = Mock(return_value=named_flush())

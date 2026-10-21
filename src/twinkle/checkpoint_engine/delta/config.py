@@ -37,17 +37,23 @@ class DeltaSyncConfig:
 class DeltaTransportEndpoint(TypedDict):
     world_size: int
     master_metadata: DeltaMasterMetadata
-    rollout_workers: list[DeltaWorkerMetadata]
+    # CUDA only: NPU workers join the trainer's HCCL group themselves, so there is no worker list.
+    rollout_workers: NotRequired[list[DeltaWorkerMetadata]]
+    # NPU only: trainer rank 0's HCCL socket env; workers apply it before joining the group.
+    hccl_env: NotRequired[dict[str, str]]
 
 
 class DeltaTrainerMetadata(TypedDict):
     device: str
     master_metadata: DeltaMasterMetadata | None
+    hccl_env: NotRequired[dict[str, str]]
 
 
 class DeltaWorkerCapabilities(TypedDict):
     tp: int
     device: str
+    # NPU only: data-parallel index of the reporting sampler replica.
+    replica_rank: NotRequired[int]
 
 
 class DeltaWorkerMetadata(TypedDict):

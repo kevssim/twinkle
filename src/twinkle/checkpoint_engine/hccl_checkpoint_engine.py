@@ -386,8 +386,9 @@ class HCCLCheckpointEngine(CheckpointEngine):
 
         elapsed = time.time() - start_time
         bandwidth = total_bytes / elapsed / (1024 * 1024 * 1024) if elapsed > 0 else 0.0
-        logger.info(f'send_weights done: rank={self.rank}, params={total_params}, chunks={total_chunks}, '
-                    f'time={elapsed:.2f}s, bandwidth={bandwidth:.2f} GB/s')
+        logger.info(f'full-sync send_weights done: rank={self.rank}, params={total_params}, chunks={total_chunks}, '
+                       f'payload={total_bytes / (1 << 20):.1f}MB ({total_bytes / (1 << 30):.2f}GB), '
+                       f'time={elapsed:.2f}s, bandwidth={bandwidth:.2f} GB/s')
 
     @torch.no_grad()
     async def receive_weights(self) -> AsyncGenerator[tuple[str, torch.Tensor]]:
@@ -474,5 +475,6 @@ class HCCLCheckpointEngine(CheckpointEngine):
 
         elapsed = time.time() - start_time
         bandwidth = total_bytes / elapsed / (1024 * 1024 * 1024) if elapsed > 0 else 0.0
-        logger.info(f'receive_weights done: rank={self.rank}, params={total_params}, chunks={total_chunks}, '
-                    f'time={elapsed:.2f}s, bandwidth={bandwidth:.2f} GB/s')
+        logger.info(f'full-sync receive_weights done: rank={self.rank}, params={total_params}, chunks={total_chunks}, '
+                       f'payload={total_bytes / (1 << 20):.1f}MB ({total_bytes / (1 << 30):.2f}GB), '
+                       f'time={elapsed:.2f}s, bandwidth={bandwidth:.2f} GB/s')

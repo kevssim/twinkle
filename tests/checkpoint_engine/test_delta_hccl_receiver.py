@@ -257,6 +257,17 @@ def test_build_communicator_args(monkeypatch):
                                  backend='hccl')
 
 
+def test_build_communicator_applies_trainer_hccl_env(monkeypatch):
+    seen = {}
+    monkeypatch.setenv('HCCL_IF_BASE_PORT', '11111')  # worker's own (mismatched) value
+    monkeypatch.setattr(hccl_receiver, 'stateless_init_process_group',
+                        lambda **_: seen.update(port=hccl_receiver.os.environ['HCCL_IF_BASE_PORT']) or 'comm')
+    env = {'HCCL_IF_BASE_PORT': '22222'}
+    assert hccl_receiver.build_delta_hccl_communicator('1.2.3.4', 99, 1, 2, torch.device('cpu', 0),
+                                                       hccl_env=env) == 'comm'
+    assert seen['port'] == '22222'
+
+
 # --------------------------------------------------------------------------- (c) engine
 @pytest.fixture
 def hccl(adapter, monkeypatch, sync):
@@ -269,13 +280,15 @@ def hccl(adapter, monkeypatch, sync):
         order.append(('connect', ip, port, topic))
         return sub
 
-    def fake_build(ip, port, rank, world, device):
+    def fake_build(ip, port, rank, world, device, hccl_env=None):
         order.append(('build', ip, port, rank, world))
+        hccl_envs.append(hccl_env)
         return comm
 
+    hccl_envs = []
     monkeypatch.setattr(zmq_mod, 'connect_subscriber', fake_connect)
     monkeypatch.setattr(hccl_receiver, 'build_delta_hccl_communicator', fake_build)
-    return SimpleNamespace(adapter=adapter, order=order, sub=sub, comm=comm)
+    return SimpleNamespace(adapter=adapter, order=order, sub=sub, comm=comm, hccl_envs=hccl_envs)
 
 
 def hccl_engine(adapter, device='cpu'):
@@ -317,6 +330,16 @@ def test_ensure_channel_order_reuse_and_rank_change(hccl):
     assert engine._ensure_channel(1) == (sub, comm) and len(hccl.order) == 2
     with pytest.raises(RuntimeError, match='group_rank changed'):
         engine._ensure_channel(2)
+    assert hccl.hccl_envs == [{}]
+
+
+def test_ensure_channel_forwards_hccl_env(hccl):
+    engine = hccl_engine(hccl.adapter)
+    env = {'HCCL_IF_BASE_PORT': '30000'}
+    engine.init_transfer_engine(hccl.adapter.TwinkleDeltaHCCLInitInfo(
+        dist_ip='10.0.0.1', dist_port=5000, zmq_ip='10.0.0.2', zmq_port=6000, world_size=3, hccl_env=env))
+    engine._ensure_channel(1)
+    assert hccl.hccl_envs == [env]
 
 
 def test_ensure_channel_build_failure_closes_sub(hccl, monkeypatch):
@@ -336,8 +359,10 @@ def test_receive_sparse_session_prepares_sparse_loaders(hccl, monkeypatch):
     utils = sys.modules.get('twinkle.sampler.vllm_sampler.weight_update_utils')
     prepare = Mock()
     drop = Mock(side_effect=lambda model, patches: patches)
+    refresh = Mock(return_value=0)
     monkeypatch.setitem(sys.modules, 'twinkle.sampler.vllm_sampler.weight_update_utils',
-                        SimpleNamespace(prepare_sparse_weight_loaders=prepare, drop_tied_alias_patches=drop))
+                        SimpleNamespace(prepare_sparse_weight_loaders=prepare, drop_tied_alias_patches=drop,
+                                        refresh_derived_weights=refresh))
     engine = hccl_engine(hccl.adapter)
     engine.init_transfer_engine(init_info(hccl.adapter))
     feed(hccl, [(named_flush(), False), (named_flush(), True)])
@@ -347,6 +372,7 @@ def test_receive_sparse_session_prepares_sparse_loaders(hccl, monkeypatch):
     loader = sys.modules['vllm.model_executor.model_loader.checkpoint_weight_patch']
     reload = sys.modules['vllm.model_executor.model_loader.reload']
     assert prepare.call_count == 2 and drop.call_count == 2
+    refresh.assert_called_once_with(engine.model)  # once per session, after the last flush
     assert loader.load_checkpoint_weight_patches.call_count == 2
     assert loader.load_checkpoint_weight_patches.call_args.kwargs == {'validate_unique_indices': False}
     reload.initialize_layerwise_reload.assert_not_called()
@@ -488,14 +514,48 @@ def test_validate_delta_worker_reports_npu_and_names_both_backends(worker_cls, a
     assert 'twinkle_delta_ipc' in str(err.value) and 'twinkle_delta_hccl' in str(err.value)
 
 
+def fake_delta_worker(worker_cls, rank=0, dp_index=None, world_size=None):
+    """A worker stand-in whose update_weights records its argument; mirrors the bound helper like a real worker."""
+    parallel = None if dp_index is None and world_size is None else SimpleNamespace(
+        data_parallel_index=dp_index or 0, world_size=world_size or 1)
+    worker = SimpleNamespace(update_weights=Mock(), delta_ipc_endpoint=lambda: 'ipc:///x', rank=rank,
+                             vllm_config=SimpleNamespace(parallel_config=parallel))
+    worker._delta_update_info_for_this_worker = lambda info: worker_cls._delta_update_info_for_this_worker(
+        worker, info)
+    return worker
+
+
 def test_update_twinkle_delta_weights_dispatch(worker_cls):
-    worker = SimpleNamespace(update_weights=Mock(), delta_ipc_endpoint=lambda: 'ipc:///x')
+    worker = fake_delta_worker(worker_cls)
     worker_cls.update_twinkle_delta_weights(worker)
     worker.update_weights.assert_called_once_with({'zmq_handle': 'ipc:///x'})
     worker.update_weights.reset_mock()
     info = [{'group_rank': 1}, {'group_rank': 2}]
     worker_cls.update_twinkle_delta_weights(worker, info)
-    worker.update_weights.assert_called_once_with(info)
+    # a list is reduced to this worker's own entry and handed over as a plain dict (vllm-ascend's
+    # NPUWorker.update_weights does not accept lists)
+    worker.update_weights.assert_called_once_with({'group_rank': 1})
+
+
+@pytest.mark.parametrize('rank,expected', [(0, 5), (1, 6), (2, 7)])
+def test_update_twinkle_delta_weights_selects_entry_by_worker_rank(worker_cls, rank, expected):
+    worker = fake_delta_worker(worker_cls, rank=rank, dp_index=0, world_size=3)
+    worker_cls.update_twinkle_delta_weights(worker, [{'group_rank': 5}, {'group_rank': 6}, {'group_rank': 7}])
+    worker.update_weights.assert_called_once_with({'group_rank': expected})
+
+
+def test_update_twinkle_delta_weights_indexes_across_data_parallel_replicas(worker_cls):
+    # same formula as vLLM's GPU Worker.update_weights: data_parallel_index * world_size + rank
+    worker = fake_delta_worker(worker_cls, rank=1, dp_index=1, world_size=2)
+    worker_cls.update_twinkle_delta_weights(worker, [{'group_rank': i} for i in range(4)])
+    worker.update_weights.assert_called_once_with({'group_rank': 3})
+
+
+def test_update_twinkle_delta_weights_rejects_short_list(worker_cls):
+    worker = fake_delta_worker(worker_cls, rank=2, dp_index=0, world_size=3)
+    with pytest.raises(ValueError, match='needs entry 2'):
+        worker_cls.update_twinkle_delta_weights(worker, [{'group_rank': 1}, {'group_rank': 2}])
+    worker.update_weights.assert_not_called()
 
 
 # --------------------------------------------------------------------------- (e) import hygiene
@@ -511,3 +571,53 @@ def test_engine_pieces_do_not_import_npu_modules(adapter):
     engine.init_transfer_engine(init_info(adapter))
     assert 'torch_npu' not in sys.modules and 'vllm_ascend' not in sys.modules
     assert checksum  # keep import used
+
+
+# --------------------------------------------------------------------------- (f) re-initialization / shutdown RPC
+def test_init_transfer_engine_after_shutdown_rebuilds_against_new_rendezvous(hccl):
+    engine = hccl_engine(hccl.adapter)
+    engine.init_transfer_engine(init_info(hccl.adapter))
+    engine._ensure_channel(1)
+    engine.shutdown()
+    new = hccl.adapter.TwinkleDeltaHCCLInitInfo(dist_ip='10.0.0.9', dist_port=5001, zmq_ip='10.0.0.8',
+                                                zmq_port=6001, world_size=5)
+    engine.init_transfer_engine(new)
+    engine._ensure_channel(3)
+    assert hccl.order[-2:] == [('connect', '10.0.0.8', 6001, 'bucket_metadata'), ('build', '10.0.0.9', 5001, 3, 5)]
+    assert hccl.comm.destroyed == [hccl.comm.comm]
+
+
+@pytest.mark.parametrize('identical', [True, False])
+def test_init_transfer_engine_with_live_channel_releases_it_first(hccl, identical):
+    engine = hccl_engine(hccl.adapter)
+    engine.init_transfer_engine(init_info(hccl.adapter))
+    engine._ensure_channel(1)
+    new = init_info(hccl.adapter) if identical else hccl.adapter.TwinkleDeltaHCCLInitInfo(
+        dist_ip='10.0.0.9', dist_port=5001, zmq_ip='10.0.0.8', zmq_port=6001, world_size=4)
+    engine.init_transfer_engine(new)
+    # the old communicator and SUB were released, nothing is live until the next receive
+    assert hccl.comm.destroyed == [hccl.comm.comm] and hccl.sub.closed
+    assert (engine._comm, engine._manifest_sub, engine._group_rank) == (None, None, None)
+    assert engine._rendezvous is new
+    # a new rendezvous may also use a different group rank
+    engine._ensure_channel(2)
+    assert hccl.order[-1][3] == 2 and len(hccl.order) == 4
+
+
+def test_shutdown_delta_weight_transfer_calls_engine_shutdown_for_delta_engines(worker_cls, adapter):
+    engine = hccl_engine(adapter, 'cpu')
+    engine.shutdown = Mock()
+    worker_cls.shutdown_delta_weight_transfer(SimpleNamespace(weight_transfer_engine=engine))
+    engine.shutdown.assert_called_once()
+    ipc = adapter.TwinkleDeltaIPCWeightTransferEngine.__new__(adapter.TwinkleDeltaIPCWeightTransferEngine)
+    ipc.shutdown = Mock()
+    worker_cls.shutdown_delta_weight_transfer(SimpleNamespace(weight_transfer_engine=ipc))
+    ipc.shutdown.assert_called_once()
+
+
+def test_shutdown_delta_weight_transfer_is_noop_for_other_engines(worker_cls):
+    other = Mock()
+    worker_cls.shutdown_delta_weight_transfer(SimpleNamespace(weight_transfer_engine=other))
+    other.shutdown.assert_not_called()
+    worker_cls.shutdown_delta_weight_transfer(SimpleNamespace(weight_transfer_engine=None))
+    worker_cls.shutdown_delta_weight_transfer(SimpleNamespace())

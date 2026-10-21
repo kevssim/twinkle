@@ -96,7 +96,10 @@ class RayHelper:
         import ray
         RayHelper.device_groups = device_groups
         if not RayHelper.ray_inited():
-            resources = RayHelper._get_ray_custom_resources(device_groups)
+            # Connecting to an existing cluster (e.g. RAY_ADDRESS set for multi-node): custom
+            # resources are declared at ``ray start`` time, and Ray rejects ``resources`` on connect.
+            connecting = bool(os.environ.get('RAY_ADDRESS'))
+            resources = None if connecting else RayHelper._get_ray_custom_resources(device_groups)
             ray.init(ignore_reinit_error=True, resources=resources or None)
 
         if RayHelper.resource_manager is None:

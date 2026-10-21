@@ -6,7 +6,7 @@ from __future__ import annotations
 import inspect
 import json
 from collections.abc import Iterable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -274,8 +274,18 @@ class TwinkleDeltaIPCWeightTransferEngine(WeightTransferEngine):
             except BaseException:
                 self._update_failed = True
                 raise
-        # Sparse updates write to initialized runtime tensors, so there is
-        # nothing to rebuild after the last flush.
+        elif self._session_encoding == "indices":
+            # Sparse patches only write source parameters; re-derive runtime copies that
+            # process_weights_after_loading would have rebuilt (e.g. Ascend packed conv1d).
+            from twinkle.sampler.vllm_sampler.weight_update_utils import (
+                refresh_derived_weights,
+            )
+
+            try:
+                refresh_derived_weights(self.model)
+            except BaseException:
+                self._update_failed = True
+                raise
         self._session_encoding = None
 
     def shutdown(self) -> None:
@@ -314,6 +324,8 @@ class TwinkleDeltaHCCLInitInfo(WeightTransferInitInfo):
     zmq_port: int
     topic: str = "bucket_metadata"
     world_size: int = 1
+    # Trainer rank 0's HCCL socket env (HCCL_IF_BASE_PORT etc.); applied before joining the group.
+    hccl_env: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -347,6 +359,9 @@ class TwinkleDeltaHCCLWeightTransferEngine(TwinkleDeltaIPCWeightTransferEngine):
 
     def init_transfer_engine(self, init_info: TwinkleDeltaHCCLInitInfo) -> None:
         self._validate_configuration()
+        # A re-seed always builds a new trainer group: drop any channel from an earlier rendezvous
+        # (even an identical one) so _ensure_channel rebuilds against the new endpoint.
+        self.shutdown()
         self._rendezvous = init_info
 
     def _ensure_channel(self, group_rank: int):
@@ -361,7 +376,7 @@ class TwinkleDeltaHCCLWeightTransferEngine(TwinkleDeltaIPCWeightTransferEngine):
             self._manifest_sub = connect_subscriber(rv.zmq_ip, rv.zmq_port, rv.topic)
             try:
                 self._comm = build_delta_hccl_communicator(
-                    rv.dist_ip, rv.dist_port, group_rank, rv.world_size, self.device
+                    rv.dist_ip, rv.dist_port, group_rank, rv.world_size, self.device, hccl_env=rv.hccl_env
                 )
             except BaseException:
                 self._close_sub()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -135,6 +136,22 @@ def test_prepare_master_idempotent(env):
 def test_prepare_non_master(env):
     e = make(master=False, rank=-1)
     assert e.prepare() is None and e.socket is None
+    assert e.hccl_env is None
+
+
+def test_prepare_publishes_effective_hccl_env(env, monkeypatch):
+    from twinkle.utils.platforms.npu import _derive_hccl_socket_env_defaults
+    for key in _derive_hccl_socket_env_defaults(0):
+        monkeypatch.delenv(key, raising=False)
+    # Already pinned by the FSDP process group (from MASTER_PORT): must be published as-is.
+    monkeypatch.setenv('HCCL_IF_BASE_PORT', '12345')
+    e = make()
+    e.prepare()
+    derived = _derive_hccl_socket_env_defaults(222)
+    assert e.hccl_env == dict(derived, HCCL_IF_BASE_PORT='12345')
+    assert 'HCCL_HOST_SOCKET_PORT_RANGE' not in os.environ  # read-only: prepare() must not mutate env
+    e.close()
+    assert e.hccl_env is None
 
 
 def test_init_process_group_builds_no_communicator(env):

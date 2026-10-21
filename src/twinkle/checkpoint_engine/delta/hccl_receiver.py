@@ -11,6 +11,7 @@ zmq PUB drops messages sent before a subscriber connected.
 from __future__ import annotations
 
 import json
+import os
 import torch
 from collections.abc import Callable
 
@@ -20,8 +21,16 @@ _REQUIRED_KEYS = ('is_last', )
 _REQUIRED_FLUSH_KEYS = ('encoding', 'val_numel', 'val_dtype', 'spec')
 
 
-def build_delta_hccl_communicator(dist_ip: str, dist_port: int, group_rank: int, world_size: int, device):
-    """Join the trainer's HCCL broadcast group at ``group_rank``."""
+def build_delta_hccl_communicator(dist_ip: str, dist_port: int, group_rank: int, world_size: int, device,
+                                  hccl_env: dict[str, str] | None = None):
+    """Join the trainer's HCCL broadcast group at ``group_rank``.
+
+    ``hccl_env`` is trainer rank 0's HCCL socket env. It overrides this process's values: the trainer may
+    have derived them from its FSDP ``MASTER_PORT``, and ranks with different port layouts time out in
+    the communicator's first collective.
+    """
+    if hccl_env:
+        os.environ.update(hccl_env)
     if isinstance(device, str):
         device = torch.device(device)
     index = device.index

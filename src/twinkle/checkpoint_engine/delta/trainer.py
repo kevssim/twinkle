@@ -66,7 +66,11 @@ class DeltaTrainerMixin:
         self._lazy_wrap_model()
         if self._delta_engine is None:
             self._initialize_delta_engine(config)
-        return {'device': self._delta_device, 'master_metadata': self._delta_master_metadata}
+        metadata: DeltaTrainerMetadata = {'device': self._delta_device, 'master_metadata': self._delta_master_metadata}
+        hccl_env = getattr(self._delta_engine, 'hccl_env', None)
+        if hccl_env:
+            metadata['hccl_env'] = dict(hccl_env)
+        return metadata
 
     @remote_function(dispatch='all', lazy_collect=True)
     def init_delta_transport(self, endpoint: DeltaTransportEndpoint) -> None:

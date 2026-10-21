@@ -381,13 +381,16 @@ def stateless_init_process_group(
         master_listen_fd=listen_fd,
     )
 
-    pg = StatelessProcessGroup(
-        rank=rank,
-        world_size=world_size,
-        store=store,
-        socket=listen_socket,
-        data_expiration_seconds=3600,
-    )
+    # Newer vLLM (e.g. 0.30) removed the ``socket`` field from StatelessProcessGroup; pass it only if present.
+    import dataclasses
+    pg_fields = {field.name for field in dataclasses.fields(StatelessProcessGroup)}
+    pg_kwargs = dict(rank=rank, world_size=world_size, store=store, data_expiration_seconds=3600)
+    if 'socket' in pg_fields:
+        pg_kwargs['socket'] = listen_socket
+    pg = StatelessProcessGroup(**pg_kwargs)
+    if 'socket' not in pg_fields and listen_socket is not None:
+        # TCPStore borrows this socket's fd via master_listen_fd; keep a reference so GC does not close it.
+        pg._twinkle_listen_socket = listen_socket
 
     communicator = Communicator(pg, device=device)
     return communicator

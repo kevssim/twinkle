@@ -2202,6 +2202,35 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                 name = name.replace('.base_layer', '')
             return name
 
+        def _tied_duplicate_names() -> set:
+            """Names the HF state_dict repeats because they share one tensor, which must not be sent.
+
+            With ``tie_word_embeddings`` the LM head and the input embedding are the SAME tensor, so
+            the state_dict lists it twice (``lm_head.weight`` and ``*.embed_tokens.weight``). vLLM
+            loads only the name its module traversal reaches first and records the other as a skipped
+            alias, then asserts the canonical one did load
+            (``AutoWeightsLoader._check_skipped_aliases``). Sending both makes that check fail, and
+            the duplicate is redundant anyway because one write covers both.
+
+            Keyed off the config rather than runtime storage identity: the sharing can be broken
+            apart mid-run (an optimizer step or an FSDP all-gather may materialise the head as its
+            own tensor), which would make a storage probe stop matching after the first sync. The
+            flag can sit on a nested ``text_config`` for multimodal shells, so check both.
+            """
+            config = getattr(self, 'hf_config', None)
+            if config is None:
+                return set()
+            tied = getattr(config, 'tie_word_embeddings', None)
+            if tied is None:
+                tied = getattr(getattr(config, 'text_config', None), 'tie_word_embeddings', None)
+            if not tied:
+                return set()
+            # Drop the head, keep the embedding: vLLM's traversal reaches the nested embedding first,
+            # making it the canonical name that ``_check_skipped_aliases`` wants to see loaded.
+            return {name for name in model.state_dict() if name.split('.')[-2:-1] == ['lm_head']}
+
+        _tied_duplicates = _tied_duplicate_names()
+
         def _add_base_layer_suffix(name):
             # vLLM (enable_lora) wraps some modules as ``*WithLoRA`` and exposes
             # only their ``.base_layer.*`` param, even when PEFT does not target
@@ -2238,7 +2267,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
                         model.merge_adapter()
                     names = []
                     for name, tensor in model.state_dict().items():
-                        if _is_lora_key(name):
+                        if _is_lora_key(name) or name in _tied_duplicates:
                             continue
                         tensor = _checkpoint_tensor(tensor)
                         name = _normalize(name, keep_base_layer=False)
@@ -2275,7 +2304,7 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             def weight_generator():
                 names = []
                 for name, tensor in state_dict.items():
-                    if _is_lora_key(name):
+                    if _is_lora_key(name) or name in _tied_duplicates:
                         continue
                     tensor = _checkpoint_tensor(tensor)
                     name = _normalize(name, keep_base_layer=False)

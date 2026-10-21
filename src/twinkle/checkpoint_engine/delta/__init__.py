@@ -13,7 +13,8 @@ Layout:
     spec.py      ShardSpec / BlockPlacement: where a local shard sits in the full tensor
     export.py    snapshot, diff and HF-coordinate delta export helpers
     trainer.py   DeltaTrainerMixin: trainer-side Ray lifecycle
-    rollout.py   CudaDeltaReceiver / DeltaSamplerMixin: rollout-side lifecycle
+    rollout.py   CudaDeltaReceiver / DeltaSamplerMixin: rollout-side lifecycle (CUDA: Ray receiver actors + IPC;
+                 NPU: no actors, vLLM workers join the trainer's HCCL group via the worker extension)
     backends/    per-training-backend export hooks (base.py contract, fsdp.py implementation)
 """
 from .config import DeltaSyncConfig

@@ -154,17 +154,40 @@ class TwinkleWorkerExtension:
             'zmq_handle': self.delta_ipc_endpoint(),
         }
 
+    def _delta_update_info_for_this_worker(self, update_info: List[Dict]) -> Dict:
+        """Pick this worker's entry from a per-worker ``update_info`` list.
+
+        Same indexing as vLLM's GPU ``Worker.update_weights``: ``data_parallel_index * world_size + rank``
+        (a list indexed by global worker rank across data-parallel replicas). vllm-ascend's
+        ``NPUWorker.update_weights`` only accepts a dict, so the entry is selected here instead of relying
+        on the worker class to do it.
+        """
+        parallel_config = getattr(getattr(self, 'vllm_config', None), 'parallel_config', None)
+        dp_index = int(getattr(parallel_config, 'data_parallel_index', 0) or 0)
+        world_size = int(getattr(parallel_config, 'world_size', 1) or 1)
+        index = dp_index * world_size + int(getattr(self, 'rank', 0) or 0)
+        if index >= len(update_info):
+            raise ValueError(f'delta update_info has {len(update_info)} entries but this worker needs entry {index}')
+        return update_info[index]
+
     def update_twinkle_delta_weights(self, update_info: Optional[List[Dict]] = None):
         """Run one delta weight-update session.
 
-        ``None``: CUDA IPC path, this worker's local zmq endpoint is used. A list of per-worker
-        dicts (HCCL path, e.g. ``[{'group_rank': 1}, {'group_rank': 2}]``) is forwarded as is;
-        ``WorkerBase.update_weights`` is expected to pick the entry for this worker's rank.
+        ``None``: CUDA IPC path, this worker's local zmq endpoint is used. A list of per-worker dicts
+        (HCCL path, e.g. ``[{'group_rank': 1}, {'group_rank': 2}]``): this worker's own entry is passed to
+        ``update_weights`` as a plain dict, so it works on both the GPU and the vllm-ascend worker.
         """
         if update_info is None:
             self.update_weights({'zmq_handle': self.delta_ipc_endpoint()})
         else:
-            self.update_weights(update_info)
+            self.update_weights(self._delta_update_info_for_this_worker(update_info))
+
+    def shutdown_delta_weight_transfer(self) -> None:
+        """Release the delta engine's transport channel (HCCL SUB + communicator); no-op for other engines."""
+        from .delta_weight_transfer import TwinkleDeltaIPCWeightTransferEngine
+        engine = getattr(self, 'weight_transfer_engine', None)
+        if isinstance(engine, TwinkleDeltaIPCWeightTransferEngine):
+            engine.shutdown()
 
     def monkey_patch_model(self):
         from twinkle.patch.vllm_moe_loader import VLLMMoEWeights

@@ -467,6 +467,7 @@ class DeltaSyncMixin:
             return metrics
         weights, _ = engine.get_per_tensor_param_delta_shard()
         is_r0 = self.is_master
+        t0 = time.time()
         n_flushes = 0
         changed_elems = 0
         total_elems = 0
@@ -516,7 +517,15 @@ class DeltaSyncMixin:
         if not is_r0:
             return
         self._release_after_round("steady")
-        logger.info("delta-sharded send v=%s delta flushes=%d (streamed)", global_steps, n_flushes)
+        elapsed = time.time() - t0
+        mb = wire_bytes / (1 << 20)
+        logger.info(
+            "delta-sharded steady send v=%s: changed_ratio=%.4f wire_payload=%.1fMB wire_time=%.2fs "
+            "throughput=%.1fMB/s flushes=%d",
+            global_steps,
+            (changed_elems / total_elems) if total_elems else 0.0,
+            mb, elapsed, (mb / elapsed) if elapsed > 0 else 0.0, n_flushes,
+        )
         if not total_elems:
             return None
         return {

@@ -1,5 +1,9 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Rollout-side Ray lifecycle and receivers for the CUDA delta checkpoint engine."""
+"""Rollout-side lifecycle for the delta checkpoint engine.
+
+CUDA: Ray receiver actors colocated with each vLLM worker feed it over IPC. Ascend NPU: no receiver actors;
+the vLLM workers join the trainer's HCCL group themselves and the sampler only drives vLLM's lifecycle RPCs.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -9,7 +13,7 @@ from typing import Any, TYPE_CHECKING
 
 import torch
 
-from twinkle import remote_function
+from twinkle import Platform, remote_function
 from .config import (DeltaReceiverPlacement, DeltaSyncConfig, DeltaTransportEndpoint,
                      DeltaWorkerCapabilities, DeltaWorkerMetadata)
 from .engine import DeltaShardedCheckpointEngine
@@ -81,10 +85,36 @@ class CudaDeltaReceiver:
 
 
 class DeltaSamplerMixin:
+    """Sampler-side delta lifecycle RPCs (device-aware: CUDA uses receiver actors, NPU does not)."""
     _delta_config: DeltaSyncConfig
     _delta_job_failed: bool = False
     _delta_weight_transfer_initialized: bool = False
     _delta_receivers: list[ActorHandle]
+    _delta_device: str | None = None  # 'cuda' / 'npu', remembered by validate_delta_sampler
+    _delta_tp: int | None = None  # NPU: TP size of this replica
+    _delta_replica_rank: int | None = None  # NPU: this actor's data-parallel replica index
+    _delta_endpoint: DeltaTransportEndpoint | None = None  # NPU: HCCL rendezvous stored by init_delta_sampler_transport
+
+    @property
+    def _delta_is_npu(self) -> bool:
+        return self._delta_device == 'npu'
+
+    @staticmethod
+    def _delta_actor_replica_rank() -> int:
+        """Replica index of this sampler actor.
+
+        ``RayHelper.create_workers`` starts actor ``i`` of ``sampler._actors`` with ``RANK=i`` and
+        ``WORLD_SIZE=len(_actors)``, and ``dispatch='all'`` results are collected in ``_actors`` order, so
+        ``Platform.get_rank()`` is the actor's position in the manager's replica list. ``DeviceMesh`` lookups
+        are not used: they index by GPU id and are wrong when an actor owns several GPUs (TP).
+        """
+        rank = Platform.get_rank()
+        world_size = Platform.get_world_size()
+        if rank < 0 or rank >= world_size:
+            raise RuntimeError(
+                f'cannot determine the delta replica rank of this sampler actor (RANK={rank}, WORLD_SIZE={world_size}); '
+                'NPU delta sync requires sampler actors created by Ray with a per-actor RANK')
+        return rank
 
     async def _delta_rpc(self, method: str, kwargs: dict[str, Any] | None = None) -> list[Any]:
         return await self.engine.engine.collective_rpc(
@@ -139,6 +169,11 @@ class DeltaSamplerMixin:
             raise ValueError('inconsistent delta worker capabilities')
         if len(results) != results[0]['tp']:
             raise ValueError('delta topology requires one vLLM worker per TP rank')
+        self._delta_device = results[0]['device']
+        if self._delta_device == 'npu':
+            self._delta_tp = results[0]['tp']
+            self._delta_replica_rank = self._delta_actor_replica_rank()
+            return dict(results[0], replica_rank=self._delta_replica_rank)
         return results[0]
 
     @remote_function(dispatch='all', collect='flatten', lazy_collect=False)
@@ -175,6 +210,11 @@ class DeltaSamplerMixin:
 
     @remote_function(dispatch='all', lazy_collect=True)
     def init_delta_sampler_transport(self, endpoint: DeltaTransportEndpoint) -> None:
+        if self._delta_is_npu:
+            # No receiver actors: workers join the trainer's HCCL group on their first receive.
+            self._delta_endpoint = endpoint
+            self._delta_weight_transfer_initialized = False
+            return
         import ray
 
         metadata = self._run_in_loop(self._delta_rpc('delta_receiver_metadata'))
@@ -203,8 +243,41 @@ class DeltaSamplerMixin:
                 receivers.cancel()
             await asyncio.gather(receivers, return_exceptions=True)
 
+    async def _receive_delta_weights_npu(self) -> dict[str, bool]:
+        """One NPU round: the vLLM workers pump the whole HCCL session inside ``update_twinkle_delta_weights``.
+
+        That RPC blocks until the session is received and applied, and runs concurrently with the trainer's
+        send (the manager launches both before waiting). A zero-change round cannot be told apart here (the
+        worker pump just returns on the terminal manifest), so it is reported as changed; the cache clear is
+        harmless.
+        """
+        endpoint = self._delta_endpoint
+        if endpoint is None:
+            raise RuntimeError('delta NPU transport is not initialized; run a full seed first')
+        if not self._delta_weight_transfer_initialized:
+            master = endpoint['master_metadata']
+            init_info = {
+                'dist_ip': master.dist_ip, 'dist_port': master.dist_port,
+                'zmq_ip': master.zmq_ip, 'zmq_port': master.zmq_port,
+                'topic': 'bucket_metadata', 'world_size': endpoint['world_size']}
+            if endpoint.get('hccl_env'):
+                init_info['hccl_env'] = dict(endpoint['hccl_env'])
+            await self._delta_rpc('init_weight_transfer_engine', {'init_info': init_info})
+            self._delta_weight_transfer_initialized = True
+        await self._delta_rpc('start_weight_update')
+        # Group rank 0 is the trainer; workers are numbered replica-major, TP-minor.
+        base = 1 + self._delta_replica_rank * self._delta_tp
+        await self._delta_rpc('update_twinkle_delta_weights', {
+            'update_info': [{'group_rank': base + index} for index in range(self._delta_tp)]})
+        await self._delta_rpc('finish_weight_update')
+        await self._clear_delta_cache()
+        return {'changed': True}
+
     @remote_function(dispatch='all', lazy_collect=True)
     def receive_delta_weights(self) -> dict[str, bool]:
+        if self._delta_is_npu:
+            return self._run_in_loop(self._receive_delta_weights_npu())
+
         async def receive():
             first = await self._next_delta_flush()
             if first is None:
@@ -236,6 +309,13 @@ class DeltaSamplerMixin:
 
         self.engine._delta_unavailable = True
         self._run_in_loop(self.engine.pause_delta_generation(self._delta_config.timeout_seconds))
+        if self._delta_is_npu:
+            try:
+                self._run_in_loop(self._delta_rpc('shutdown_delta_weight_transfer'))
+            finally:
+                self._delta_weight_transfer_initialized = False
+                self._delta_endpoint = None
+            return
         receivers = getattr(self, '_delta_receivers', [])
         try:
             ray.get([receiver.close.remote() for receiver in receivers], timeout=self._delta_config.timeout_seconds)

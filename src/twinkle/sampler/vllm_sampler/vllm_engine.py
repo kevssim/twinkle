@@ -382,11 +382,17 @@ class VLLMEngine(BaseSamplerEngine):
             from .delta_weight_transfer import register_twinkle_delta_weight_transfer_engine, require_vllm_delta_support
             require_vllm_delta_support()
             register_twinkle_delta_weight_transfer_engine()
+        elif backend == 'twinkle_delta_hccl':
+            # Ascend NPU: sleep mode stays opt-in (engine_args / enable_sleep_mode), it is not forced on here.
+            from .delta_weight_transfer import (register_twinkle_delta_hccl_weight_transfer_engine,
+                                                require_vllm_delta_support)
+            require_vllm_delta_support()
+            register_twinkle_delta_hccl_weight_transfer_engine()
         if self.enable_sampling_replay:
             engine_config['enable_return_sampling_mask'] = True
             engine_config['logprobs_mode'] = 'processed_logprobs'
         valid_args = inspect.signature(AsyncEngineArgs).parameters.keys()
-        if backend == 'twinkle_delta_ipc' and 'weight_transfer_config' not in valid_args:
+        if backend in ('twinkle_delta_ipc', 'twinkle_delta_hccl') and 'weight_transfer_config' not in valid_args:
             raise RuntimeError('delta_sharded requires vLLM AsyncEngineArgs.weight_transfer_config')
         filtered_engine_config, invalid_args = _filter_engine_config(
             engine_config,

@@ -93,9 +93,11 @@ class CheckpointEngineManager:
         self.sync_backend = sync_backend
         self.delta_config = delta_config or DeltaSyncConfig()
         self.delta_engine_cls = None
+        self._delta_platform = None
         if sync_backend == 'delta_sharded':
             # Fail at construction, not mid-sync, when the platform has no delta transport.
-            self.delta_engine_cls = resolve_delta_engine_cls(Platform.get_platform(platform).__name__)
+            self._delta_platform = Platform.get_platform(platform).__name__
+            self.delta_engine_cls = resolve_delta_engine_cls(self._delta_platform)
         self._delta_replica_count = None
         self._delta_round = 0
         self._delta_failed = False
@@ -231,6 +233,8 @@ class CheckpointEngineManager:
     def _prepare_delta_transport(self):
         capabilities = self.sampler.validate_delta_sampler(self.delta_config)
         replicas = capabilities if isinstance(capabilities, list) else [capabilities]
+        if self._delta_platform == 'NPU':
+            return self._prepare_delta_transport_npu(replicas)
         workers = self.sampler.delta_sampler_metadata()
         if len(workers) != sum(replica['tp'] for replica in replicas):
             raise ValueError('delta topology does not include every rollout TP worker')
@@ -239,6 +243,23 @@ class CheckpointEngineManager:
             raise ValueError('delta checkpoint receivers must occupy distinct rollout GPUs')
         metadata = self.model.prepare_delta_sync(self.delta_config)
         return dict(metadata, world_size=len(workers) + 1, rollout_workers=workers), len(replicas)
+
+    def _prepare_delta_transport_npu(self, replicas):
+        """NPU rendezvous: workers join the trainer's HCCL group themselves, so there is no worker list.
+
+        Group rank 0 is the trainer; rollout workers follow replica-major, TP-minor, so the world size is
+        every replica's TP size plus the trainer.
+        """
+        metadata = self.model.prepare_delta_sync(self.delta_config)
+        for replica in replicas:
+            if replica['device'] != metadata['device']:
+                raise ValueError(f"delta device mismatch: trainer is {metadata['device']!r}, "
+                                 f"rollout worker is {replica['device']!r}")
+        ranks = [replica.get('replica_rank') for replica in replicas]
+        if sorted(ranks, key=lambda rank: (rank is None, rank)) != list(range(len(replicas))):
+            raise ValueError(f'delta replica ranks {ranks} must be exactly 0..{len(replicas) - 1} without duplicates')
+        world_size = sum(replica['tp'] for replica in replicas) + 1
+        return dict(metadata, world_size=world_size), len(replicas)
 
     def _sync_delta_weights(self, merge_and_sync):
         if not merge_and_sync:

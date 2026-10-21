@@ -103,3 +103,32 @@ def _mamba_copy_weight_loader(original_loader):
 
     copy_weight_loader._twinkle_sparse_copy = True
     return copy_weight_loader
+
+
+# vllm-ascend (ops/gdn.py, ops/kimi_kda.py) keeps a kernel-layout copy of each linear-attention conv1d
+# weight: ``[D, 1, W]`` source -> ``[W, D]`` contiguous parameter, repacked only by
+# ``process_weights_after_loading``. Sparse patches never run that hook, so the copy must be refreshed here.
+_ASCEND_PACKED_CONV_WEIGHT = 'ascend_conv1d_weight'
+
+
+def refresh_derived_weights(model: torch.nn.Module) -> int:
+    """Re-derive runtime copies of source weights after a sparse checkpoint patch.
+
+    Dense updates rebuild these in ``finalize_layerwise_reload``; sparse updates only write the source
+    parameters. Copies are refreshed in place so captured graphs keep their addresses. Returns the number
+    of refreshed tensors.
+    """
+    refreshed = 0
+    for name, module in model.named_modules():
+        packed = (getattr(module, '_parameters', None) or {}).get(_ASCEND_PACKED_CONV_WEIGHT)
+        if packed is None:
+            continue
+        source = module.weight
+        if source.dim() != 3 or source.size(1) != 1 or tuple(packed.shape) != (source.size(2), source.size(0)):
+            raise RuntimeError(
+                f'{name}.{_ASCEND_PACKED_CONV_WEIGHT}: unsupported packed conv layout '
+                f'{tuple(packed.shape)} for source {tuple(source.shape)}; expected [W, D] from [D, 1, W]')
+        # ``.data`` keeps the copy out of autograd; copy_ also casts to the packed dtype like vllm-ascend.
+        packed.data.copy_(source.data.view(source.size(0), source.size(2)).transpose(0, 1))
+        refreshed += 1
+    return refreshed

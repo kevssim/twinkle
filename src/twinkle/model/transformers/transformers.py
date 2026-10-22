@@ -699,7 +699,6 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         # into the exception string and that dump swallows the real traceback.
         return f'{type(self).__name__}(model_id={getattr(self, "model_id", None)!r})'
 
-    @staticmethod
     def _lazy_wrap_model(self):
         if not self._model_wrapped:
             optimizer_groups = [og for og in self.optimizer_group.values() if og.optimizer is not None]

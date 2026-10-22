@@ -2,7 +2,7 @@
 """Platform -> delta transport resolution."""
 from __future__ import annotations
 
-_HCCL_MODULE = 'twinkle.checkpoint_engine.delta.hccl_engine'
+_HCCL_MODULE = 'twinkle.checkpoint_engine.delta.transport.hccl_engine'
 
 # Trainer-side torch device type per supported platform.
 DELTA_DEVICES = {'GPU': 'cuda', 'NPU': 'npu'}
@@ -14,11 +14,11 @@ def resolve_delta_engine_cls(platform_name: str) -> type:
     Imports are lazy so the GPU path never touches NPU-specific modules.
     """
     if platform_name == 'GPU':
-        from .engine import DeltaShardedCheckpointEngine
+        from .transport.nccl_engine import DeltaShardedCheckpointEngine
         return DeltaShardedCheckpointEngine
     if platform_name == 'NPU':
         try:
-            from .hccl_engine import DeltaHCCLCheckpointEngine
+            from .transport.hccl_engine import DeltaHCCLCheckpointEngine
         except ModuleNotFoundError as error:
             if error.name != _HCCL_MODULE:
                 raise

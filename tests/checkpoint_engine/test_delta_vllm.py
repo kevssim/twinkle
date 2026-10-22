@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 import torch
 
-from twinkle.checkpoint_engine.delta.wire import checksum
+from twinkle.checkpoint_engine.delta.protocol.wire import checksum
 
 
 @pytest.fixture
@@ -57,7 +57,7 @@ def adapter(monkeypatch):
         module = ModuleType(name)
         module.__dict__.update(fields)
         monkeypatch.setitem(sys.modules, name, module)
-    path = Path(__file__).parents[2] / 'src/twinkle/sampler/vllm_sampler/delta_weight_transfer.py'
+    path = Path(__file__).parents[2] / 'src/twinkle/sampler/vllm_sampler/delta/transfer_engine.py'
     spec = importlib.util.spec_from_file_location('_twinkle_delta_adapter_test', path)
     module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, spec.name, module)
@@ -168,7 +168,7 @@ def test_sparse_update_refreshes_ascend_packed_conv_weight(adapter, encoding, re
 
 
 def test_refresh_derived_weights_rejects_unknown_packed_layout(adapter):
-    from twinkle.sampler.vllm_sampler.weight_update_utils import refresh_derived_weights
+    from twinkle.sampler.vllm_sampler.delta.weight_update_utils import refresh_derived_weights
     model, conv1d = ascend_gdn_model()
     conv1d.ascend_conv1d_weight = torch.nn.Parameter(torch.zeros(6, 4, dtype=torch.bfloat16), requires_grad=False)
     with pytest.raises(RuntimeError, match='unsupported packed conv layout'):
@@ -176,7 +176,7 @@ def test_refresh_derived_weights_rejects_unknown_packed_layout(adapter):
 
 
 def test_refresh_derived_weights_is_noop_without_packed_weights(adapter):
-    from twinkle.sampler.vllm_sampler.weight_update_utils import refresh_derived_weights
+    from twinkle.sampler.vllm_sampler.delta.weight_update_utils import refresh_derived_weights
     assert refresh_derived_weights(torch.nn.Linear(2, 2)) == 0
 
 
@@ -194,7 +194,7 @@ def test_partial_update_failure_poisoned_across_sessions(adapter):
 
 def test_worker_requires_native_delta_backend(adapter, monkeypatch):
     from twinkle.sampler.vllm_sampler.vllm_worker_extension import TwinkleWorkerExtension
-    monkeypatch.setitem(sys.modules, 'twinkle.sampler.vllm_sampler.delta_weight_transfer', adapter)
+    monkeypatch.setitem(sys.modules, 'twinkle.sampler.vllm_sampler.delta.transfer_engine', adapter)
     worker = SimpleNamespace(weight_transfer_engine=None)
     with pytest.raises(RuntimeError, match='weight_transfer_config'):
         TwinkleWorkerExtension.validate_delta_worker(worker)
@@ -202,7 +202,7 @@ def test_worker_requires_native_delta_backend(adapter, monkeypatch):
 
 def test_worker_allows_dense_model_and_tp_beyond_previous_allowlist(adapter, monkeypatch):
     from twinkle.sampler.vllm_sampler.vllm_worker_extension import TwinkleWorkerExtension
-    monkeypatch.setitem(sys.modules, 'twinkle.sampler.vllm_sampler.delta_weight_transfer', adapter)
+    monkeypatch.setitem(sys.modules, 'twinkle.sampler.vllm_sampler.delta.transfer_engine', adapter)
     engine = transfer_engine(adapter)
     engine.model_config.hf_config = SimpleNamespace(model_type='llama')
     worker = SimpleNamespace(weight_transfer_engine=engine,
@@ -237,7 +237,7 @@ def tied_helpers(monkeypatch):
     module = ModuleType('vllm.model_executor.layers.vocab_parallel_embedding')
     module.VocabParallelEmbedding = Embedding
     monkeypatch.setitem(sys.modules, module.__name__, module)
-    return load_source(monkeypatch, 'weight_update_utils.py')
+    return load_source(monkeypatch, 'delta/weight_update_utils.py')
 
 
 @pytest.fixture(params=[False, True], ids=['language-model', 'qwen-multimodal'])
@@ -314,8 +314,8 @@ def tied_adapter(monkeypatch, tied_helpers):
         module = ModuleType(name)
         module.__dict__.update(fields)
         monkeypatch.setitem(sys.modules, name, module)
-    monkeypatch.setitem(sys.modules, 'twinkle.sampler.vllm_sampler.weight_update_utils', tied_helpers)
-    return load_source(monkeypatch, 'delta_weight_transfer.py')
+    monkeypatch.setitem(sys.modules, 'twinkle.sampler.vllm_sampler.delta.weight_update_utils', tied_helpers)
+    return load_source(monkeypatch, 'delta/transfer_engine.py')
 
 
 @pytest.mark.parametrize('encoding', ['indices', 'dense'])
@@ -347,7 +347,7 @@ def test_transfer_applies_shared_weight_across_separate_flushes(tied_adapter, ti
 
 @pytest.mark.parametrize('encoding', ['indices', 'dense'])
 def test_transfer_prepares_native_loaders_for_sparse_patches(tied_adapter, tied_model, monkeypatch, encoding):
-    tied_helpers = sys.modules['twinkle.sampler.vllm_sampler.weight_update_utils']
+    tied_helpers = sys.modules['twinkle.sampler.vllm_sampler.delta.weight_update_utils']
     prepare = Mock()
     monkeypatch.setattr(tied_helpers, 'prepare_sparse_weight_loaders', prepare)
     engine = tied_adapter.TwinkleDeltaIPCWeightTransferEngine(None, SimpleNamespace(model_config=object()), None, tied_model)
@@ -403,7 +403,7 @@ def native_mamba_loader(shard_spec, tp_size, tp_rank):
 
 @pytest.fixture
 def mamba_helpers():
-    path = Path(__file__).parents[2] / 'src/twinkle/sampler/vllm_sampler/weight_update_utils.py'
+    path = Path(__file__).parents[2] / 'src/twinkle/sampler/vllm_sampler/delta/weight_update_utils.py'
     spec = importlib.util.spec_from_file_location('_delta_mamba_helpers', path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)

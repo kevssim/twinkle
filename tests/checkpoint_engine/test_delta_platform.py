@@ -11,13 +11,13 @@ import torch
 from twinkle import DeviceMesh, Platform
 from twinkle.checkpoint_engine import CheckpointEngineManager
 from twinkle.checkpoint_engine.delta import DeltaSyncConfig, resolve_delta_engine_cls
-from twinkle.checkpoint_engine.delta import trainer as delta_trainer
-from twinkle.checkpoint_engine.delta.backends.fsdp import validate_fsdp2
-from twinkle.checkpoint_engine.delta.engine import DeltaShardedCheckpointEngine
-from twinkle.checkpoint_engine.delta.trainer import DeltaTrainerMixin
+from twinkle.checkpoint_engine.delta.trainer import mixin as delta_trainer
+from twinkle.checkpoint_engine.delta.trainer.backends.fsdp import validate_fsdp2
+from twinkle.checkpoint_engine.delta.transport.nccl_engine import DeltaShardedCheckpointEngine
+from twinkle.checkpoint_engine.delta.trainer.mixin import DeltaTrainerMixin
 from twinkle.model.transformers.strategy.native_fsdp import NativeFSDPStrategy
 
-HCCL_MODULE = 'twinkle.checkpoint_engine.delta.hccl_engine'
+HCCL_MODULE = 'twinkle.checkpoint_engine.delta.transport.hccl_engine'
 NOT_IMPLEMENTED = 'not implemented yet'
 
 
@@ -34,7 +34,7 @@ def test_resolver_gpu():
 
 
 def test_resolver_npu_real_engine():
-    from twinkle.checkpoint_engine.delta.hccl_engine import DeltaHCCLCheckpointEngine
+    from twinkle.checkpoint_engine.delta.transport.hccl_engine import DeltaHCCLCheckpointEngine
     assert resolve_delta_engine_cls('NPU') is DeltaHCCLCheckpointEngine
 
 
@@ -90,7 +90,7 @@ def test_manager_full_sync_does_not_resolve_delta(monkeypatch):
 
 def test_manager_npu_constructs_with_hccl_engine(monkeypatch):
     fake_platform(monkeypatch, 'NPU')
-    from twinkle.checkpoint_engine.delta.hccl_engine import DeltaHCCLCheckpointEngine
+    from twinkle.checkpoint_engine.delta.transport.hccl_engine import DeltaHCCLCheckpointEngine
     manager = CheckpointEngineManager(*actors(), platform='NPU', mode='standalone', sync_backend='delta_sharded')
     assert manager.delta_engine_cls is DeltaHCCLCheckpointEngine
 

@@ -9,7 +9,7 @@ import pytest
 from twinkle import Platform
 from twinkle.checkpoint_engine import CheckpointEngineManager
 from twinkle.checkpoint_engine.delta import DeltaSyncConfig
-from twinkle.checkpoint_engine.delta.rollout import DeltaSamplerMixin
+from twinkle.checkpoint_engine.delta.rollout.mixin import DeltaSamplerMixin
 from twinkle.checkpoint_engine.hccl_checkpoint_engine import MasterMetadata
 
 MASTER = MasterMetadata(zmq_ip='10.0.0.1', zmq_port=6000, dist_ip='10.0.0.1', dist_port=5000)
@@ -380,7 +380,7 @@ def engine_env(monkeypatch):
         monkeypatch.setitem(sys.modules, name, module)
     adapter = SimpleNamespace(require_vllm_delta_support=Mock(), register_twinkle_delta_weight_transfer_engine=Mock(),
                               register_twinkle_delta_hccl_weight_transfer_engine=Mock())
-    monkeypatch.setitem(sys.modules, 'twinkle.sampler.vllm_sampler.delta_weight_transfer', adapter)
+    monkeypatch.setitem(sys.modules, 'twinkle.sampler.vllm_sampler.delta.transfer_engine', adapter)
     return SimpleNamespace(adapter=adapter, captured=captured)
 
 

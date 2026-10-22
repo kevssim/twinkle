@@ -104,7 +104,9 @@ def _install_stand_ins(comm_factory, build_log):
     """Patch torch.npu and stateless_init_process_group in BOTH modules (child process only)."""
     import torch.distributed as dist
 
-    from twinkle.checkpoint_engine.delta import hccl_engine, hccl_receiver
+    from twinkle.checkpoint_engine.delta.rollout import hccl_receiver
+    from twinkle.checkpoint_engine.delta.transport import hccl_engine
+
     os.environ.setdefault('GLOO_SOCKET_IFNAME', 'lo')
     torch.set_num_threads(1)
     torch.npu = SimpleNamespace(current_device=lambda: 0, synchronize=lambda: None, empty_cache=lambda: None)
@@ -160,8 +162,8 @@ def trainer_main(cfg, ep_qs, res_q, done_evs):
             return LoopComm()
 
         _install_stand_ins(factory, build_log)
-        from twinkle.checkpoint_engine.delta.hccl_engine import DeltaHCCLCheckpointEngine
-        from twinkle.checkpoint_engine.delta.pipeline import DeltaSyncMixin
+        from twinkle.checkpoint_engine.delta.transport.hccl_engine import DeltaHCCLCheckpointEngine
+        from twinkle.checkpoint_engine.delta.transport.pipeline import DeltaSyncMixin
 
         class LoopbackEngine(DeltaHCCLCheckpointEngine):
 
@@ -215,7 +217,7 @@ class RecordingSub:
 
 
 def apply_flush(state, named):
-    from twinkle.checkpoint_engine.delta.decode import decode_delta_wire
+    from twinkle.checkpoint_engine.delta.protocol.decode import decode_delta_wire
     _enc, patches = decode_delta_wire(named)  # includes the checksum check
     for p in patches:
         if p.positions is None:
@@ -236,7 +238,7 @@ def receiver_main(cfg, ep_q, res_q):
         _install_stand_ins(lambda r: LoopComm(), build_log)
         import zmq
 
-        from twinkle.checkpoint_engine.delta.hccl_receiver import (build_delta_hccl_communicator,
+        from twinkle.checkpoint_engine.delta.rollout.hccl_receiver import (build_delta_hccl_communicator,
                                                                    pump_hccl_delta_session)
         from twinkle.checkpoint_engine.zmq_pubsub import connect_subscriber
         time.sleep(cfg.get('start_delay', 0))

@@ -7,8 +7,8 @@ import asyncio
 import pytest
 import torch
 
-from twinkle.checkpoint_engine.delta.engine import DeltaShardedCheckpointEngine
-from twinkle.checkpoint_engine.delta.pipeline import DeltaSyncMixin
+from twinkle.checkpoint_engine.delta.transport.nccl_engine import DeltaShardedCheckpointEngine
+from twinkle.checkpoint_engine.delta.transport.pipeline import DeltaSyncMixin
 from twinkle.checkpoint_engine.nccl_checkpoint_engine import NCCLCheckpointEngine
 
 METRIC_KEYS = {

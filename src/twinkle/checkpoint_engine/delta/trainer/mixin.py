@@ -10,8 +10,8 @@ from typing import Any
 import torch.distributed as dist
 
 from twinkle import Platform, remote_function
-from .config import DeltaMasterMetadata, DeltaSyncConfig, DeltaTrainerMetadata, DeltaTransportEndpoint
-from .platform import DELTA_DEVICES, resolve_delta_engine_cls
+from ..config import DeltaMasterMetadata, DeltaSyncConfig, DeltaTrainerMetadata, DeltaTransportEndpoint
+from ..platform import DELTA_DEVICES, resolve_delta_engine_cls
 
 
 class DeltaTrainerMixin:

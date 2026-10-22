@@ -120,7 +120,7 @@ def decode_delta_payload(
 ) -> tuple[str, list[CheckpointWeightPatch]]:
     """Validate and decode one DeltaFlush into vLLM checkpoint patches."""
 
-    from twinkle.checkpoint_engine.delta.decode import decode_delta_wire
+    from twinkle.checkpoint_engine.delta.protocol.decode import decode_delta_wire
 
     CheckpointWeightPatch, _ = _checkpoint_patch_api()
     encoding, patches = decode_delta_wire(named_tensors)
@@ -186,7 +186,7 @@ class TwinkleDeltaIPCWeightTransferEngine(WeightTransferEngine):
         self._session_encoding = None
 
     def _receive_payload(self, *, zmq_handle: str) -> list[tuple[str, torch.Tensor]]:
-        from twinkle.sampler.vllm_sampler.bucketed_weight_transfer import (
+        from twinkle.sampler.vllm_sampler.delta.cuda_ipc import (
             BucketedWeightReceiver,
         )
 
@@ -217,7 +217,7 @@ class TwinkleDeltaIPCWeightTransferEngine(WeightTransferEngine):
 
     def _decode_and_apply(self, payload: list[tuple[str, torch.Tensor]]) -> None:
         """Decode one flush's named tensors into checkpoint patches and apply them."""
-        from twinkle.sampler.vllm_sampler.weight_update_utils import (
+        from twinkle.sampler.vllm_sampler.delta.weight_update_utils import (
             drop_tied_alias_patches,
             prepare_sparse_weight_loaders,
         )
@@ -277,7 +277,7 @@ class TwinkleDeltaIPCWeightTransferEngine(WeightTransferEngine):
         elif self._session_encoding == "indices":
             # Sparse patches only write source parameters; re-derive runtime copies that
             # process_weights_after_loading would have rebuilt (e.g. Ascend packed conv1d).
-            from twinkle.sampler.vllm_sampler.weight_update_utils import (
+            from twinkle.sampler.vllm_sampler.delta.weight_update_utils import (
                 refresh_derived_weights,
             )
 
@@ -366,7 +366,7 @@ class TwinkleDeltaHCCLWeightTransferEngine(TwinkleDeltaIPCWeightTransferEngine):
 
     def _ensure_channel(self, group_rank: int):
         """Create (once) and return the (manifest SUB, communicator) pair, SUB first."""
-        from twinkle.checkpoint_engine.delta.hccl_receiver import build_delta_hccl_communicator
+        from twinkle.checkpoint_engine.delta.rollout.hccl_receiver import build_delta_hccl_communicator
         from twinkle.checkpoint_engine.zmq_pubsub import connect_subscriber
 
         if self._comm is None:
@@ -389,7 +389,7 @@ class TwinkleDeltaHCCLWeightTransferEngine(TwinkleDeltaIPCWeightTransferEngine):
         return self._manifest_sub, self._comm
 
     def receive_weights(self, update_info: TwinkleDeltaHCCLUpdateInfo) -> None:
-        from twinkle.checkpoint_engine.delta.hccl_receiver import pump_hccl_delta_session
+        from twinkle.checkpoint_engine.delta.rollout.hccl_receiver import pump_hccl_delta_session
 
         try:
             sub, comm = self._ensure_channel(update_info.group_rank)

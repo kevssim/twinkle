@@ -9,7 +9,7 @@ from collections.abc import Iterator
 
 import torch
 
-from ..nccl_checkpoint_engine import MasterMetadata, NCCLCheckpointEngine, _pg_broadcast
+from ...nccl_checkpoint_engine import MasterMetadata, NCCLCheckpointEngine, _pg_broadcast
 from twinkle.utils.network import find_free_port
 # Re-exported for callers that import the pipeline internals from this module.
 from .pipeline import (  # noqa: F401

@@ -379,12 +379,12 @@ class VLLMEngine(BaseSamplerEngine):
         if backend == 'twinkle_delta_ipc':
             engine_config.setdefault('enable_sleep_mode', True)
             self.enable_sleep_mode = engine_config['enable_sleep_mode']
-            from .delta_weight_transfer import register_twinkle_delta_weight_transfer_engine, require_vllm_delta_support
+            from .delta.transfer_engine import register_twinkle_delta_weight_transfer_engine, require_vllm_delta_support
             require_vllm_delta_support()
             register_twinkle_delta_weight_transfer_engine()
         elif backend == 'twinkle_delta_hccl':
             # Ascend NPU: sleep mode stays opt-in (engine_args / enable_sleep_mode), it is not forced on here.
-            from .delta_weight_transfer import (register_twinkle_delta_hccl_weight_transfer_engine,
+            from .delta.transfer_engine import (register_twinkle_delta_hccl_weight_transfer_engine,
                                                 require_vllm_delta_support)
             require_vllm_delta_support()
             register_twinkle_delta_hccl_weight_transfer_engine()

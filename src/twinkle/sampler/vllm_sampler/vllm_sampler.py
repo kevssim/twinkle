@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional, Type, Union
 
 from twinkle import DeviceMesh, get_logger, remote_class, remote_function, requires
 from twinkle.checkpoint_engine import CheckpointEngineMixin
-from twinkle.checkpoint_engine.delta.rollout import DeltaSamplerMixin
+from twinkle.checkpoint_engine.delta.rollout.mixin import DeltaSamplerMixin
 from twinkle.data_format import (InputFeature, PoolingParams, PoolingResponse, SampledSequence, SampleResponse,
                                  SamplingParams, Trajectory)
 from twinkle.exceptions import FullWeightLoadError

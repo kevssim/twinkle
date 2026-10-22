@@ -8,7 +8,8 @@ from unittest.mock import AsyncMock, Mock, call
 import pytest
 import torch
 
-from twinkle.checkpoint_engine.delta.rollout import CudaDeltaReceiver, DeltaSamplerMixin
+from twinkle.checkpoint_engine.delta.rollout.cuda_receiver import CudaDeltaReceiver
+from twinkle.checkpoint_engine.delta.rollout.mixin import DeltaSamplerMixin
 from twinkle.sampler.vllm_sampler.vllm_engine import VLLMEngine
 from twinkle.sampler.vllm_sampler.vllm_worker_extension import _cuda_visible_device
 
@@ -97,7 +98,7 @@ def test_without_kv_release_pause_and_resume_still_run():
 
 
 def test_checkpoint_receiver_keeps_flush_on_local_gpu_until_ipc(monkeypatch):
-    from twinkle.checkpoint_engine.delta import rollout as delta_rollout
+    from twinkle.checkpoint_engine.delta.rollout import cuda_receiver as delta_rollout
     engine = Mock()
     tensors = [('__values__', torch.zeros(2))]
     engine.receive_weights.return_value = iter([(tensors, True)])
@@ -106,7 +107,7 @@ def test_checkpoint_receiver_keeps_flush_on_local_gpu_until_ipc(monkeypatch):
     monkeypatch.setattr(torch.cuda, 'get_device_properties', Mock(return_value=SimpleNamespace(uuid='GPU-test')))
     monkeypatch.setenv('CUDA_VISIBLE_DEVICES', '3')
     sender = SimpleNamespace(async_send_weights=AsyncMock())
-    module = ModuleType('twinkle.sampler.vllm_sampler.bucketed_weight_transfer')
+    module = ModuleType('twinkle.sampler.vllm_sampler.delta.cuda_ipc')
     module.BucketedWeightSender = Mock(return_value=sender)
     monkeypatch.setitem(sys.modules, module.__name__, module)
     config = SimpleNamespace(bucket_bytes=64 << 20)
@@ -122,7 +123,7 @@ def test_checkpoint_receiver_keeps_flush_on_local_gpu_until_ipc(monkeypatch):
 
 
 def test_receiver_binds_gpu_before_cuda_initialization(monkeypatch):
-    from twinkle.checkpoint_engine.delta import rollout as delta_rollout
+    from twinkle.checkpoint_engine.delta.rollout import cuda_receiver as delta_rollout
     import os
 
     monkeypatch.setenv('CUDA_VISIBLE_DEVICES', '')
@@ -136,7 +137,7 @@ def test_receiver_binds_gpu_before_cuda_initialization(monkeypatch):
 
 
 def test_receiver_rejects_gpu_mismatch_before_joining_group(monkeypatch):
-    from twinkle.checkpoint_engine.delta import rollout as delta_rollout
+    from twinkle.checkpoint_engine.delta.rollout import cuda_receiver as delta_rollout
 
     monkeypatch.setenv('CUDA_VISIBLE_DEVICES', '3')
     monkeypatch.setattr(torch.cuda, 'set_device', Mock())

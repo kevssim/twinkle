@@ -30,8 +30,8 @@ import torch
 import zmq
 
 from .gather import gather_slot_entries_to_rank0
-from .wire import DeltaFlush, DeltaParam
-from .wire import checksum as _checksum
+from ..protocol.wire import DeltaFlush, DeltaParam
+from ..protocol.wire import checksum as _checksum
 
 logger = logging.getLogger(__name__)
 

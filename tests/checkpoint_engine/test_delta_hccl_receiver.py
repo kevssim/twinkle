@@ -11,9 +11,9 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from twinkle.checkpoint_engine.delta import hccl_receiver
-from twinkle.checkpoint_engine.delta.decode import DeltaPatch, decode_delta_wire
-from twinkle.checkpoint_engine.delta.wire import checksum
+from twinkle.checkpoint_engine.delta.rollout import hccl_receiver
+from twinkle.checkpoint_engine.delta.protocol.decode import DeltaPatch, decode_delta_wire
+from twinkle.checkpoint_engine.delta.protocol.wire import checksum
 
 from .test_delta_vllm import adapter, named_flush  # noqa: F401  (adapter is a fixture)
 
@@ -356,11 +356,11 @@ def _update(adapter, rank=1):
 
 
 def test_receive_sparse_session_prepares_sparse_loaders(hccl, monkeypatch):
-    utils = sys.modules.get('twinkle.sampler.vllm_sampler.weight_update_utils')
+    utils = sys.modules.get('twinkle.sampler.vllm_sampler.delta.weight_update_utils')
     prepare = Mock()
     drop = Mock(side_effect=lambda model, patches: patches)
     refresh = Mock(return_value=0)
-    monkeypatch.setitem(sys.modules, 'twinkle.sampler.vllm_sampler.weight_update_utils',
+    monkeypatch.setitem(sys.modules, 'twinkle.sampler.vllm_sampler.delta.weight_update_utils',
                         SimpleNamespace(prepare_sparse_weight_loaders=prepare, drop_tied_alias_patches=drop,
                                         refresh_derived_weights=refresh))
     engine = hccl_engine(hccl.adapter)
@@ -484,7 +484,7 @@ def test_register_hccl_engine_once(adapter, monkeypatch):
 @pytest.fixture
 def worker_cls(adapter, monkeypatch):
     from twinkle.sampler.vllm_sampler import vllm_worker_extension as ext
-    monkeypatch.setitem(sys.modules, 'twinkle.sampler.vllm_sampler.delta_weight_transfer', adapter)
+    monkeypatch.setitem(sys.modules, 'twinkle.sampler.vllm_sampler.delta.transfer_engine', adapter)
     monkeypatch.setattr(ext, 'set_death_signal', Mock())
     import twinkle.patch.vllm_lora_weights as lora
     monkeypatch.setattr(lora, 'VLLMLoraWeights', lambda: (lambda _: None))
@@ -560,7 +560,7 @@ def test_update_twinkle_delta_weights_rejects_short_list(worker_cls):
 
 # --------------------------------------------------------------------------- (e) import hygiene
 def test_import_without_npu_modules():
-    code = ("import sys, twinkle.checkpoint_engine.delta.hccl_receiver, twinkle.checkpoint_engine.delta.decode;"
+    code = ("import sys, twinkle.checkpoint_engine.delta.rollout.hccl_receiver, twinkle.checkpoint_engine.delta.protocol.decode;"
             "print('torch_npu' in sys.modules, 'vllm_ascend' in sys.modules)")
     out = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True, check=True).stdout
     assert out.split() == ['False', 'False']

@@ -16,11 +16,11 @@ from torch.distributed.device_mesh import DeviceMesh as TorchMesh
 from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_tensor
 
 from twinkle import DeviceMesh, Platform
-from twinkle.checkpoint_engine.delta.backends import FSDP2DeltaBackend
-from twinkle.checkpoint_engine.delta.backends.fsdp import validate_fsdp2
-from twinkle.checkpoint_engine.delta.engine import DeltaShardedCheckpointEngine, _GatherQueue
-from twinkle.checkpoint_engine.delta.export import shard_delta_indices
-from twinkle.checkpoint_engine.delta.trainer import DeltaTrainerMixin
+from twinkle.checkpoint_engine.delta.trainer.backends import FSDP2DeltaBackend
+from twinkle.checkpoint_engine.delta.trainer.backends.fsdp import validate_fsdp2
+from twinkle.checkpoint_engine.delta.transport.nccl_engine import DeltaShardedCheckpointEngine, _GatherQueue
+from twinkle.checkpoint_engine.delta.trainer.export import shard_delta_indices
+from twinkle.checkpoint_engine.delta.trainer.mixin import DeltaTrainerMixin
 from twinkle.model.transformers.strategy.native_fsdp import NativeFSDPStrategy
 
 
@@ -56,7 +56,7 @@ def test_shard_delta_indices_no_change_is_empty():
 def test_derive_dtensor_placement_unsharded():
     # A non-DTensor (replicated / unsharded) param: offset 0, no gather group,
     # and outside a process group rank 0 is assumed -> contributes.
-    from twinkle.checkpoint_engine.delta.spec import ShardSpec, derive_dtensor_placement
+    from twinkle.checkpoint_engine.delta.trainer.spec import ShardSpec, derive_dtensor_placement
 
     t = torch.randn(64, 8, dtype=torch.bfloat16)
     spec = ShardSpec.from_param(t)
@@ -72,7 +72,7 @@ def test_gather_slot_entries_sub_rounds_world1():
 
     import torch.distributed as dist
 
-    from twinkle.checkpoint_engine.delta.gather import gather_slot_entries_to_rank0
+    from twinkle.checkpoint_engine.delta.transport.gather import gather_slot_entries_to_rank0
 
     owns_pg = not dist.is_initialized()
     if owns_pg:
@@ -107,8 +107,8 @@ def test_prime_then_hf_delta_export_roundtrip():
     shards; a later pass through hf_delta_export yields a final-HF-coordinate
     entry with exactly the changed elements and refreshes the snapshot (a
     second delta pass yields a zero-count entry)."""
-    from twinkle.checkpoint_engine.delta.spec import ShardSpec
-    from twinkle.checkpoint_engine.delta.export import _hf_entry_identity, hf_delta_export, prime_delta_snapshots
+    from twinkle.checkpoint_engine.delta.trainer.spec import ShardSpec
+    from twinkle.checkpoint_engine.delta.trainer.export import _hf_entry_identity, hf_delta_export, prime_delta_snapshots
 
     w = torch.arange(12, dtype=torch.float32)
     spec = ShardSpec(full_shape=(12,))
@@ -140,8 +140,8 @@ def test_hf_delta_export_requires_seed():
     garbage."""
     import pytest
 
-    from twinkle.checkpoint_engine.delta.spec import ShardSpec
-    from twinkle.checkpoint_engine.delta.export import _hf_entry_identity, hf_delta_export
+    from twinkle.checkpoint_engine.delta.trainer.spec import ShardSpec
+    from twinkle.checkpoint_engine.delta.trainer.export import _hf_entry_identity, hf_delta_export
 
     def raw():
         yield "w", torch.zeros(4), ShardSpec(full_shape=(4,))
@@ -183,7 +183,7 @@ def test_single_rank_trainer_accepts_unsharded_model(fsdp_owner):
 
 
 def test_single_rank_trainer_uses_rank_zero_without_process_group(monkeypatch):
-    from twinkle.checkpoint_engine.delta import trainer as delta_trainer
+    from twinkle.checkpoint_engine.delta.trainer import mixin as delta_trainer
     monkeypatch.setattr(delta_trainer.dist, 'is_initialized', lambda: False)
     assert FSDPDeltaTrainer._delta_rank() == 0
     trainer = FSDPDeltaTrainer()
@@ -275,7 +275,7 @@ def test_full_sync_baseline_uses_same_hf_key_conversion():
 
 
 def test_snapshot_pinning_can_be_disabled(monkeypatch):
-    from twinkle.checkpoint_engine.delta.backends import base as backend_base
+    from twinkle.checkpoint_engine.delta.trainer.backends import base as backend_base
     prime = Mock()
     monkeypatch.setattr(backend_base, 'prime_delta_snapshots', prime)
     exporter = make_delta_trainer(SimpleNamespace(_delta_device='cuda', _delta_pin_snapshots=False))
@@ -360,7 +360,7 @@ def test_trainer_prepare_reuses_engine_between_workflow_rounds():
 
 def test_trainer_validation_failure_releases_metadata_group(monkeypatch):
     from twinkle.checkpoint_engine.delta import DeltaSyncConfig
-    from twinkle.checkpoint_engine.delta import trainer as delta_trainer
+    from twinkle.checkpoint_engine.delta.trainer import mixin as delta_trainer
 
     trainer = FSDPDeltaTrainer()
     group = object()

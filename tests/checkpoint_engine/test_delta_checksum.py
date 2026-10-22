@@ -12,8 +12,8 @@ from types import ModuleType
 import pytest
 import torch
 
-from twinkle.checkpoint_engine.delta import wire
-from twinkle.checkpoint_engine.delta.wire import checksum
+from twinkle.checkpoint_engine.delta.protocol import wire
+from twinkle.checkpoint_engine.delta.protocol.wire import checksum
 
 MASK = (1 << 64) - 1
 
@@ -124,7 +124,7 @@ def adapter(monkeypatch):
         module = ModuleType(name)
         module.__dict__.update(fields)
         monkeypatch.setitem(sys.modules, name, module)
-    path = Path(__file__).parents[2] / 'src/twinkle/sampler/vllm_sampler/delta_weight_transfer.py'
+    path = Path(__file__).parents[2] / 'src/twinkle/sampler/vllm_sampler/delta/transfer_engine.py'
     spec = importlib.util.spec_from_file_location('_twinkle_delta_checksum_adapter_test', path)
     module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, spec.name, module)

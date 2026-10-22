@@ -119,16 +119,16 @@ class TwinkleWorkerExtension:
         VLLMLoraWeights()(None)
         config = getattr(kwargs.get('vllm_config'), 'weight_transfer_config', None)
         if getattr(config, 'backend', None) == 'twinkle_delta_ipc':
-            from .delta_weight_transfer import register_twinkle_delta_weight_transfer_engine
+            from .delta.transfer_engine import register_twinkle_delta_weight_transfer_engine
             register_twinkle_delta_weight_transfer_engine()
         elif getattr(config, 'backend', None) == 'twinkle_delta_hccl':
-            from .delta_weight_transfer import register_twinkle_delta_hccl_weight_transfer_engine
+            from .delta.transfer_engine import register_twinkle_delta_hccl_weight_transfer_engine
             register_twinkle_delta_hccl_weight_transfer_engine()
 
         return super().__new__(cls)
 
     def validate_delta_worker(self) -> 'DeltaWorkerCapabilities':
-        from .delta_weight_transfer import TwinkleDeltaIPCWeightTransferEngine, is_moe_model
+        from .delta.transfer_engine import TwinkleDeltaIPCWeightTransferEngine, is_moe_model
         engine = getattr(self, 'weight_transfer_engine', None)
         if not isinstance(engine, TwinkleDeltaIPCWeightTransferEngine):
             raise RuntimeError("Delta sync requires engine_args['weight_transfer_config'] when constructing the "
@@ -184,7 +184,7 @@ class TwinkleWorkerExtension:
 
     def shutdown_delta_weight_transfer(self) -> None:
         """Release the delta engine's transport channel (HCCL SUB + communicator); no-op for other engines."""
-        from .delta_weight_transfer import TwinkleDeltaIPCWeightTransferEngine
+        from .delta.transfer_engine import TwinkleDeltaIPCWeightTransferEngine
         engine = getattr(self, 'weight_transfer_engine', None)
         if isinstance(engine, TwinkleDeltaIPCWeightTransferEngine):
             engine.shutdown()

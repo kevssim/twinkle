@@ -11,8 +11,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from twinkle.checkpoint_engine.delta import hccl_engine as mod
-from twinkle.checkpoint_engine.delta.hccl_engine import DeltaHCCLCheckpointEngine
+from twinkle.checkpoint_engine.delta.transport import hccl_engine as mod
+from twinkle.checkpoint_engine.delta.transport.hccl_engine import DeltaHCCLCheckpointEngine
 from twinkle.checkpoint_engine.hccl_checkpoint_engine import MasterMetadata
 
 from .test_delta_pipeline import FakeTrainingEngine
@@ -103,7 +103,7 @@ def run(e, eng):
 
 
 def test_import_without_npu_modules():
-    code = ("import sys, twinkle.checkpoint_engine.delta.hccl_engine as m;"
+    code = ("import sys, twinkle.checkpoint_engine.delta.transport.hccl_engine as m;"
             "print('torch_npu' in sys.modules, 'vllm_ascend' in sys.modules)")
     out = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True, check=True).stdout
     assert out.split() == ['False', 'False']

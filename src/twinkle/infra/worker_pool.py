@@ -57,7 +57,7 @@ class WorkerPool:
         state = self.__dict__.copy()
         if hasattr(self, '_actors'):
             # 远程 payload 处理只需要原生 handler 的可序列化元数据；准入和在途状态仍归原 driver。
-            for key in ('_worker_lock', '_continous_work_state', '_sampler_workers', '_generation_owners',
+            for key in ('_worker_lock', '_continous_work_state', '_sampler_workers',
                         '_suspended_workers', '_paused_generation_workers', '_creating_slots', '_worker_factory',
                         '_worker_configurations'):
                 state.pop(key, None)
@@ -83,7 +83,6 @@ class WorkerPool:
         if not hasattr(self, '_worker_lock'):
             self._worker_lock = threading.RLock()
         self._sampler_workers = {}
-        self._generation_owners = {}
         self._suspended_workers = set()
         self._paused_generation_workers = set()
         self._creating_slots = set()
@@ -154,8 +153,7 @@ class WorkerPool:
     def _worker_call_conflicts(self, current_method, pending_method, worker_id):
         if not hasattr(self, '_sampler_workers') or pending_method != 'sample':
             return True
-        controls = ('pause_generation', 'resume_generation', 'abort_all_inflight', '_get_generation_status',
-                    '_cancel_generation', '_cancel_all_generations', '_generation_count')
+        controls = ('pause_generation', 'resume_generation', 'abort_all_inflight', '_generation_count')
         return (current_method not in controls
                 and worker_id not in getattr(self, '_paused_generation_workers', ()))
 
@@ -285,9 +283,6 @@ class WorkerPool:
             self._admission_closed = True
 
     def worker_inflight(self, worker_ids):
-        reap = getattr(self, '_reap_generation_owners', None)
-        if reap is not None:
-            reap()
         with self._worker_lock:
             return tuple(self._sampler_workers[worker_id].inflight for worker_id in worker_ids)
 
@@ -299,9 +294,6 @@ class WorkerPool:
         """只检查控制状态，不通过读取生成输出判断 actor 是否可以退役。"""
         import ray
         worker_ids = tuple(worker_ids)
-        reap = getattr(self, '_reap_generation_owners', None)
-        if reap is not None:
-            reap()
         with self._worker_lock:
             if any(self._sampler_workers[worker_id].inflight or self._sampler_workers[worker_id].dispatching
                    for worker_id in worker_ids):
@@ -425,10 +417,6 @@ class WorkerPool:
                         self._sampler_workers.pop(worker_id, None)
                     self._suspended_workers.difference_update(worker_ids)
                     self._paused_generation_workers.difference_update(worker_ids)
-                    if hasattr(self, '_generation_owners'):
-                        self._generation_owners = {
-                            key: owner for key, owner in self._generation_owners.items() if owner.worker_id not in worker_ids
-                        }
                 state = getattr(self, '_continous_work_state', None)
                 if state is not None:
                     with state['lock']:
@@ -448,7 +436,7 @@ class WorkerPool:
         if hasattr(self, '_sampler_workers'):
             self.close_admission()
         try:
-            cancel = getattr(self, 'cancel_all_generations', None)
+            cancel = getattr(self, 'abort_all_inflight', None)
             if self._actors and cancel is not None:
                 cancel()
         finally:

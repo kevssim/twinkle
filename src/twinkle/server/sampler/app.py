@@ -177,7 +177,7 @@ class SamplerManagement(LazyCleanupMixin, TaskQueueMixin):
     async def shutdown(self) -> None:
         self.sampling_guard.close()
         try:
-            cancel_all = getattr(self.sampler, 'cancel_all_generations', None)
+            cancel_all = getattr(self.sampler, 'abort_all_inflight', None)
             if callable(cancel_all):
                 await self.call_backend(cancel_all, admit=False)
         finally:

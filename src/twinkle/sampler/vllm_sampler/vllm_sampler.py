@@ -19,7 +19,6 @@ from twinkle.patch import Patch, apply_patch
 from twinkle.patch.vllm_lora_weights import VLLMLoraWeights
 from twinkle.perf import timed
 from twinkle.sampler.base import Sampler
-from twinkle.sampler.generation_submission import GenerationSubmissionMixin
 from twinkle.sampler.partial_rollout import PartialRolloutMixin
 from twinkle.utils import Platform
 
@@ -82,7 +81,7 @@ SAMPLER_MAX_CONCURRENCY = max(1, int(os.environ.get('TWINKLE_SAMPLER_MAX_CONCURR
 
 
 @remote_class(max_concurrency=SAMPLER_MAX_CONCURRENCY)
-class vLLMSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, PartialRolloutMixin, DeltaSamplerMixin):
+class vLLMSampler(Sampler, CheckpointEngineMixin, PartialRolloutMixin, DeltaSamplerMixin):
     """A vLLM-based sampler using VLLMEngine (AsyncLLM).
 
     This sampler automatically configures vLLM based on available GPUs.
@@ -119,10 +118,6 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, Par
         self._async_loop = asyncio.new_event_loop()
         self._async_thread = threading.Thread(target=self._run_event_loop, daemon=True, name='vLLMSampler-EventLoop')
         self._async_thread.start()
-
-        # In-flight non-blocking generations keyed by submission id (GenerationSubmissionMixin). Each
-        # entry is a concurrent.futures.Future scheduled on ``self._async_loop`` above.
-        self._generation_submissions: Dict[str, Any] = {}
 
         # Engine request ids currently mid-generation (PartialRolloutMixin), so an in-place weight republish
         # can abort them and let each resume on the fresh weights. Only touched from ``self._async_loop``.
@@ -437,8 +432,8 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, Par
               aligned with them on every rank.
         """
         # One sampling path: the blocking sample is the async core driven to completion on the loop. The
-        # non-blocking submit_generation (GenerationSubmissionMixin) schedules the SAME coroutine and
-        # collects it later, so an overlapped RL rollout and a plain blocking call cannot drift.
+        # non-blocking ``submit`` schedules the SAME coroutine on this loop and hands back a Future, so
+        # an overlapped RL rollout and a plain blocking call cannot drift.
         return self._run_in_loop(
             self._generate_inputs(
                 inputs,
@@ -463,11 +458,11 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, Par
         allow_partial_rollout: bool = False,
         token_only: bool = False,
     ) -> List[SampleResponse]:
-        """The async generation core shared by the blocking :meth:`sample` and :meth:`submit_generation`.
+        """The async generation core shared by the blocking :meth:`sample` and the non-blocking ``submit``.
 
-        ``sample`` drives this coroutine to completion on the background loop; ``submit_generation``
-        (GenerationSubmissionMixin) schedules the very same coroutine and collects it later, so an
-        overlapped RL rollout and a plain blocking call cannot drift apart. LoRA is resolved with the
+        ``sample`` drives this coroutine to completion on the background loop; ``submit`` schedules the
+        very same coroutine and hands back a Future, so an overlapped RL rollout and a plain blocking
+        call cannot drift apart. LoRA is resolved with the
         async ``_aload_lora`` rather than the blocking ``_load_lora`` because this already runs inside
         the event loop -- ``_load_lora`` would call ``_run_in_loop`` and deadlock on itself.
 

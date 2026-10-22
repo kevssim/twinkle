@@ -321,6 +321,24 @@ class ServerLauncher:
         flush_telemetry_safely()
 
 
+def _warn_public_unauthenticated(config: ServerConfig) -> None:
+    """Loudly flag a 0.0.0.0 listener with no gateway ``api_key`` anywhere.
+
+    Every inference route would be reachable without credentials from any host that
+    can route to this machine -- the advisory class where an open deployment becomes
+    free compute plus an internal-network pivot. Keeping the check here (the single
+    launch choke point) covers YAML and programmatic configs alike.
+    """
+    if config.http_options.host != '0.0.0.0':
+        return
+    if any(app.import_path == 'server' and getattr(app.args, 'api_key', None)
+           for app in config.applications):
+        return
+    logger.warning('server binds 0.0.0.0:%s with no api_key configured on any gateway application: '
+                   'every route is reachable unauthenticated by any network peer. Set ServerArgs.api_key '
+                   '(--api_key) or bind a non-public host.', config.http_options.port)
+
+
 def launch_server(
     config: ServerConfig | None = None,
     config_path: str | Path | None = None,
@@ -350,6 +368,8 @@ def launch_server(
         # ``FileNotFoundError`` / ``ConfigParseError`` / ``pydantic.ValidationError``
         # propagate so the caller can surface a precise message.
         config = ServerConfig.from_yaml(config_path)
+
+    _warn_public_unauthenticated(config)
 
     launcher = ServerLauncher(
         config=config,

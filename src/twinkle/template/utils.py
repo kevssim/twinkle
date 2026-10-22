@@ -47,6 +47,7 @@ def _load_image(img: Any) -> Optional[Any]:
     """Load images to PIL format."""
     import io
     from PIL import Image
+    from twinkle.utils.safe_media import checked_media_path, safe_http_get
 
     if img is None:
         return None
@@ -54,12 +55,13 @@ def _load_image(img: Any) -> Optional[Any]:
         return img
     elif isinstance(img, str):
         if img.startswith(('http://', 'https://')):
-            import requests
-            resp = requests.get(img, timeout=30)
-            resp.raise_for_status()
+            # safe_http_get refuses non-public targets (private nets, loopback, cloud
+            # metadata) and re-validates every redirect hop: a URL from a dataset row or
+            # a serving request must not turn this process into an SSRF pivot.
+            resp = safe_http_get(img, timeout=30)
             return Image.open(io.BytesIO(resp.content))
         else:
-            return Image.open(img)
+            return Image.open(checked_media_path(img))
     elif isinstance(img, bytes):
         return Image.open(io.BytesIO(img))
     elif isinstance(img, dict) and 'bytes' in img:

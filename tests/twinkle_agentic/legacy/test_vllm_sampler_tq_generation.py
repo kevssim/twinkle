@@ -10,7 +10,6 @@ from concurrent.futures import Future
 from twinkle import DeviceMesh
 from twinkle.data_format import SampledSequence, SampleResponse, SamplingParams
 from twinkle.infra import _dispatch_args
-from twinkle.server.sampler.twinkle_handlers import _await_generation
 from twinkle_agentic.async_rl import LoraContext
 from twinkle_agentic.async_rl.types import PartitionAdmission, PromptGroup, RolloutPolicy
 from twinkle_agentic.async_rl.generation_submissions import _dispatch_generation
@@ -221,92 +220,6 @@ def test_native_prompt_group_sampling_requires_context_manager() -> None:
 
     with pytest.raises(RuntimeError, match='context_manager is required'):
         sampler.submit_prompt_groups([], SamplingParams(max_tokens=4))
-
-
-class _DirectGenerationService:
-
-    def __init__(self, sampler):
-        self.sampler = sampler
-
-    async def call_backend(self, fn, /, *args, **kwargs):
-        return await asyncio.to_thread(fn, *args, **kwargs)
-
-
-def test_server_waiter_admits_later_submission_before_first_finishes() -> None:
-
-    class Sampler:
-
-        def __init__(self):
-            self.futures: dict[str, Future] = {}
-            self.submission_order = []
-
-        def submit_generation(self, submission_id, *_args, **_kwargs):
-            self.submission_order.append(submission_id)
-            self.futures[submission_id] = Future()
-
-        def get_generation_status(self, submission_id):
-            future = self.futures[submission_id]
-            return {'status': 'completed' if future.done() else 'running'}
-
-        def collect_generation(self, submission_id):
-            return self.futures[submission_id].result()
-
-        def cancel_generation(self, submission_id):
-            self.futures.pop(submission_id, None)
-
-    sampler = Sampler()
-    service = _DirectGenerationService(sampler)
-
-    async def run():
-        sampler.submit_generation('first')
-        sampler.submit_generation('second')
-        first = asyncio.create_task(_await_generation(service, 'first'))
-        second = asyncio.create_task(_await_generation(service, 'second'))
-        while len(sampler.submission_order) < 2:
-            await asyncio.sleep(0)
-        assert not first.done()
-        sampler.futures['second'].set_result(['short'])
-        assert await second == ['short']
-        assert not first.done()
-        sampler.futures['first'].set_result(['long'])
-        assert await first == ['long']
-
-    asyncio.run(run())
-    assert set(sampler.submission_order) == {'first', 'second'}
-
-
-def test_server_waiter_retries_cancelled_status_poll() -> None:
-    from ray.exceptions import TaskCancelledError
-
-    class Sampler:
-
-        def __init__(self):
-            self.status_calls = 0
-            self.cancelled = False
-
-        def submit_generation(self, *_args, **_kwargs):
-            return None
-
-        def get_generation_status(self, _submission_id):
-            self.status_calls += 1
-            if self.status_calls == 1:
-                raise TaskCancelledError()
-            return {'status': 'completed'}
-
-        def collect_generation(self, _submission_id):
-            return ['completed']
-
-        def cancel_generation(self, _submission_id):
-            self.cancelled = True
-
-    sampler = Sampler()
-    sampler.submit_generation('submission')
-    service = _DirectGenerationService(sampler)
-    result = asyncio.run(_await_generation(service, 'submission'))
-
-    assert result == ['completed']
-    assert sampler.status_calls == 2
-    assert not sampler.cancelled
 
 
 def test_sampler_dp_dispatch_slices_complete_groups_without_duplication():

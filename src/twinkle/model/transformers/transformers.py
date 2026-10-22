@@ -394,6 +394,10 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
             self.hf_config = model_loader.process_config(model_loader.build_config(model_id))
         else:
             from transformers import AutoConfig
+            # Fallback path (no ModelLoader): this config load may execute the checkpoint's own
+            # Python. State it loudly -- the same advisory class as a hardcoded trust_remote_code.
+            logger.warning_once('loading %s with trust_remote_code=True: the checkpoint\'s own Python code '
+                                'will execute inside this process. Only use checkpoints you trust.', model_id)
             self.hf_config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
         if model_cls is None and hasattr(self.hf_config, 'architectures'):
             model_cls = self.hf_config.architectures[0]
@@ -2365,9 +2369,14 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         optimizer_config.scaler_has_nan = scaler_state.get('scaler_has_nan', False)
 
     def _get_training_rng_state(self):
+        # numpy's state tuple carries int64 scalars and an ndarray, which torch's
+        # weights_only unpickler refuses; storing the key as a plain list keeps the
+        # whole file loadable with weights_only=True (np.random.set_state accepts it).
+        numpy_name, numpy_key, numpy_pos, numpy_has_gauss, numpy_cached = np.random.get_state()
         state = {
             'python_rng_state': random.getstate(),
-            'numpy_rng_state': np.random.get_state(),
+            'numpy_rng_state': (numpy_name, numpy_key.tolist(), int(numpy_pos), int(numpy_has_gauss),
+                                float(numpy_cached)),
             'torch_rng_state': torch.get_rng_state(),
         }
 
@@ -2382,7 +2391,16 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         return state
 
     def _load_rng_state(self, rng_path):
-        rng_state = torch.load(rng_path, map_location='cpu', weights_only=False)
+        try:
+            rng_state = torch.load(rng_path, map_location='cpu', weights_only=True)
+        except Exception:
+            # Pre-hardening checkpoints stored numpy scalars/arrays, which the safe
+            # unpickler refuses. RNG state only affects run-to-run reproducibility, so
+            # the recovery is to drop it rather than fall back to unrestricted pickle.
+            raise ValueError(
+                f'{rng_path} is not loadable in weights-only mode (likely a pre-hardening checkpoint '
+                'carrying numpy rng objects). Delete the file and resume: only exact RNG replay is '
+                'lost, training correctness is unaffected.') from None
         random.setstate(rng_state['python_rng_state'])
         np.random.set_state(rng_state['numpy_rng_state'])
         torch.set_rng_state(rng_state['torch_rng_state'])

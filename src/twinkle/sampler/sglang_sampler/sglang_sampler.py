@@ -18,7 +18,6 @@ from twinkle.hub import HubOperation
 from twinkle.patch import Patch, apply_patch
 from twinkle.perf import timed
 from twinkle.sampler.base import Sampler
-from twinkle.sampler.generation_submission import GenerationSubmissionMixin
 from twinkle.sampler.partial_rollout import PartialRolloutMixin
 from twinkle.utils import Platform
 
@@ -43,7 +42,7 @@ def _convert_ndarray_to_list(obj: Any) -> Any:
 
 
 @remote_class()
-class SGLangSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, PartialRolloutMixin):
+class SGLangSampler(Sampler, CheckpointEngineMixin, PartialRolloutMixin):
     """An sglang-based sampler using :class:`SGLangEngine`.
 
     Mirrors :class:`vLLMSampler`: tensor parallelism is taken from the visible devices unless given
@@ -91,10 +90,6 @@ class SGLangSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, P
         self._async_loop = asyncio.new_event_loop()
         self._async_thread = threading.Thread(target=self._run_event_loop, daemon=True, name='SGLangSampler-EventLoop')
         self._async_thread.start()
-
-        # In-flight non-blocking generations keyed by submission id (GenerationSubmissionMixin). Each
-        # entry is a concurrent.futures.Future scheduled on ``self._async_loop`` above.
-        self._generation_submissions: Dict[str, Any] = {}
 
         # Engine request ids currently mid-generation (PartialRolloutMixin), so an in-place weight republish
         # can abort them and let each resume on the fresh weights. Only touched from ``self._async_loop``.
@@ -283,8 +278,8 @@ class SGLangSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, P
             ``adapter_paths`` is a list too and is sliced in lockstep, staying aligned with ``inputs``.
         """
         # One sampling path: the blocking sample is the async core driven to completion on the loop. The
-        # non-blocking submit_generation (GenerationSubmissionMixin) schedules the SAME coroutine and
-        # collects it later, so an overlapped RL rollout and a plain blocking call cannot drift.
+        # non-blocking ``submit`` schedules the SAME coroutine on this loop and hands back a Future, so
+        # an overlapped RL rollout and a plain blocking call cannot drift.
         return self._run_in_loop(
             self._generate_inputs(
                 inputs,
@@ -305,7 +300,7 @@ class SGLangSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, P
         adapter_paths: Optional[List[Optional[str]]] = None,
         allow_partial_rollout: bool = False,
     ) -> List[SampleResponse]:
-        """The async generation core shared by the blocking :meth:`sample` and :meth:`submit_generation`.
+        """The async generation core shared by the blocking :meth:`sample` and the non-blocking ``submit``.
 
         Mirrors :meth:`vLLMSampler._generate_inputs`. Adapters are registered with the async
         ``_aregister_lora`` rather than the blocking ``_register_lora`` because this already runs inside

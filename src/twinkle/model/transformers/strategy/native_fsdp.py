@@ -283,7 +283,9 @@ class NativeFSDPStrategy(TransformerStrategyBase):
 
         from twinkle.model.state_dict_utils import remap_optimizer_state_names
         if not self.needs_wrapped_optimizer_state():
-            optim_state = torch.load(input_path, map_location='cpu', weights_only=False)
+            # weights_only=True: optimizer state is tensors + plain containers (verified), so a
+            # hostile checkpoint's pickle payload never reaches an unrestricted unpickler.
+            optim_state = torch.load(input_path, map_location='cpu', weights_only=True)
             remap_optimizer_state_names(optim_state, param_name_mapping or {})
             optimizer.load_state_dict(optim_state)
             return

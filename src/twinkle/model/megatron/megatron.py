@@ -171,6 +171,11 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
             self.hf_config = model_loader.process_config(model_loader.build_config(self._model_path))
         else:
             from transformers import AutoConfig
+            # Fallback path (no ModelLoader): this config load may execute the checkpoint's own
+            # Python. State it loudly -- the same advisory class as a hardcoded trust_remote_code.
+            logger.warning_once('loading %s with trust_remote_code=True: the checkpoint\'s own Python code '
+                                'will execute inside this process. Only use checkpoints you trust.',
+                                self._model_path)
             self.hf_config = AutoConfig.from_pretrained(self._model_path, trust_remote_code=True)
         if new_special_tokens:
             self._extend_vocab_for_new_special_tokens(new_special_tokens)

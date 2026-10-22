@@ -3,7 +3,7 @@ import asyncio
 import uuid
 import zlib
 from abc import ABC, abstractmethod
-from concurrent.futures import InvalidStateError, Future
+from concurrent.futures import Future
 from peft import PeftConfig
 from typing import Any, List, Optional, Type, Union
 
@@ -182,63 +182,12 @@ class Sampler(ABC):
     # ------------------------------------------------------------------
     # 异步三件套：submit / pause / stop
     # ------------------------------------------------------------------
-    def _submit_in_loop(self, coro, *, submission_id=None) -> Future:
-        """把协程挂到引擎后台事件循环；无 id 时直接返回本线程可等待的 Future。
+    def _submit_in_loop(self, coro) -> Future:
+        """把协程挂到引擎后台事件循环，交回本线程可等待的 Future。
 
         引擎侧异步簿记（事件循环调度与 Future 传递），不是跨调用状态：请求结束 Future 即完成。
         """
-        if submission_id is None:
-            return asyncio.run_coroutine_threadsafe(coro, self._async_loop)
-
-        future = Future()
-
-        def completed(task):
-            self._running_generation_submissions.discard(submission_id)
-            if task.cancelled():
-                future.cancel()
-                return
-            error = task.exception()
-            try:
-                if error is None:
-                    future.set_result(task.result())
-                else:
-                    future.set_exception(error)
-            except InvalidStateError:
-                # Future 的取消可先于 Task 的清理完成；仍须取出 Task 的异常。
-                pass
-
-        async def schedule():
-            try:
-                task = self._async_loop.create_task(coro)
-            except BaseException:
-                coro.close()
-                raise
-            self._running_generation_submissions.add(submission_id)
-            task.add_done_callback(completed)
-
-            def cancel_task():
-                if not task.done() and not task.cancelling():
-                    task.cancel()
-
-            def cancellation_requested(result):
-                if result.cancelled() and not task.done():
-                    self._async_loop.call_soon_threadsafe(cancel_task)
-
-            future.add_done_callback(cancellation_requested)
-
-        scheduling = schedule()
-        try:
-            scheduled = asyncio.run_coroutine_threadsafe(scheduling, self._async_loop)
-        except BaseException:
-            scheduling.close()
-            coro.close()
-            raise
-        try:
-            scheduled.result()
-        except BaseException:
-            future.cancel()
-            raise
-        return future
+        return asyncio.run_coroutine_threadsafe(coro, self._async_loop)
 
     @staticmethod
     async def _gather_generation_tasks(coroutines):

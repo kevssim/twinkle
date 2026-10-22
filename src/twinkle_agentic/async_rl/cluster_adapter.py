@@ -963,7 +963,7 @@ class ClusterAdapter:
                 except Exception:
                     pass
             try:
-                self.sampler.cancel_all_generations()
+                self.sampler.abort_all_inflight()
             finally:
                 self.reclaim()
         finally:

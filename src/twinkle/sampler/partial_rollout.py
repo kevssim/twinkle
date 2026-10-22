@@ -155,6 +155,16 @@ class PartialRolloutMixin:
         future = asyncio.run_coroutine_threadsafe(self._abort_all_inflight(), self._async_loop)
         return {'aborted': future.result()}
 
+    @remote_function(dispatch='all', collect='none', lazy_collect=False)
+    def _generation_count(self):
+        """Idle probe input: in-flight engine requests plus active partial-rollout loops on this worker.
+
+        Read by ``WorkerPool.workers_idle`` (driver side) to decide whether an actor can retire; the
+        broadcast is exempted from the cw barrier via the control list there.
+        """
+        return (len(getattr(self, '_inflight_request_ids', ()))
+                + getattr(self, '_active_partial_rollouts', 0))
+
     def _ensure_pause_state(self) -> None:
         if getattr(self, '_generation_resume_gate', None) is None:
             self._generation_resume_gate = asyncio.Event()

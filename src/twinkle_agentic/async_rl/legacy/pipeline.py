@@ -11,10 +11,11 @@ from pydoc import locate
 from typing import Any, Sequence
 
 from twinkle.metric import MetricRecord, MetricsReporter, create_metrics_reporter
-from .context_manager import LoraContextManager
+from twinkle_agentic.async_rl.context_manager import LoraContextManager
 from .data_plane import TQDataPlane
 from .scheduler import ContextSchedulePolicy, SchedulerConfig
-from .types import LoraContext, PartitionAdmission
+from twinkle_agentic.async_rl.legacy.types import LoraContext
+from twinkle_agentic.async_rl.types import PartitionAdmission
 from .utils import (TrainBatchConfig, build_native_fsdp_model_kwargs, configure_lora_lr_scheduler,
                     resolve_context_learning_rate, resolve_context_lora_target_modules, resolve_context_loss_config,
                     resolve_model_attention_implementation, resolve_sequence_parallel_size, sampler_data_parallel_size,

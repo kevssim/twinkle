@@ -268,7 +268,7 @@ class RLContextManager:
         """Whether the producer must stop reading new prompts.
 
         A global train limit closes admission only. Existing live partitions
-        remain available to AdvantageWorker and TrainerWorker until drained.
+        remain readable by the rollout side until drained.
         """
         return self._stop_requested or all(state.status is not ContextStatus.ACTIVE
                                            for state in self._contexts.values())

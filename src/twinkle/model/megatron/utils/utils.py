@@ -1,15 +1,9 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Module-walking helpers for Megatron keyword expansion (``all-*`` target names)."""
 from __future__ import annotations
 
 
 def _find_layers(model, cond_fn):
-    """Every full mcore module path under ``model`` satisfying ``cond_fn(name, module)``.
-
-    Shared by the ``all-*`` keyword expansion for both ``target_modules`` and ``modules_to_save``, so the
-    two keep one definition of "walk the real modules" (the expansion runs worker-side, where the real
-    modules live -- the driver only holds a sharded PROXY).
-    """
+    """Every full mcore module path under ``model`` satisfying ``cond_fn(name, module)``."""
     return [name for name, module in model.named_modules() if cond_fn(name, module)]
 
 

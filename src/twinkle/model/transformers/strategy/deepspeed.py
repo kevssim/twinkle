@@ -1,15 +1,4 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""DeepSpeed training strategy for twinkle.
-
-A peer of ``AccelerateStrategy`` and ``NativeFSDPStrategy``. All DeepSpeed
-logic is self-contained here — the existing strategies are not modified.
-
-Design: construct ``DeepSpeedPlugin`` + ``Accelerator`` in ``__init__``.
-``wrap_model`` applies ZeRO-3 compatibility patches (from
-``twinkle.patch.deepspeed_patches``) around ``accelerator.prepare``.
-``get_full_state_dict`` / ``gather_parameters`` use DeepSpeed's
-``GatheredParameters`` for ZeRO-3 parameter gathering.
-"""
 import os
 from contextlib import nullcontext
 from datetime import timedelta
@@ -81,10 +70,6 @@ class DeepSpeedStrategy(TransformerStrategyBase):
             return DeepSpeedPlugin(hf_ds_config=config)
 
     # -- state queries ------------------------------------------------------
-
-    @property
-    def is_deepspeed_enabled(self) -> bool:
-        return True
 
     def is_zero_stage(self, stage: int) -> bool:
         cfg = self._deepspeed_plugin.deepspeed_config

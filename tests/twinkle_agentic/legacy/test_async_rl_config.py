@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from twinkle_agentic.async_rl.legacy.pipeline import _reward_for_context
-from twinkle_agentic.async_rl.legacy.utils import (
+from twinkle_agentic.async_rl.pipeline import _reward_for_context
+from twinkle_agentic.async_rl.utils import (
     TrainBatchConfig,
     build_native_fsdp_model_kwargs,
     configure_lora_lr_scheduler,

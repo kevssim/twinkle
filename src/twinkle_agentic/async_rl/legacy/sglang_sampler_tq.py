@@ -3,8 +3,8 @@
 
 The sglang counterpart of :class:`VLLMSamplerTQ`. It adds no native TransferQueue rollout path -- only
 the client/server data-plane path is served here -- so it is just :class:`SGLangSampler` plus the shared
-async-submission capability (``submit_generation`` / ``get_generation_status`` /
-``collect_generation`` / ``cancel_generation``) and the one engine-specific coroutine that capability calls,
+:class:`GenerationSubmissionMixin` quartet (``submit_generation`` / ``get_generation_status`` /
+``collect_generation`` / ``cancel_generation``) and the one engine-specific coroutine that mixin calls,
 :meth:`_generate_inputs`. That makes ``sampler_type='sglang_async'`` able to back
 ``/twinkle/sample_to_data_plane``, which plain ``sglang`` cannot because it has no ``submit_generation``.
 """
@@ -17,15 +17,18 @@ from typing import Any
 from twinkle import remote_class
 from twinkle.data_format import SampleResponse, SamplingParams
 from twinkle.sampler.sglang_sampler import SGLangSampler
+from .generation_submissions import GenerationSubmissionMixin
 
 
 @remote_class()
-class SGLangSamplerTQ(SGLangSampler):
+class SGLangSamplerTQ(SGLangSampler, GenerationSubmissionMixin):
     """:class:`SGLangSampler` that admits generations without blocking the Ray actor.
 
-    The submit/poll/collect/cancel quartet arrives from the async-submission capability attached to
-    ``SGLangSampler`` by ``remote_class``; this class supplies only the ``_generation_submissions`` map
-    and the sglang-specific ``_generate_inputs`` (``_async_loop`` is inherited from ``SGLangSampler``).
+    The quartet lives in :class:`GenerationSubmissionMixin`; this class only supplies ``_async_loop``
+    (inherited from ``SGLangSampler``), the ``_generation_submissions`` map, and the sglang-specific
+    ``_generate_inputs``. ``SGLangSampler`` already mixes in the (re-exported, single-identity) mixin, so
+    it MUST stay ahead of the explicit mixin base here: listing the mixin first would repeat a base the
+    other parent already inherits and fail C3 linearisation at import.
     """
 
     def __init__(self, *args, **kwargs):

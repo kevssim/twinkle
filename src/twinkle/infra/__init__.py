@@ -1,56 +1,37 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""twinkle infrastructure: driver-side dispatch to Ray workers.
+"""Twinkle infrastructure: process-level state, ``initialize``, and the remote-call re-exports.
 
-This package re-exports its public surface; the implementation lives in focused
-modules:
-
-- ``dispatch``: the ``remote_class`` / ``remote_function`` decorators, argument
-  dispatch and result collection.
-- ``continuous_work``: the ``enable_continous_work`` ledger, barriers and the
-  worker-side async companions, plus actor identity helpers.
-- ``ray_tasks``: ``remote_map``, short-lived CPU task fan-out.
-- ``collectors``: cross-worker result aggregation for tensor outputs.
-- ``_torch_setup``: per-process torch init knobs (seed / determinism / tf32).
-- ``_ray``: Ray resource placement and the execute/collect helpers.
-
-Process-wide state (mode, device groups, device mesh, notifier) is defined here
-and owned by :func:`initialize`; ``dispatch`` reads it through this module at
-call time, so ``infra._mode``-style access and ``initialize`` keep one owner.
+This package keeps the process-level knobs (mode, lazy-collect policy, device groups/mesh,
+notifier) together with :func:`initialize`, the sanctioned setup seam. The dispatch decorators
+live in ``.dispatch`` and the continuous-work protocol in ``.continuous_work``; both read the
+globals above through this module object at call time, so a later ``initialize`` is honoured.
 """
 import json
 import os
 from typing import Any, Dict, List, Literal, Optional
 
 import numpy as np
-
 from twinkle.notifier import Notifier
-from twinkle.utils import DeviceGroup, DeviceMesh, Platform, requires
+from twinkle.utils import DeviceGroup, DeviceMesh, Platform, get_logger, requires
+
 from . import _torch_setup
 from .collectors import collect_dp_and_flatten, collect_tensor_dict
-from .continuous_work import _cw_drop_locked, _cw_unregister, _select_workers, get_worker_id
-from .dispatch import (_dispatch_args, _get_device_mesh_param_name, get_device_placement, remote_class,
-                       remote_function)
-from .ray_tasks import remote_map
-from twinkle.utils.lazy_collect import set_lazy_collect
-from .worker_pool import with_worker_pool
+from .continuous_work import _cw_barrier, _cw_drop_locked, _cw_unregister, _get_workers, _select_workers, \
+    get_worker_id
+from .dispatch import _collect_func, _dispatch_args, _get_device_mesh_param_name, _prepare_lazy_collect, \
+    remote_class, remote_function, remote_map
 
-__all__ = [
-    'initialize',
-    'get_mode',
-    'get_device_mesh',
-    'get_device_placement',
-    'remote_class',
-    'remote_function',
-    'remote_map',
-    'get_worker_id',
-    'collect_dp_and_flatten',
-    'collect_tensor_dict',
-]
+__all__ = ['collect_dp_and_flatten', 'collect_tensor_dict', 'get_device_mesh', 'get_device_placement', 'get_mode',
+           'get_worker_id', 'initialize', 'remote_class', 'remote_function', 'remote_map']
+
+logger = get_logger()
 
 _mode: Optional[Literal['local', 'ray']] = 'local'
 
 if os.environ.get('TWINKLE_MODE', 'local') == 'ray':
     _mode = 'ray'
+
+_lazy_collect = True
 
 # Torch process-global init knobs (seed / determinism / tf32), bundled into one dict so a new knob never
 # means a new initialize()/create_workers() argument or a new env var. Each only takes effect in the
@@ -116,11 +97,11 @@ def initialize(mode: Literal['local', 'ray'] = 'local',
             method raises. The original exception is always re-raised; the
             notifier is best-effort and its own failures are swallowed.
     """
-    global _mode, _device_group, _extra_torch_kwargs, _device_mesh, _name, _notifier
+    global _mode, _device_group, _extra_torch_kwargs, _lazy_collect, _device_mesh, _name, _notifier
     assert mode in ('local', 'ray')
     _mode = mode
     _name = name
-    set_lazy_collect(lazy_collect)
+    _lazy_collect = lazy_collect
     _notifier = notifier
     if name is not None:
         os.environ['TWINKLE_NAME'] = name
@@ -151,7 +132,8 @@ def initialize(mode: Literal['local', 'ray'] = 'local',
             _device_mesh = DeviceMesh(
                 device_type=Platform.device_prefix(),
                 mesh=np.arange(Platform.get_world_size()),
-                mesh_dim_names=('dp', ))
+                mesh_dim_names=('dp', ),
+            )
 
         assert Platform.get_world_size() == _device_mesh.world_size
     else:
@@ -168,11 +150,12 @@ def get_device_mesh() -> Optional[DeviceMesh]:
     """The global default device mesh set by ``initialize`` (None before init).
 
     A ``@remote_class`` model receives this mesh automatically: its wrapped ``__init__`` injects it
-    whenever the caller passes ``device_mesh=None`` (see ``_new_init_body``). A model that builds
-    *outside* that wrapper -- one overriding ``__init__`` rather than inheriting the wrapped base --
-    resolves its mesh through this accessor to uphold the same invariant: a constructed model holds a
-    real mesh, so the InputProcessor / OptimizerGroup it builds get proper DP placement instead of
-    silently degrading to single-rank loss normalisation and no metric aggregation.
+    whenever the caller passes ``device_mesh=None`` (see the dispatch module's ``_new_init_body``).
+    A model that builds *outside* that wrapper -- one overriding ``__init__`` rather than inheriting
+    the wrapped base -- resolves its mesh through this accessor to uphold the same invariant: a
+    constructed model holds a real mesh, so the InputProcessor / OptimizerGroup it builds get proper
+    DP placement instead of silently degrading to single-rank loss normalisation and no metric
+    aggregation.
     """
     return _device_mesh
 
@@ -187,3 +170,139 @@ def get_mode() -> Optional[Literal['local', 'ray']]:
     would reach into a private global, so this is the sanctioned seam.
     """
     return _mode
+
+
+def get_device_placement(device_group=None) -> str:
+    """Get the device placement graph, can be used to show the training topology.
+
+    Args:
+        device_group: The device group of the training, default will use the global `device_group`.
+
+    Returns:
+        A string containing the training topology.
+    """
+    if device_group is None:
+        device_group = _device_group
+
+    if device_group is None:
+        return 'No device group provided.'
+
+    WIDTH = 80
+
+    def box_line(content='', align='left', prefix='│', suffix='│'):
+        inner_width = WIDTH - 4
+        if align == 'center':
+            text = content.center(inner_width)
+        else:
+            text = content.ljust(inner_width)
+        return f'{prefix} {text} {suffix}'
+
+    def header_box(title):
+        return [
+            '╔' + '═' * (WIDTH - 2) + '╗',
+            box_line(title, align='center', prefix='║', suffix='║'),
+            '╚' + '═' * (WIDTH - 2) + '╝',
+        ]
+
+    def section_top(title=''):
+        lines = ['┌' + '─' * (WIDTH - 2) + '┐']
+        if title:
+            lines.append(box_line(f'◈ {title}', prefix='│', suffix='│'))
+            lines.append('├' + '─' * (WIDTH - 2) + '┤')
+        return lines
+
+    def section_bottom():
+        return ['└' + '─' * (WIDTH - 2) + '┘']
+
+    def format_ranks(ranks):
+        if isinstance(ranks, list):
+            if len(ranks) <= 16:
+                return str(ranks)
+            return f'{ranks[:6]} ... {ranks[-3:]} ({len(ranks)} total)'
+        return str(ranks)
+
+    def render_mesh_grid(mesh_array, dim_names):
+        """Render a compact mesh visualization."""
+        lines = []
+
+        if mesh_array.ndim == 1:
+            mesh_array = mesh_array.reshape(1, -1)
+
+        if mesh_array.ndim > 2:
+            lines.append(box_line(f'    ⊞ High-dim mesh: shape={mesh_array.shape}'))
+            return lines
+
+        rows, cols = mesh_array.shape
+        max_rows, max_cols = 6, 10
+        show_rows, show_cols = min(rows, max_rows), min(cols, max_cols)
+
+        cell_w = max(4, len(str(mesh_array.max())) + 2)
+
+        header = '      ' + ''.join(f'{i:^{cell_w}}' for i in range(show_cols))
+        if cols > max_cols:
+            header += ' ⋯'
+        lines.append(box_line(f'    {header}'))
+
+        # Top border
+        border = '      ╭' + '─' * (cell_w * show_cols + show_cols - 1) + '╮'
+        lines.append(box_line(f'    {border}'))
+
+        # Data rows
+        for r in range(show_rows):
+            row_data = '│'.join(f'{mesh_array[r, c]:^{cell_w}}' for c in range(show_cols))
+            row_str = f'   {r:>2} │{row_data}│'
+            if cols > max_cols:
+                row_str += ' ⋯'
+            lines.append(box_line(f'    {row_str}'))
+
+        if rows > max_rows:
+            lines.append(box_line(f"         {'⋮':^{cell_w * show_cols}}"))
+
+        # Bottom border
+        border = '      ╰' + '─' * (cell_w * show_cols + show_cols - 1) + '╯'
+        lines.append(box_line(f'    {border}'))
+
+        return lines
+
+    # Build output
+    lines = header_box('DEVICE PLACEMENT TOPOLOGY')
+    lines.append('')
+
+    for group in device_group:
+        lines.extend(section_top(f'DeviceGroup: {group.name}'))
+        lines.append(box_line(f'  ├─ Device Type : {group.device_type}'))
+        lines.append(box_line(f'  └─ Ranks       : {format_ranks(group.ranks)}'))
+
+        if not group._device_mesh:
+            lines.append(box_line(''))
+            lines.append(box_line('  (No device meshes configured)', align='center'))
+        else:
+            for mesh_name, mesh in group._device_mesh.items():
+                lines.append(box_line(''))
+                lines.append(box_line(f'  ┌─ DeviceMesh: {mesh_name}'))
+
+                # Dimensions
+                if mesh.mesh_dim_names:
+                    dim_info = ' × '.join(f'{name}={size}' for name, size in zip(mesh.mesh_dim_names, mesh.mesh.shape))
+                    lines.append(box_line(f'  │  Dimensions : {dim_info}'))
+
+                # Active parallelism
+                parallelism = []
+                for dim in ['pp', 'dp', 'tp', 'ep', 'sp', 'cp', 'fsdp']:
+                    ws = mesh._get_world_size_for_dim(dim)
+                    if ws is not None and ws > 1:
+                        parallelism.append(f'{dim.upper()}={ws}')
+
+                if parallelism:
+                    lines.append(box_line(f"  │  Parallelism: {', '.join(parallelism)}"))
+
+                # Mesh layout
+                lines.append(box_line(f'  │'))
+                lines.append(box_line(f'  └─ Mesh Layout:'))
+                lines.extend(render_mesh_grid(mesh.mesh, mesh.mesh_dim_names or []))
+
+        lines.append(box_line(''))
+        lines.extend(section_bottom())
+        lines.append('')
+
+    return '\n' + '\n'.join(lines)

@@ -1,33 +1,35 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""The remote-dispatch mechanism: ``remote_class`` / ``remote_function`` and their helpers.
+"""Remote-call declaration and dispatch: the ``remote_class``/``remote_function`` decorators.
 
-This module owns how a decorated call travels from driver to workers: worker
-selection, argument dispatch (slice / slice_dp / all / callable), result
-collection, and the driver-side orchestration around continuous work. Process-wide
-state (mode, device groups, notifier) lives in ``twinkle.infra`` and is read
-through the ``infra`` module reference at call time, so ``initialize`` keeps
-single ownership of it.
+The wrapper decides, from the decorator's declaration and the process mode, whether a call runs
+locally, is re-dispatched inside a worker, or fans out from the driver to the actors; it also
+applies collect semantics and the lazy-collect policy. Process-level knobs (_mode, _lazy_collect,
+notifier...) stay in ``twinkle.infra`` and are read through the module object at call time, so a
+later ``initialize`` is always honoured -- a ``from``-import would freeze the value at import time.
 """
 import functools
 import inspect
 import os
 import sys
-from typing import Any, Callable, List, Literal, Optional, TypeVar, Union
+from concurrent.futures import Future
+from typing import Any, Callable, Dict, List, Literal, Optional, TypeVar, Union
 
 import numpy as np
-
-from twinkle import infra
 from twinkle.notifier import notify_exception
-from twinkle.utils import DeviceMesh, Platform, check_unsafe, get_logger
-from . import _torch_setup
-from .continuous_work import (_WORKER_ASYNC_PREFIX, _cw_barrier, _cw_batch_len, _cw_register, _cw_unregister,
-                              _run_continous_work, _select_workers, get_worker_id, _make_worker_async_companion)
-from twinkle.utils.lazy_collect import get_lazy_collect
-from .worker_pool import with_worker_pool
+from twinkle.utils import DeviceGroup, DeviceMesh, Platform, check_unsafe, get_logger
+
+from .continuous_work import _WORKER_ASYNC_PREFIX, _cw_barrier, _cw_batch_len, _cw_register, _cw_unregister, \
+    _get_workers, _make_worker_async_companion, _resolve_sticky_key, _run_continous_work, _select_workers, \
+    _sticky_bind, _sticky_lookup, get_worker_id
 
 logger = get_logger()
 
 T1 = TypeVar('T1', bound=object)
+
+
+def _infra():
+    """The ``twinkle.infra`` module object, for reading its process-level globals at call time."""
+    return sys.modules['twinkle.infra']
 
 
 def _capture_caller() -> Optional[str]:
@@ -52,155 +54,6 @@ def _tag_exc(exc: BaseException, caller: Optional[str]) -> None:
             exc._twinkle_caller_augmented = True
     except Exception:  # noqa
         pass
-
-
-def _get_workers(workers, execute):
-    if not workers:
-        return []
-    if execute == 'first':
-        return [workers[0]]
-    elif execute == 'all':
-        return workers
-    elif execute == 'peer':
-        return workers[Platform.get_peer_index(len(workers))]
-    else:
-        raise ValueError(f'Unsupported execute method: {execute}')
-
-
-def get_device_placement(device_group=None) -> str:
-    """Get the device placement graph, can be used to show the training topology.
-
-    Args:
-        device_group: The device group of the training, default will use the global `device_group`.
-
-    Returns:
-        A string containing the training topology.
-    """
-    if device_group is None:
-        device_group = infra._device_group
-
-    if device_group is None:
-        return 'No device group provided.'
-
-    WIDTH = 80
-
-    def box_line(content='', align='left', prefix='│', suffix='│'):
-        inner_width = WIDTH - 4
-        if align == 'center':
-            text = content.center(inner_width)
-        else:
-            text = content.ljust(inner_width)
-        return f'{prefix} {text} {suffix}'
-
-    def header_box(title):
-        return [
-            '╔' + '═' * (WIDTH - 2) + '╗',
-            box_line(title, align='center', prefix='║', suffix='║'),
-            '╚' + '═' * (WIDTH - 2) + '╝',
-        ]
-
-    def section_top(title=''):
-        lines = ['┌' + '─' * (WIDTH - 2) + '┐']
-        if title:
-            lines.append(box_line(f'◈ {title}', prefix='│', suffix='│'))
-            lines.append('├' + '─' * (WIDTH - 2) + '┤')
-        return lines
-
-    def section_bottom():
-        return ['└' + '─' * (WIDTH - 2) + '┘']
-
-    def format_ranks(ranks):
-        if isinstance(ranks, list):
-            if len(ranks) <= 16:
-                return str(ranks)
-            return f'{ranks[:6]} ... {ranks[-3:]} ({len(ranks)} total)'
-        return str(ranks)
-
-    def render_mesh_grid(mesh_array, dim_names):
-        """Render a compact mesh visualization."""
-        lines = []
-
-        if mesh_array.ndim == 1:
-            mesh_array = mesh_array.reshape(1, -1)
-
-        if mesh_array.ndim > 2:
-            lines.append(box_line(f'    ⊞ High-dim mesh: shape={mesh_array.shape}'))
-            return lines
-
-        rows, cols = mesh_array.shape
-        max_rows, max_cols = 6, 10
-        show_rows, show_cols = min(rows, max_rows), min(cols, max_cols)
-
-        cell_w = max(4, len(str(mesh_array.max())) + 2)
-
-        header = '      ' + ''.join(f'{i:^{cell_w}}' for i in range(show_cols))
-        if cols > max_cols:
-            header += ' ⋯'
-        lines.append(box_line(f'    {header}'))
-
-        # Top border
-        border = '      ╭' + '─' * (cell_w * show_cols + show_cols - 1) + '╮'
-        lines.append(box_line(f'    {border}'))
-
-        # Data rows
-        for r in range(show_rows):
-            row_data = '│'.join(f'{mesh_array[r, c]:^{cell_w}}' for c in range(show_cols))
-            row_str = f'   {r:>2} │{row_data}│'
-            if cols > max_cols:
-                row_str += ' ⋯'
-            lines.append(box_line(f'    {row_str}'))
-
-        if rows > max_rows:
-            lines.append(box_line(f"         {'⋮':^{cell_w * show_cols}}"))
-
-        # Bottom border
-        border = '      ╰' + '─' * (cell_w * show_cols + show_cols - 1) + '╯'
-        lines.append(box_line(f'    {border}'))
-
-        return lines
-
-    # Build output
-    lines = header_box('DEVICE PLACEMENT TOPOLOGY')
-    lines.append('')
-
-    for group in device_group:
-        lines.extend(section_top(f'DeviceGroup: {group.name}'))
-        lines.append(box_line(f'  ├─ Device Type : {group.device_type}'))
-        lines.append(box_line(f'  └─ Ranks       : {format_ranks(group.ranks)}'))
-
-        if not group._device_mesh:
-            lines.append(box_line(''))
-            lines.append(box_line('  (No device meshes configured)', align='center'))
-        else:
-            for mesh_name, mesh in group._device_mesh.items():
-                lines.append(box_line(''))
-                lines.append(box_line(f'  ┌─ DeviceMesh: {mesh_name}'))
-
-                # Dimensions
-                if mesh.mesh_dim_names:
-                    dim_info = ' × '.join(f'{name}={size}' for name, size in zip(mesh.mesh_dim_names, mesh.mesh.shape))
-                    lines.append(box_line(f'  │  Dimensions : {dim_info}'))
-
-                # Active parallelism
-                parallelism = []
-                for dim in ['pp', 'dp', 'tp', 'ep', 'sp', 'cp', 'fsdp']:
-                    ws = mesh._get_world_size_for_dim(dim)
-                    if ws is not None and ws > 1:
-                        parallelism.append(f'{dim.upper()}={ws}')
-
-                if parallelism:
-                    lines.append(box_line(f"  │  Parallelism: {', '.join(parallelism)}"))
-
-                # Mesh layout
-                lines.append(box_line('  │'))
-                lines.append(box_line('  └─ Mesh Layout:'))
-                lines.extend(render_mesh_grid(mesh.mesh, mesh.mesh_dim_names or []))
-
-        lines.append(box_line(''))
-        lines.extend(section_bottom())
-        lines.append('')
-
-    return '\n' + '\n'.join(lines)
 
 
 def _collect_func(method: Union[Literal['none', 'flatten', 'mean', 'sum', 'first', 'last_pp'], Callable],
@@ -424,13 +277,12 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all', max_concurren
     """
 
     def decorator(cls):
-        # A class that declares a pool domain (any of the *_METHODS class attributes)
-        # gets the worker-pool facade attached here, before the method scan, so its
-        # injected methods are collected like any other. Classes without a declaration
-        # are untouched -- this is the only way a component touches infra: two decorators.
-        if any(hasattr(cls, name) for name in ('_REPLAY_METHODS', '_PAUSE_METHODS', '_CONTROL_METHODS',
-                                               '_GENERATION_METHODS')):
-            with_worker_pool(cls)
+        # Mount the worker-pool elasticity contract (add_workers/configure_workers/...): the code
+        # lives in infra so the component class stays pure business, yet callers get plain method
+        # calls. Imported here rather than at module top: worker_pool imports this module's
+        # remote_function, and a load-time cycle would leave it half-initialised.
+        from .worker_pool import mount_worker_pool
+        mount_worker_pool(cls)
         # Give every continuous-work method its awaitable form on the class, so Ray
         # has something to await instead of a call that would sit on the actor's
         # event loop and make the others wait behind it.
@@ -450,14 +302,15 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all', max_concurren
             if _caller:
                 _ctx = f'{_ctx} <- {_caller}'
             try:
-                infra._maybe_load_worker_notifier()
+                _infra()._maybe_load_worker_notifier()
                 _new_init_body(self, _caller, *args, **kwargs)
             except Exception as _e:
                 _tag_exc(_e, _caller)
-                notify_exception(infra._notifier, _ctx, _e, infra._name)
+                notify_exception(_infra()._notifier, _ctx, _e, _infra()._name)
                 raise
 
         def _new_init_body(self, _caller, *args, **kwargs):
+            infra = _infra()
             if infra._mode == 'local':
                 # Get the actual device_mesh
                 device_mesh = _get_device_mesh_param(args, kwargs)
@@ -549,6 +402,7 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all', max_concurren
                     # os.environ.get('CLUSTER_NAME') == remote_group: a normal worker's init
                     # All per-process torch setup (seed / determinism / tf32 / the worker CUDA-env pins)
                     # is isolated in _torch_setup, so none of it leaks into the Ray dispatch logic here.
+                    from . import _torch_setup
                     _torch_setup.apply_in_worker(infra._extra_torch_kwargs)
                     if not device_mesh_name:
                         # pop the device_mesh
@@ -591,7 +445,7 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all', max_concurren
                         **kwargs_for_workers)
                     self._actors = _actors
                     # Recorded unconditionally (an actor-native elasticity input: re-running this
-                    # factory on a pre-reserved slot grows the replica set, see Sampler.add_workers);
+                    # factory on a pre-reserved slot grows the replica set, see the worker-pool mount);
                     # classes that need richer bookkeeping layer their own _save_worker_factory on top.
                     self._worker_factory = (cls, tuple(args), dict(kwargs_for_workers), infra._extra_torch_kwargs)
                     factory_recorder = getattr(self, '_save_worker_factory', None)
@@ -655,6 +509,24 @@ def remote_class(execute: Literal['first', 'peer', 'all'] = 'all', max_concurren
     return decorator
 
 
+def remote_map(func: Callable, args_list: List[tuple]) -> List[Any]:
+    """Fan a picklable function out over short-lived CPU tasks, returning results in input order.
+
+    Unlike remote_class/remote_function (which drive the resident training worker pool bound to
+    device groups), this serves stateless embarrassingly-parallel jobs: each tuple in ``args_list``
+    runs ``func(*tuple)`` on its own Ray CPU task. Starts a local head if no cluster is running.
+    """
+    if not args_list:
+        return []
+    import ray
+
+    if not ray.is_initialized():
+        from twinkle.server.launcher import build_ray_runtime_env
+        ray.init(runtime_env=build_ray_runtime_env(), ignore_reinit_error=True)
+    worker = ray.remote(func)
+    return ray.get([worker.remote(*args) for args in args_list])
+
+
 def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp_first'], Callable] = 'slice',
                     execute: Literal['first', 'peer', 'all'] = 'all',
                     collect: Union[Literal['none', 'flatten', 'mean', 'sum', 'first', 'last_pp'], Callable] = 'none',
@@ -662,6 +534,11 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
                     lazy_collect: Optional[bool] = None,
                     timeout: Optional[float] = None,
                     enable_continous_work: bool = False,
+                    sticky: bool = False,
+                    sticky_key: Optional[Union[str, Callable]] = None,
+                    exclusive: bool = False,
+                    control: bool = False,
+                    replay: bool = False,
                     worker_selector: Optional[str] = None):
     """Patch each method called from remote(which class should be decorated with `remote_class`) with this decorator.
 
@@ -705,14 +582,31 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
             need no collective between them -- data-parallel sampling, not a
             method with an all-reduce in it. While one such method has requests in
             flight, calling any other method on the same handle waits for them.
+        sticky: Pin each call to the worker that first served its key, so later calls
+            with the same key land on the same worker (request ownership / session
+            affinity). Requires ``sticky_key``.
+        sticky_key: The pinning key: a field-path string (read off the bound call's
+            arguments, no eval) or a callable taking the bound ``args``/``kwargs``.
+        exclusive: The method mutates shared worker state, so it takes the handle's
+            configuration lock: in-flight calls drain first, new ordinary calls
+            block until it finishes, and its own result is collected eagerly.
+        control: The method is a control-plane call (pause/stop/status): it stays
+            reachable while exclusive calls drain, and reuses a sticky request's
+            pinned worker instead of re-routing.
+        replay: Record the call so newly added workers replay it on mount
+            (configuration replay: template/adapter/patch setup).
         worker_selector: 可选的实例方法名，返回本次调用的稳定 actor ID 子集；
             显式传入的内部参数 ``_worker_ids`` 优先于该选择方法。
     """ # noqa
+    if sticky and sticky_key is None:
+        raise ValueError('remote_function(sticky=True) requires sticky_key (a field-path string or a callable).')
+
 
     def decorator(func: Callable[..., T1]) -> Callable[..., T1]:
 
         @functools.wraps(func)
         def wrapper(self, *args, **kwargs) -> T1:
+            infra = _infra()
             _ctx = f'{type(self).__name__}.{func.__name__}'
             # Only capture caller on driver side; worker frames are Ray internals
             _caller = _capture_caller() if hasattr(self, '_actors') else None
@@ -728,12 +622,32 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
                 nonlocal _worker_dispatching
                 if _worker_dispatching:
                     _worker_dispatching = False
-                    self._worker_pool.end_dispatch()
+                    self._end_worker_dispatch()
 
             try:
                 device_mesh = getattr(self, 'device_mesh', None)
                 worker_ids = kwargs.pop('_worker_ids', None)
                 dispatch_context = kwargs.pop('_dispatch_context', None)
+                # Sticky ownership: resolve the declared key once per call, on the driver only (the
+                # ownership table lives on the driver-side handler). A ``sticky`` call with an
+                # existing owner is pinned to that worker (request ownership); a ``control`` call
+                # reuses the same binding so pause/stop reach the worker actually running the
+                # request, and fails loudly when no such request is in flight. First-served calls
+                # bind their owner at submit time (see ``_track_submission``).
+                _sticky_key_value = (_resolve_sticky_key(sticky_key, func, args, kwargs)
+                                     if hasattr(self, '_actors') and (sticky or control) and worker_ids is None
+                                     else None)
+                if _sticky_key_value is not None:
+                    _owner = _sticky_lookup(self, _sticky_key_value)
+                    if _owner is not None:
+                        worker_ids = (_owner, )
+                    elif control and hasattr(self, '_actors'):
+                        # Ray driver only: the ownership table exists only there (bindings are made
+                        # by the driver-side submission tracking). In local mode there is no table
+                        # and no routing -- the call runs once on the local object, so a missing
+                        # owner is not an error.
+                        raise ValueError(f'{func.__name__}: no in-flight request for sticky key '
+                                         f'{_sticky_key_value!r}')
                 if infra._mode == 'local':
                     return func(self, *args, **kwargs)
                 elif infra._mode == 'ray':
@@ -753,13 +667,21 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
                             else:
                                 world_size, rank, subset = dispatch_context
                                 workers = [None] * world_size
-                                local_dispatch = (getattr(self, '_subset_dispatch', 'slice')
+                                local_dispatch = (getattr(self, '_dispatch_sampling_inputs', 'slice')
                                                   if subset and dispatch == 'slice_dp' else dispatch)
                                 local_mesh = None if subset else device_mesh
                             _workers_and_args = _dispatch_args(
                                 workers, local_dispatch, execute, local_mesh, args, kwargs)
                             _, args, kwargs = _workers_and_args[rank]
-                        return func(self, *args, **kwargs)
+                        result = func(self, *args, **kwargs)
+                        if isinstance(result, Future):
+                            # A worker method may hand back a plain Future (an engine-side async
+                            # submission). Waiting here makes the caller's reference come ready only
+                            # when that work truly finishes, which is what gives a lazily-collected
+                            # call its Future semantics; in local mode the same return goes to the
+                            # caller as-is, so both modes speak one contract with no probing.
+                            result = result.result()
+                        return result
                     else:
                         # This is the driver
                         from ._ray import RayHelper
@@ -772,15 +694,17 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
                         execute_method = RayHelper.execute_all_async if not sync else functools.partial(
                             RayHelper.execute_all_sync, timeout=_rgt)
                         _default_workers = worker_ids is None and worker_selector is None
-                        # One attachment point: a pool-backed component drives configuration
-                        # locking, reservation and bookkeeping through its WorkerPool.
-                        _pool = getattr(self, '_worker_pool', None)
-                        if _pool is not None:
-                            lock = _pool.configuration_lock(func.__name__)
+                        if exclusive:
+                            # Exclusive methods take the handle's configuration lock: in-flight calls
+                            # drain first and new ordinary calls wait (declared per-method instead of a
+                            # component-side lock-provider hook).
+                            lock = getattr(self, '_worker_lock', None)
                             if lock is not None:
                                 lock.acquire()
                                 _configuration_lock = lock
-                            _worker_reservation = _pool.begin_call(worker_ids, worker_selector)
+                        begin_call = getattr(self, '_begin_worker_call', None)
+                        if begin_call is not None:
+                            _worker_reservation = begin_call(worker_ids, worker_selector)
                             _worker_dispatching = _worker_reservation is not None
                         if _worker_reservation is not None:
                             selected_ids = _worker_reservation
@@ -794,18 +718,19 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
                         if not _workers:
                             return []
                         if _subset and worker_selector is not None:
-                            _subset_normalize = getattr(self, '_subset_normalize', None)
-                            if _subset_normalize is not None:
-                                args, kwargs = _subset_normalize(args, kwargs)
-                        _dispatch = (getattr(self, '_subset_dispatch', 'slice')
+                            args, kwargs = self._normalize_sampling_args(args, kwargs)
+                        _dispatch = (getattr(self, '_dispatch_sampling_inputs', 'slice')
                                      if _subset and dispatch == 'slice_dp' else dispatch)
                         _mesh = None if _subset else device_mesh
                         _concurrent_actor = bool(getattr(self, '_max_concurrency', None))
-                        _track_calls = _concurrent_actor or _subset or _worker_reservation is not None
-                        if _track_calls:
+                        _track_calls = (_concurrent_actor or _subset or _worker_reservation is not None
+                                        or _sticky_key_value is not None)
+                        if _track_calls and not control:
                             # Every method waits here, not just the continuous ones:
                             # the point is to keep a weight update or a sleep from
                             # reaching a worker that still has generations running.
+                            # Control calls are exempt: they are the ones that *end* those
+                            # generations, so waiting for them would be waiting on themselves.
                             _cw_barrier(self, func.__name__, _workers,
                                         materialize=not (_subset or _worker_reservation is not None))
                         if enable_continous_work and not RayHelper.has_ref(args, kwargs):
@@ -833,6 +758,9 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
 
                         def _track_submission(worker, result):
                             _submitted_calls.append((get_worker_id(worker), result))
+                            if sticky and _sticky_key_value is not None:
+                                # First worker to serve this key owns it from now on.
+                                _sticky_bind(self, _sticky_key_value, get_worker_id(worker))
                             _tracked_refs.extend(_cw_register(self, func.__name__, [result], [worker]))
 
                         # 配置后的 sampler 不持有选择锁等待同步 RPC 的结果。
@@ -844,12 +772,12 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
                         _finish_dispatch()
                         if _sync_sampler:
                             import ray
-                            result = ray.get(result, timeout=_rgt)
+                            result = ray.get(result)
                         # This is a result future, call it to get the actual result
                         result_func = RayHelper.do_get_and_collect_func(
                             _collect_func, collect, result, device_mesh, timeout=_rgt)
-                        _local_lazy_collect = get_lazy_collect()
-                        recorder = _pool.record_configuration if _pool is not None else None
+                        _local_lazy_collect = infra._lazy_collect
+                        recorder = getattr(self, '_record_worker_configuration', None)
                         if func.__name__ == '__iter__':
                             # return self
                             return self
@@ -902,10 +830,11 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
                             return _notifying_result_func
                         try:
                             output = result_func()
-                            if _pool is not None and _worker_reservation is not None:
-                                _pool.call_completed(func.__name__, _worker_reservation)
+                            completed = getattr(self, '_worker_call_completed', None)
+                            if completed is not None and _worker_reservation is not None:
+                                completed(func.__name__, _worker_reservation)
                             _call_completed = True
-                            if recorder is not None and _default_workers and _configuration_lock is not None:
+                            if recorder is not None and replay and _default_workers and _configuration_lock is not None:
                                 recorder(func.__name__, args, kwargs)
                             return output
                         finally:
@@ -923,10 +852,11 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
                     _finish_dispatch()
                     if _worker_reservation is not None:
                         try:
-                            if not _call_completed and _pool is not None:
-                                _pool.settle_controls(func.__name__, _submitted_calls)
+                            settle = getattr(self, '_settle_worker_controls', None)
+                            if not _call_completed and settle is not None:
+                                settle(func.__name__, _submitted_calls)
                         finally:
-                            self._worker_pool.end_call(_worker_reservation)
+                            self._end_worker_call(_worker_reservation)
                 finally:
                     if _configuration_lock is not None:
                         _configuration_lock.release()
@@ -934,9 +864,15 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
         wrapper._execute = execute
         wrapper._collect = collect
         wrapper._dispatch = dispatch
-        wrapper._lazy_collect = get_lazy_collect()
+        wrapper._lazy_collect = lazy_collect
         wrapper._sync = sync
         wrapper._enable_continous_work = enable_continous_work
+        wrapper._sticky = sticky
+        wrapper._sticky_key = sticky_key
+        wrapper._exclusive = exclusive
+        wrapper._control = control
+        wrapper._replay = replay
+        wrapper._worker_selector = worker_selector
         if enable_continous_work:
             # Attached to the class by remote_class, and called instead of this
             # method when the driver routes requests worker by worker.

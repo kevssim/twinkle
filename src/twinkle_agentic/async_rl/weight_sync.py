@@ -3,9 +3,10 @@
 
 When a training partition finishes, the trainer must make the just-trained
 policy visible to the sampler before the next rollout.  How that happens is
-model- and deployment-specific, so ``TrainerWorker`` receives it as an injected
-``save_adapter`` callable instead of hard-coding one mechanism.  The strategies
-here are the concrete, named forms of that callable:
+model- and deployment-specific, so the training caller receives it as an injected
+``save_adapter`` callable (the archived TQ runtime's TrainerWorker shaped this seam;
+the streaming driver's publish push is the current caller) instead of hard-coding
+one mechanism.  The strategies here are the concrete, named forms of that callable:
 
 * :class:`AdapterSnapshotSync` -- save a LoRA adapter to disk and let the sampler
   load that snapshot.  Every version is a distinct path, so several can stay
@@ -21,9 +22,8 @@ here are the concrete, named forms of that callable:
   GPUs between sparse syncs, so queued samples may be several versions old
   (``max_staleness > 1``), exactly verl's fully-async regime.
 
-A strategy is callable with the same ``(admission) -> handle`` signature
-``TrainerWorker`` already expects of ``save_adapter``, so it drops into that seam
-unchanged.  The handle is the version-pinning token: a disk path for
+A strategy is callable with the ``(admission) -> handle`` signature the
+``save_adapter`` seam expects, so it drops into that call site unchanged.  The handle is the version-pinning token: a disk path for
 :class:`AdapterSnapshotSync`, ``None`` for :class:`InPlaceWeightSync` (its single
 live copy needs no pinning).  Both are plain objects holding one callback, so
 they cross the Ray actor boundary exactly like the ``partial`` callables the

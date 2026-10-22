@@ -45,6 +45,31 @@ def build_ray_runtime_env() -> dict[str, Any]:
     return runtime_env
 
 
+def ensure_ray_cluster(*, namespace: str, address: str | None = None) -> None:
+    """Bring up (or attach to) the Ray runtime a Serve deployment needs.
+
+    The deploy-side entry for Ray bring-up: with no cluster running this starts a local head seeded
+    with :func:`build_ray_runtime_env` (the patches Ray Serve's proxy actors need); ``address='auto'``
+    attaches to an existing cluster instead. Idempotent -- an already-initialized runtime is left
+    untouched. Both the launcher itself and a caller that starts the head before handing off to
+    :func:`launch_server` (e.g. swift's deploy recipe) go through here, so worker seeding stays
+    single-sourced.
+    """
+    import ray
+
+    if ray.is_initialized():
+        return
+    init_kwargs: dict[str, Any] = {
+        'namespace': namespace,
+        'runtime_env': build_ray_runtime_env(),
+        'ignore_reinit_error': True,
+    }
+    if address:
+        init_kwargs['address'] = address
+    ray.init(**init_kwargs)
+    logger.info(f'ray runtime ready (namespace={namespace}, address={address or "local head"})')
+
+
 class ServerLauncher:
     """
     Unified server launcher.
@@ -96,26 +121,11 @@ class ServerLauncher:
         return resolve_builder(import_path, self._get_builders())
 
     def _init_ray(self) -> None:
-        """Initialize Ray if not already initialized."""
+        """Initialize Ray with the resolved namespace (attach-or-local via :func:`ensure_ray_cluster`)."""
         if self._ray_initialized:
             return
-
-        import ray
-
         namespace = self.ray_namespace or self.config.ray_namespace or 'twinkle_cluster'
-
-        if not ray.is_initialized():
-            # Use runtime_env to apply patches in worker processes
-            # This is required because Ray Serve's ProxyActor runs in separate processes
-            runtime_env = build_ray_runtime_env()
-            # Connect to existing cluster if available, otherwise start local instance
-            ray.init(
-                address='auto',
-                namespace=namespace,
-                runtime_env=runtime_env,
-            )
-            logger.info(f'Ray initialized with namespace={namespace}')
-
+        ensure_ray_cluster(namespace=namespace, address='auto')
         self._ray_initialized = True
 
     def _start_serve(self) -> None:

@@ -19,6 +19,8 @@ from twinkle.patch import Patch, apply_patch
 from twinkle.patch.vllm_lora_weights import VLLMLoraWeights
 from twinkle.perf import timed
 from twinkle.sampler.base import Sampler
+from twinkle.sampler.generation_submission import GenerationSubmissionMixin
+from twinkle.sampler.partial_rollout import PartialRolloutMixin
 from twinkle.utils import Platform
 
 logger = get_logger()
@@ -73,11 +75,14 @@ def _load_vllm_image(entry: Any) -> Any:
     return unwrapped
 
 
+#: The actor's method-concurrency ceiling (Ray runs a decorated actor's methods one at a time
+#: unless this is raised). Shared with the server-side async backend, which decorates its own
+#: actor with the same ceiling, hence the public name.
 SAMPLER_MAX_CONCURRENCY = max(1, int(os.environ.get('TWINKLE_SAMPLER_MAX_CONCURRENCY') or 24))
 
 
 @remote_class(max_concurrency=SAMPLER_MAX_CONCURRENCY)
-class vLLMSampler(Sampler, CheckpointEngineMixin, DeltaSamplerMixin):
+class vLLMSampler(Sampler, CheckpointEngineMixin, GenerationSubmissionMixin, PartialRolloutMixin, DeltaSamplerMixin):
     """A vLLM-based sampler using VLLMEngine (AsyncLLM).
 
     This sampler automatically configures vLLM based on available GPUs.
@@ -115,11 +120,11 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, DeltaSamplerMixin):
         self._async_thread = threading.Thread(target=self._run_event_loop, daemon=True, name='vLLMSampler-EventLoop')
         self._async_thread.start()
 
-        # In-flight non-blocking generations keyed by submission id (the async-submission capability). Each
+        # In-flight non-blocking generations keyed by submission id (GenerationSubmissionMixin). Each
         # entry is a concurrent.futures.Future scheduled on ``self._async_loop`` above.
         self._generation_submissions: Dict[str, Any] = {}
 
-        # Engine request ids currently mid-generation (the partial-rollout capability), so an in-place weight republish
+        # Engine request ids currently mid-generation (PartialRolloutMixin), so an in-place weight republish
         # can abort them and let each resume on the fresh weights. Only touched from ``self._async_loop``.
         self._inflight_request_ids: set = set()
 
@@ -224,7 +229,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, DeltaSamplerMixin):
                 encoded[key] = encoded[key].tolist()
         return encoded
 
-    @remote_function(dispatch='all', collect='first', lazy_collect=False)
+    @remote_function(dispatch='all', collect='first', lazy_collect=False, exclusive=True, replay=True)
     def apply_patch(self, patch_cls: Union[Patch, Type[Patch], str], **kwargs) -> None:
         apply_patch(self, patch_cls, **kwargs)
 
@@ -286,7 +291,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, DeltaSamplerMixin):
         """Sample a single input asynchronously.
 
         ``request_id`` is this generation's engine handle: auto-generated when not given, and registered as
-        in-flight for the duration of the call so :meth:`abort_all_inflight` (the partial-rollout capability) can
+        in-flight for the duration of the call so :meth:`abort_all_inflight` (PartialRolloutMixin) can
         interrupt it and let a partial rollout resume from the tokens it produced before the abort.
         """
         if request_id is None:
@@ -432,7 +437,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, DeltaSamplerMixin):
               aligned with them on every rank.
         """
         # One sampling path: the blocking sample is the async core driven to completion on the loop. The
-        # non-blocking submit_generation (the async-submission capability) schedules the SAME coroutine and
+        # non-blocking submit_generation (GenerationSubmissionMixin) schedules the SAME coroutine and
         # collects it later, so an overlapped RL rollout and a plain blocking call cannot drift.
         return self._run_in_loop(
             self._generate_inputs(
@@ -461,13 +466,13 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, DeltaSamplerMixin):
         """The async generation core shared by the blocking :meth:`sample` and :meth:`submit_generation`.
 
         ``sample`` drives this coroutine to completion on the background loop; ``submit_generation``
-        (the async-submission capability) schedules the very same coroutine and collects it later, so an
+        (GenerationSubmissionMixin) schedules the very same coroutine and collects it later, so an
         overlapped RL rollout and a plain blocking call cannot drift apart. LoRA is resolved with the
         async ``_aload_lora`` rather than the blocking ``_load_lora`` because this already runs inside
         the event loop -- ``_load_lora`` would call ``_run_in_loop`` and deadlock on itself.
 
         With ``allow_partial_rollout`` each input is driven through
-        :meth:`~twinkle.sampler.partial_rollout.the partial-rollout capability._run_partial_rollout`, so an abort from
+        :meth:`~twinkle.sampler.partial_rollout.PartialRolloutMixin._run_partial_rollout`, so an abort from
         a concurrent in-place weight republish resumes it from its own tokens on the fresh weights instead
         of ending it truncated; otherwise each input is a single ``_sample_single`` attempt.
         """
@@ -515,7 +520,12 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, DeltaSamplerMixin):
         else:
             lora_requests = [await self._aload_lora(adapter_path)] * len(encoded_inputs)
 
-        async def _generate_one(feat, multi_modal_data, lora_request):
+        # ``request_id`` is the caller-side handle for async control (submit/pause/stop): taken from
+        # the raw inputs before encoding (the encoder does not carry it) and handed to the engine as
+        # the request id, so an abort can address this exact generation.
+        request_ids = [input.get('request_id') for input in inputs_list]
+
+        async def _generate_one(feat, multi_modal_data, lora_request, request_id):
             if not allow_partial_rollout:
                 return await self._sample_single(
                     feat,
@@ -525,10 +535,11 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, DeltaSamplerMixin):
                     logprobs_only=logprobs_only,
                     disable_lora=use_base_model,
                     token_only=token_only,
+                    request_id=request_id,
                 )
 
             # Partial rollout: one generation attempt is a plain _sample_single; the resume/merge loop
-            # (the partial-rollout capability) re-runs it from new_input_feature when a republish aborts it. The core
+            # (PartialRolloutMixin) re-runs it from new_input_feature when a republish aborts it. The core
             # path carries no per-attempt control-plane state, so run_attempt returns None for it.
             async def run_attempt(current_input, attempt_params, attempt):
                 response = await self._sample_single(
@@ -539,6 +550,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, DeltaSamplerMixin):
                     logprobs_only=logprobs_only,
                     disable_lora=use_base_model,
                     token_only=token_only,
+                    request_id=request_id,
                 )
                 return response, None
 
@@ -553,8 +565,9 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, DeltaSamplerMixin):
             return outcome.response
 
         return await self._gather_generation_tasks(
-            _generate_one(feat, multi_modal_data, lora_request) for feat, multi_modal_data, lora_request in
-            zip(encoded_inputs, multi_modal_data_list, lora_requests))
+            _generate_one(feat, multi_modal_data, lora_request, request_id)
+            for feat, multi_modal_data, lora_request, request_id in
+            zip(encoded_inputs, multi_modal_data_list, lora_requests, request_ids))
 
     async def _encode_single(
         self,
@@ -742,7 +755,7 @@ class vLLMSampler(Sampler, CheckpointEngineMixin, DeltaSamplerMixin):
     def get_state_keys(self):
         return self._run_in_loop(self.engine.get_state_keys())
 
-    @remote_function(dispatch='all', lazy_collect=True)
+    @remote_function(dispatch='all', lazy_collect=True, exclusive=True)
     @timed
     def receive_weights(
         self,

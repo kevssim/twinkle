@@ -139,7 +139,7 @@ class TransformersSampler(Sampler):
     def apply_patch(self, patch_cls: Union[Patch, Type[Patch], str], **kwargs) -> None:
         apply_patch(self, patch_cls, **kwargs)
 
-    @remote_function(dispatch='all', collect='first', lazy_collect=False)
+    @remote_function(dispatch='all', collect='first', lazy_collect=False, exclusive=True, replay=True)
     def set_template(self, template_cls, **kwargs):
         """Set the template that turns messages into token ids.
 
@@ -293,7 +293,7 @@ class TransformersSampler(Sampler):
     def wake_up(self, tags: List[str] = None) -> None:
         self._run_in_loop(self._own_engine().wake_up(tags=tags))
 
-    @remote_function(dispatch='all', collect='first', lazy_collect=False)
+    @remote_function(dispatch='all', collect='first', lazy_collect=False, exclusive=True, replay=True)
     def add_adapter_to_sampler(self, adapter_name: str, config: Any) -> None:
         raise NotImplementedError('TransformersSampler loads adapters from disk; pass adapter_path to sample().')
 

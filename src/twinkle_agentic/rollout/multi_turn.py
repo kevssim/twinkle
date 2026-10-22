@@ -215,21 +215,33 @@ _MAX_CONCURRENT_EPISODES = 1024
 
 def _default_response_callback(sampler, api, sampling_params, *, input_feature, adapter_kwargs,
                                **kwargs) -> SampledSequence:
-    """Use the sampler when present, otherwise the API adapter."""
+    """Use the sampler when present, otherwise the API adapter.
+
+    The sampler path goes through ``submit`` (not ``sample``): each turn is one request whose
+    ``request_id`` is the episode-level session key, so sticky routing lands every turn of an
+    episode on the same worker (KV-cache locality) and an episode-level pause can address the
+    turn in flight. ``.result()`` blocks this turn only -- the episode loop is sequential by
+    nature; the concurrency between episodes lives one level up (admit/payload).
+    """
     if sampler is None:
         if api is None:
             raise ValueError('response_callback was omitted, but no sampler or API was provided')
         return api(input_feature, sampling_params, **adapter_kwargs)
-    responses = sampler.sample([input_feature], sampling_params=sampling_params, **adapter_kwargs)
+    request = dict(input_feature)
+    if 'request_id' not in request:
+        trajectory = kwargs.get('trajectory') or {}
+        if trajectory.get('request_id'):
+            request['request_id'] = trajectory['request_id']
+    responses = sampler.submit(request, sampling_params=sampling_params, **adapter_kwargs).result()
     if not isinstance(responses, list):
-        raise TypeError(f'expected List[SampleResponse] from sampler.sample, got '
+        raise TypeError(f'expected a single-element list from sampler.submit, got '
                         f'{type(responses).__name__}')
     if len(responses) != 1:
         raise RuntimeError(f'sampler returned {len(responses)} responses for a single request; '
                            'expected exactly one.')
     response = responses[0]
     if not isinstance(response, SampleResponse):
-        raise TypeError(f'expected SampleResponse from sampler.sample, got '
+        raise TypeError(f'expected SampleResponse from sampler.submit, got '
                         f'{type(response).__name__}')
     if len(response.sequences) != 1:
         raise RuntimeError(f'SampleResponse contains {len(response.sequences)} sequences; expected exactly one.')
@@ -425,17 +437,12 @@ class MultiTurnRollout(Rollout):
         if response_callback is None and sampler is None and api is None:
             raise ValueError('MultiTurnRollout requires a sampler or API when response_callback is omitted')
         if sampler is not None:
-            sample = getattr(type(sampler), 'sample', None)
-            if sample is None:
+            if not hasattr(type(sampler), 'submit'):
                 raise TypeError(f'backend must be an API or sampler, got {type(sampler).__name__}')
-            # A message-only backend is a local text sampler, not a slice_dp GPU
-            # worker, so the one-request-per-call spreading this guards against does
-            # not apply; only the token-level path needs the declaration.
-            if not message_only and not getattr(sample, '_enable_continous_work', False):
-                raise ValueError(f'{type(sampler).__name__}.sample must be declared with '
-                                 'enable_continous_work=True: this rollout samples one trajectory per '
-                                 'call, and a slice_dp sampler raises when a worker gets nothing from '
-                                 'a batch of one.')
+            # The per-turn path goes through ``submit``; a sampler without async support
+            # (a message-only text backend is exempt) fails loudly at the first turn instead
+            # of here, because ``_async_loop`` is an instance attribute no type-level check
+            # can see.
         if adapter_path and use_base_model:
             raise ValueError('adapter_path and use_base_model=True ask for opposite '
                              'weights; the sampler would drop the adapter silently.')
@@ -657,24 +664,38 @@ class MultiTurnRollout(Rollout):
                  prompt_extras: Optional[List[Dict[str, Any]]] = None,
                  force_logprobs: bool = True,
                  adapter_path: Optional[str] = None,
-                 allow_partial_rollout: Optional[bool] = None) -> List[RolloutSample]:
+                 allow_partial_rollout: Optional[bool] = None,
+                 request_id: Optional[str] = None) -> List[RolloutSample]:
         """Run one episode per (prompt, sample) pair and translate each output.
 
         ``num_samples`` completions per prompt, grouped by prompt -- a GRPO group is one
         prompt's slice of the returned list. ``lazy_collect=True`` makes a REMOTE call
         return a LazyCollect handle immediately (what :meth:`admit` parks on its
-        payload); a local call still blocks.
+        payload); a local call still blocks. ``request_id`` stamps ONE session key onto
+        the episodes -- only meaningful for the single-prompt admit path, where the
+        driver-side handle identity and the sampler-side request identity must coincide
+        so a later pause addresses the very episodes this call started; a multi-prompt
+        batch leaves it unset and each episode mints its own.
         """
         if num_samples < 1:
             raise ValueError('num_samples must be >= 1.')
         if prompt_extras is not None and len(prompt_extras) != len(prompts):
             raise ValueError('prompt_extras must contain exactly one mapping per prompt.')
+        if request_id is not None and len(prompts) * num_samples != 1:
+            raise ValueError('request_id stamps one episode; pass it only for the single-prompt path.')
         extras = prompt_extras or [{} for _ in prompts]
         trajectories, metadata = [], []
         for prompt_index, prompt in enumerate(prompts):
             for _ in range(num_samples):
                 extra = copy.deepcopy(extras[prompt_index])
                 trajectory: Dict[str, Any] = {'messages': copy.deepcopy(prompt)}
+                # The episode-level session key: every turn of this episode submits under it,
+                # so sticky routing keeps the episode on one worker (KV-cache locality) and an
+                # episode-level pause/stop can address the turn in flight. The admit path
+                # passes the handle's id so driver-side pause and sampler-side request
+                # identity coincide; a batch mints one per episode.
+                trajectory['request_id'] = (request_id if request_id is not None
+                                            else uuid.uuid4().hex)
                 # Thread the prompt row's media columns so a multimodal episode samples its media.
                 for key in _MULTIMODAL_PROMPT_KEYS:
                     if extra.get(key):
@@ -682,7 +703,7 @@ class MultiTurnRollout(Rollout):
                 trajectories.append(trajectory)
                 metadata.append((str(prompt_index), extra))
         sp = self._rl_sampling_params(sampling_params, force_logprobs)
-        # adapter_path threads into every per-turn sampler.sample (a LoRA run must not sample
+        # adapter_path threads into every per-turn sampler.submit (a LoRA run must not sample
         # from the base); allow_partial_rollout rides the same kwargs channel (False reads as
         # omitted).
         kwargs: Dict[str, Any] = {
@@ -746,10 +767,13 @@ class MultiTurnRollout(Rollout):
         if hasattr(self, '_actors'):
             # The remote episode runs on the actor: the generate call itself returns a
             # LazyCollect immediately, so admission never blocks the driver thread.
+            # The handle's id doubles as the episode's request_id: every turn submits
+            # under it and a later pause(handle)/stop(handle) addresses this episode.
             handle.payload = self.generate(
                 [prompt], num_samples=1, sampling_params=sampling_params,
                 prompt_extras=[prompt_extras] if prompt_extras else None,
-                force_logprobs=True, adapter_path=adapter_path)
+                force_logprobs=True, adapter_path=adapter_path,
+                request_id=handle.submission_id)
             return handle
         futures: Dict[str, Future] = self.__dict__.setdefault('_episode_futures', {})
         future: Future = Future()
@@ -760,7 +784,8 @@ class MultiTurnRollout(Rollout):
                 future.set_result(self.generate(
                     [prompt], num_samples=1, sampling_params=sampling_params,
                     prompt_extras=[prompt_extras] if prompt_extras else None,
-                    force_logprobs=True, adapter_path=adapter_path))
+                    force_logprobs=True, adapter_path=adapter_path,
+                    request_id=handle.submission_id))
             except Exception as exc:  # surfaced at poll/collect; the thread must not die silently
                 future.set_exception(exc)
 
@@ -832,9 +857,29 @@ class MultiTurnRollout(Rollout):
         """
         abort = getattr(getattr(self, 'sampler', None), 'abort_all_inflight', None)
         if not callable(abort):
-            raise RuntimeError('abort-on-publish needs a sampler with abort_all_inflight (the twinkle '
-                               'partial-rollout capability): the core vLLM/SGLang samplers provide it.')
+            raise RuntimeError('abort-on-publish needs a sampler with abort_all_inflight (twinkle '
+                               'PartialRolloutMixin): the core vLLM/SGLang samplers provide it.')
         return abort()
+
+    @remote_function(dispatch='all', collect='first', lazy_collect=False, control=True,
+                     sticky_key='request_id', enable_continous_work=True)
+    def pause(self, request_id: str) -> bool:
+        """End one episode's turn in flight and wait for it to settle; True once settled.
+
+        Forwards to the sampler's pause: sticky ownership (bound by this episode's own
+        ``submit`` calls, on the sampler handle this actor holds) pins the call to the
+        worker actually running the turn. Declared remote because the driver-side proxy
+        shell never ran ``__init__`` and has no ``sampler`` -- the actor does. The
+        partial (stop_reason='abort' + the tokens produced so far) surfaces at the
+        episode's own future (the admit payload); assembling a continuation episode is
+        the caller's job, not this class's.
+        """
+        return self.sampler.pause({'request_id': request_id})
+
+    def stop(self, request_id: str) -> bool:
+        """Same engine action as pause; the semantic difference is what the caller does with
+        the partial (stop discards it, pause continues from it)."""
+        return self.pause(request_id)
 
     @remote_function(dispatch='all', collect='none', lazy_collect=False)
     def close(self) -> None:
@@ -1072,6 +1117,15 @@ class MultiTurnRollout(Rollout):
             # contain are still not dispatched -- the turn never got to decide it
             # was done emitting them.
             if seq.stop_reason == 'length':
+                truncated = True
+                break
+
+            # An abort ended this turn: pause/stop, or a weight republish without
+            # allow_partial_rollout. The partial tokens are already banked; the episode
+            # ends truncated here, and whether it resumes is the caller's call (the
+            # driver re-admits a continuation episode; the engine-level resume of
+            # allow_partial_rollout stays inside its own turn).
+            if seq.stop_reason == 'abort':
                 truncated = True
                 break
 

@@ -1,34 +1,38 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Continuous-work bookkeeping and the per-worker async machinery it depends on.
+"""Continuous-work protocol: least-loaded routing, in-flight bookkeeping and the drain barrier.
 
-This module owns the driver-side ledger behind ``enable_continous_work`` plus the
-worker-side thread/awaitable plumbing that lets one actor run several blocking
-methods side by side. ``dispatch`` imports from here; nothing here imports back,
-so worker identity and the ledger stay a leaf.
+A method declared with ``enable_continous_work`` on a ``max_concurrency`` actor runs several of
+its requests side by side in the worker's engine. The helpers here track which refs are still
+running on which worker (``_cw_state``), route new requests to the least busy worker
+(``_run_continous_work``), and let any *other* method wait for those refs before touching the
+same workers (``_cw_barrier``). Worker identity (``get_worker_id``) and worker-list resolution
+(``_select_workers``) live here too, being shared by the barrier, the pool and dispatch.
 """
 import functools
 import os
 import threading
 from typing import Any, List, Optional
 
-from twinkle.utils import get_logger
+from twinkle.utils import Platform, get_logger
 
 logger = get_logger()
 
-# Guards creating the per-handle state below. Without it two threads arriving at
-# once each build their own state, with their own lock, and one overwrites the
-# other -- after which the two are no longer excluding each other and the requests
-# charged to the discarded one are never given back.
-_CW_CREATE_LOCK = threading.Lock()
 
-# Prefix of the awaitable companion generated for a continuous-work method. The
-# companion is what the driver actually calls on the worker; see
-# ``_make_worker_async_companion``.
-_WORKER_ASYNC_PREFIX = '_twinkle_async_'
+def _get_workers(workers, execute):
+    if not workers:
+        return []
+    if execute == 'first':
+        return [workers[0]]
+    elif execute == 'all':
+        return workers
+    elif execute == 'peer':
+        return workers[Platform.get_peer_index(len(workers))]
+    else:
+        raise ValueError(f'Unsupported execute method: {execute}')
 
 
 def get_worker_id(worker) -> str:
-    """Stable identity of a Ray actor, independent of its position in a handle."""
+    """返回 Ray actor 的稳定身份，与它在 handler 中的位置无关。"""
     return worker._actor_id.hex()
 
 
@@ -48,17 +52,16 @@ def _select_workers(self, worker_ids=None):
     return tuple(by_id[worker_id] for worker_id in worker_ids)
 
 
-def ready_refs(refs) -> List[Any]:
-    """ObjectRefs already finished, without materializing the rest.
+# Guards creating the per-handle state below. Without it two threads arriving at
+# once each build their own state, with their own lock, and one overwrites the
+# other -- after which the two are no longer excluding each other and the requests
+# charged to the discarded one are never given back.
+_CW_CREATE_LOCK = threading.Lock()
 
-    Shared zero-timeout probe of the ledger users: ``_cw_unregister`` drops only
-    what has completed, the ``_cw_barrier`` finally-block settles what it waited
-    for, and ``_run_continous_work`` reaps stale charges before planning.
-    """
-    import ray
-
-    ready, _ = ray.wait(list(refs), num_returns=len(refs), timeout=0)
-    return ready
+# Prefix of the awaitable companion generated for a continuous-work method. The
+# companion is what the driver actually calls on the worker; see
+# ``_make_worker_async_companion``.
+_WORKER_ASYNC_PREFIX = '_twinkle_async_'
 
 
 def _worker_executor(self, ):
@@ -159,9 +162,7 @@ def _cw_barrier(self, current_func: str, workers, *, materialize=True) -> None:
     if not state:
         return
     worker_ids = {get_worker_id(worker) for worker in workers}
-    # Pool-backed components carry their conflict policy on the pool; others wait for everything.
-    pool = getattr(self, '_worker_pool', None)
-    conflicts = pool.conflicts if pool is not None else None
+    conflicts = getattr(self, '_worker_call_conflicts', None)
     with state['lock']:
         others = {
             name: [ref for ref in refs if state['owners'][ref][0] in worker_ids
@@ -181,8 +182,9 @@ def _cw_barrier(self, current_func: str, workers, *, materialize=True) -> None:
         else:
             ray.wait(flat, num_returns=len(flat))
     finally:
+        ready, _ = ray.wait(flat, num_returns=len(flat), timeout=0)
         with state['lock']:
-            _cw_drop_locked(state, ready_refs(flat))
+            _cw_drop_locked(state, ready)
 
 
 def _cw_object_refs(result) -> List[Any]:
@@ -220,8 +222,10 @@ def _cw_unregister(self, func_name: str, refs: List[Any]) -> None:
     state = getattr(self, '_continous_work_state', None)
     if not state or not refs:
         return
+    import ray
+    ready, _ = ray.wait(refs, num_returns=len(refs), timeout=0)
     with state['lock']:
-        _cw_drop_locked(state, ready_refs(refs))
+        _cw_drop_locked(state, ready)
 
 
 def _cw_plan(n_workers: int, load: List[int], batch_len: int) -> List[List[int]]:
@@ -263,6 +267,89 @@ def _cw_sub_args(args, kwargs, indices: List[int], batch_len: int):
     return tuple(pick(a) for a in args), {k: pick(v) for k, v in kwargs.items()}
 
 
+def _sticky_state(self):
+    """Driver-side sticky-ownership bookkeeping (``sticky``/``control`` declarations), created on first use.
+
+    ``owners`` maps a sticky key (e.g. a request id) to the worker id that first served it, so a later
+    ``control`` call with the same key lands on the worker actually running that request. Plain dict
+    under its own lock: nothing here re-enters while holding it.
+    """
+    state = getattr(self, '_sticky_owners_state', None)
+    if state is not None:
+        return state
+    with _CW_CREATE_LOCK:
+        state = getattr(self, '_sticky_owners_state', None)
+        if state is None:
+            state = {'lock': threading.Lock(), 'owners': {}}
+            self._sticky_owners_state = state
+        return state
+
+
+def _sticky_lookup(self, key):
+    """The worker id owning ``key``, or ``None`` when no sticky call has served it yet."""
+    state = getattr(self, '_sticky_owners_state', None)
+    if state is None:
+        return None
+    with state['lock']:
+        return state['owners'].get(key)
+
+
+def _sticky_bind(self, key, worker_id):
+    """Record that ``worker_id`` now owns ``key``; an existing binding is left alone (first wins)."""
+    state = _sticky_state(self)
+    with state['lock']:
+        state['owners'].setdefault(key, worker_id)
+
+
+def _sticky_drop_worker(self, worker_id):
+    """Remove every ownership pointing at a retired worker (called from worker removal)."""
+    state = getattr(self, '_sticky_owners_state', None)
+    if state is None:
+        return
+    with state['lock']:
+        state['owners'] = {key: owner for key, owner in state['owners'].items() if owner != worker_id}
+
+
+def _resolve_sticky_key(sticky_key, func, args, kwargs):
+    """Resolve the declared ``sticky_key`` against one bound call to ``func``.
+
+    A string is a ``param.field.path``: the first segment names the parameter (matched against the
+    keyword names first, then the positional slots of ``func``'s signature), the rest walk dict keys or
+    object attributes (no eval). A callable receives the bound ``args``/``kwargs``. Returns ``None``
+    when the path is absent, so the wrapper can treat it as "no key on this call".
+    """
+    if sticky_key is None:
+        return None
+    if callable(sticky_key):
+        return sticky_key(args, kwargs)
+    parts = str(sticky_key).split('.')
+    param_name, path = parts[0], parts[1:]
+    if param_name in kwargs:
+        value = kwargs[param_name]
+    else:
+        import inspect
+        try:
+            parameters = list(inspect.signature(func).parameters)
+        except (TypeError, ValueError):
+            return None
+        if param_name not in parameters:
+            return None
+        position = parameters.index(param_name)
+        if position >= len(args):
+            return None
+        value = args[position]
+    for segment in path:
+        if isinstance(value, dict):
+            if segment not in value:
+                return None
+            value = value[segment]
+        else:
+            value = getattr(value, segment, None)
+            if value is None:
+                return None
+    return value
+
+
 def _run_continous_work(self, func_name: str, execute_method, workers, args, kwargs, batch_len: int,
                         ray_get_timeout: Optional[float], *, on_dispatched=None):
     """Submit one call per chosen worker and return results in the caller's order.
@@ -283,7 +370,8 @@ def _run_continous_work(self, func_name: str, execute_method, workers, args, kwa
         with state['lock']:
             pending = [ref for ref, (owner, _) in state['owners'].items() if owner in worker_ids]
             if pending:
-                _cw_drop_locked(state, ready_refs(pending))
+                ready, _ = ray.wait(pending, num_returns=len(pending), timeout=0)
+                _cw_drop_locked(state, ready)
             load = [state['load'].get(worker_id, 0) for worker_id in worker_ids]
             plan = _cw_plan(len(workers), load, batch_len)
             for worker_index, indices in enumerate(plan):

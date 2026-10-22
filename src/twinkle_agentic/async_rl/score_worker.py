@@ -129,7 +129,7 @@ class ScoreWorker:
         values = score(rows) if callable(score) else scorer(rows)
         return [None if value is None or value != value else float(value) for value in values]
 
-    @remote_function(dispatch='all', collect='first', lazy_collect=True)
+    @remote_function(dispatch='all', collect='first', lazy_collect=False)
     def score_group(self, samples: List[Any]) -> List[List[float]]:
         """Score one group with every ORM scorer -> the ``[N][n_scorers]`` sample-major matrix.
 
@@ -147,7 +147,7 @@ class ScoreWorker:
         return [[None if value is None or value != value else float(value) for value in column]
                 for column in zip(*matrix)] if matrix else [[] for _ in samples]
 
-    @remote_function(dispatch='all', collect='first', lazy_collect=True)
+    @remote_function(dispatch='all', collect='first', lazy_collect=False)
     def score_group_prm(self, samples: List[Any]) -> Tuple[List[List[Optional[float]]], List[Any]]:
         """Both channels for one group in ONE pass: ``(the ORM matrix, per-sample process rewards)``.
 

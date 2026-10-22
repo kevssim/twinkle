@@ -434,7 +434,7 @@ class VLLMEngine(BaseSamplerEngine):
         """Abort an in-flight request so its ``generate()`` finishes with ``finish_reason='abort'``.
 
         This is the trigger half of partial rollout (the resume/merge half is
-        :mod:`~twinkle.sampler.partial_rollout`). vLLM v1's ``AsyncLLM.abort`` is a
+        :class:`~twinkle.sampler.partial_rollout.PartialRolloutMixin`). vLLM v1's ``AsyncLLM.abort`` is a
         coroutine; under the hood ``OutputProcessor.abort_requests`` enqueues a final ``RequestOutput`` with
         ``FinishReason.ABORT`` that carries the tokens decoded so far -- and because that output counts as
         finished, it is emitted even in ``FINAL_ONLY`` mode -- so the caller gets ``stop_reason='abort'``

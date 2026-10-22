@@ -846,7 +846,7 @@ class ClusterAdapter:
             if handle is not None and self._free_flex_groups:
                 group = self._free_flex_groups.popleft()
                 try:
-                    worker_ids = handle.add_workers(group, list(self._flex_groups[group]))
+                    worker_ids = handle.add_replicas(group)
                     self._rm_flex_workers[role] = (group, worker_ids)
                 except BaseException:
                     self._free_flex_groups.appendleft(group)
@@ -860,7 +860,7 @@ class ClusterAdapter:
                 # whole retirement (the scoring worker's in-flight call finishes on the actor Ray
                 # keeps alive until the call returns).
                 handle = self.elastic_models[role]
-                handle.remove_workers(worker_ids)
+                handle.remove_replicas(worker_ids)
                 self._rm_flex_workers.pop(role, None)
                 self._free_flex_groups.append(group)
         if decision is not None:

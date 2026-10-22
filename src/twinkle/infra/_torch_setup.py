@@ -88,21 +88,23 @@ def apply(extra_torch_kwargs: Optional[Dict[str, Any]] = None) -> Dict[str, Any]
 
 
 def apply_in_worker(fallback: Optional[Dict[str, Any]] = None) -> None:
-    """Re-apply the knob set in any process that hosts a component (worker or local driver).
+    """Re-apply the knob set inside a Ray worker (or a driver-hosted local component).
 
-    Reads ``EXTRA_TORCH_KWARGS`` first (falling back to *fallback*), does what :func:`apply` does,
-    then pins the env vars below. This runs in the component-construction path before the model's
-    ``__init__`` sets the device, so the CUDA driver still sees ``CUDA_DEVICE_MAX_CONNECTIONS``
-    when it latches it at context creation. ``setdefault`` (not assignment) leaves room for a user
-    who picked their own connection count.
+    Reads ``EXTRA_TORCH_KWARGS`` first (falling back to *fallback*), does what :func:`apply` does, then
+    pins the worker-only env vars below. Those must land before the model is constructed: the CUDA driver
+    latches ``CUDA_DEVICE_MAX_CONNECTIONS`` when the context is created, so ``setdefault`` (not
+    assignment) leaves room for ``MegatronStrategy.apply_process_env`` to raise it for a sharded
+    data-parallel wrapper while there is still time. It cannot be delegated to the strategy from here --
+    infra sits below the model layer and does not import it.
     """
     apply(from_env(fallback))
-    # Depress megatron's warnings and cut kernel-issue overhead.
-    os.environ.setdefault('CUDA_DEVICE_MAX_CONNECTIONS', '1')
-    # Cap the compile thread pool torch would otherwise grow without bound.
-    os.environ['TORCHINDUCTOR_COMPILE_THREADS'] = '1'
-    # Keep tokenizers in its parallel mode.
-    os.environ['TOKENIZERS_PARALLELISM'] = 'true'
+    if os.environ.get('WORKER_NAME'):
+        # Depress megatron's warnings and cut overhead; a sharded (FSDP) wrapper raises it later.
+        os.environ.setdefault('CUDA_DEVICE_MAX_CONNECTIONS', '1')
+        # Cap the compile thread pool torch would otherwise grow without bound.
+        os.environ['TORCHINDUCTOR_COMPILE_THREADS'] = '1'
+        # Keep tokenizers in its parallel mode.
+        os.environ['TOKENIZERS_PARALLELISM'] = 'true'
 
 
 def seed_from_env(default: int = _DEFAULT_SEED) -> int:

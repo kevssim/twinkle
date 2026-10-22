@@ -29,6 +29,7 @@ from ..base import ModelLoaderProtocol
 from ..multi_lora import MultiLora
 from .utils._mindspeed_runtime import ensure_mindspeed_adaptor_patched
 from .megatron import MegatronModel
+from .mtp.mtp import MtpTrainingState
 from .strategy import MegatronStrategy
 
 logger = get_logger()
@@ -68,12 +69,18 @@ class MultiLoraMegatronModel(MegatronModel):
         self.device_mesh = device_mesh
         self.mixed_precision = mixed_precision
 
-        self._model_path = HubOperation.download_model(model_id)
-        self.tokenizer_id = kwargs.get('tokenizer_id', self.model_id)
+        self._model_path = HubOperation.download_model(model_id, revision=kwargs.pop('revision', None))
+        self.tokenizer_id = kwargs.pop('tokenizer_id', self.model_id)
         self._default_tokenizer = None
         self.use_distributed_optimizer = False
+        kwargs.pop('use_distributed_optimizer', None)
         self.variable_seq_lengths = kwargs.get('variable_seq_lengths', True)
         self.optimizer_group = {}
+        # Popped here so neither key reaches MegatronStrategy / ModelConfig; mirrors the parent.
+        self._router_replay_enabled = bool(kwargs.pop('enable_router_replay', False))
+        self._router_replay_applied = False
+        if self._router_replay_enabled:
+            kwargs['moe_enable_routing_replay'] = True
         # Same ordering constraint as MegatronModel: must precede the CUDA context creation below.
         if MegatronStrategy.uses_fsdp(ddp_config):
             os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '32'
@@ -119,6 +126,8 @@ class MultiLoraMegatronModel(MegatronModel):
         self._finish_config = True
         # Active group for compatibility with single adapter
         self.active_group = None
+        # Inherited forward_backward reads this before any tenant adapter is added.
+        self._mtp = MtpTrainingState()
         self.multi_adapter.reset_adapter_status()
 
     def _check_adapter_valid(self, adapter_name: str):
@@ -152,11 +161,10 @@ class MultiLoraMegatronModel(MegatronModel):
     def forward_backward(self,
                          *,
                          inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]],
-                         num_microbatches: int = 1,
                          **kwargs):
         self._check_adapter_valid(kwargs.get('adapter_name'))
         with self.multi_adapter.adapter(kwargs.get('adapter_name')):
-            return super().forward_backward(inputs=inputs, num_microbatches=num_microbatches, **kwargs)
+            return super().forward_backward(inputs=inputs, **kwargs)
 
     @remote_function(dispatch='all')
     def step(self, **kwargs):
@@ -294,9 +302,8 @@ class MultiLoraMegatronModel(MegatronModel):
                             group_state[k] = v.to(device)
             if optimizer_config.lr_scheduler is not None and 'opt_param_scheduler' in state_dict:
                 optimizer_config.lr_scheduler.load_state_dict(state_dict['opt_param_scheduler'])
-        # RNG state is intentionally not restored in multi-tenant mode:
-        # restoring the global RNG would silently affect other active tenants'
-        # dropout / initialization behaviour.
+        # RNG is intentionally not restored: the global RNG is shared across tenants, and
+        # restoring it would silently affect other active adapters' dropout / init.
         if not no_load_rng and 'rng_state' in state_dict:
             logger.warning('Skipping RNG state restoration in multi-tenant mode. '
                            'Global RNG is shared across tenants; restoring it would '
@@ -389,9 +396,8 @@ class MultiLoraMegatronModel(MegatronModel):
         if dist.is_initialized():
             dist.barrier()
 
-    # lazy_collect=False: see TransformersModel.resume_from_checkpoint -- the driver consumes the returned
-    # training-state dict immediately, so the lazy callable default would break it. Keeps this multi-LoRA
-    # megatron variant backend-equivalent with the others.
+    # lazy_collect=False: the driver consumes the returned dict immediately (loop.resume
+    # subscripts state['cur_step']); a lazy callable default would break it.
     @remote_function(dispatch='all', collect='first', sync=True, lazy_collect=False, timeout=3600)
     def resume_from_checkpoint(self, checkpoint_dir, *, resume_only_model=False, **kwargs):
         adapter_name = kwargs.pop('adapter_name', None)

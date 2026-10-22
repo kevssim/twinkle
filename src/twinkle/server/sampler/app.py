@@ -41,15 +41,10 @@ def _make_vllm_sampler(kw: dict[str, Any]) -> Any:
 
 
 def _make_vllm_async_sampler(kw: dict[str, Any]) -> Any:
-    """The vLLM backend with non-blocking generation admission.
+    """Construct the vLLM backend with non-blocking generation admission."""
+    from .backends.vllm_async import ServerVLLMSampler
 
-    The same :class:`vLLMSampler` as the plain ``vllm`` key: its class body carries the
-    submit/poll/collect/cancel quartet (and the engine's own Ray concurrency), so the async
-    key is kept only so existing deployments keep their ``sampler_type``.
-    """
-    from twinkle.sampler import vLLMSampler
-
-    return vLLMSampler(**kw)
+    return ServerVLLMSampler(**kw)
 
 
 def _make_sglang_sampler(kw: dict[str, Any]) -> Any:
@@ -59,15 +54,10 @@ def _make_sglang_sampler(kw: dict[str, Any]) -> Any:
 
 
 def _make_sglang_async_sampler(kw: dict[str, Any]) -> Any:
-    """The sglang backend with non-blocking generation admission (for the data plane).
+    """Construct the sglang backend with non-blocking generation admission (for the data plane)."""
+    from .backends.sglang_async import ServerSGLangSampler
 
-    The same :class:`SGLangSampler` as the plain ``sglang`` key: its class body carries the
-    submit/poll/collect/cancel quartet and the ``_generate_inputs`` engine hook, so the async key
-    is kept only so existing deployments keep their ``sampler_type``.
-    """
-    from twinkle.sampler import SGLangSampler
-
-    return SGLangSampler(**kw)
+    return ServerSGLangSampler(**kw)
 
 
 def _make_torch_sampler(kw: dict[str, Any]) -> Any:
@@ -240,8 +230,8 @@ def build_sampler_app(model_id: str,
         deploy_options: Ray Serve deployment options
         sampler_type: Sampler selector — ``mock`` | ``vllm`` | ``vllm_async`` | ``sglang`` |
             ``sglang_async`` | ``torch``. Validated up front; bad values raise :class:`ConfigError`
-            before any side effect. The ``*_async`` variants add the non-blocking ``submit_generation``
-            that ``sample_to_data_plane`` requires; the plain ``vllm`` / ``sglang`` variants serve
+            before any side effect. The ``*_async`` variants add the non-blocking submission interface
+            (submit/pause/stop) that ``sample_to_data_plane`` requires; the plain ``vllm`` / ``sglang`` variants serve
             Trajectory / InputFeature sampling but cannot back the data plane.
         engine_args: Additional engine arguments for the sampler
         queue_config: Validated :class:`TaskQueueConfig` (rps_limit, tps_limit, etc.)

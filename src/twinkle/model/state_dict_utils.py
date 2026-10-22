@@ -1,8 +1,9 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""PEFT-aware state-dict helpers shared by the transformers strategies and the model layer.
+"""Checkpoint state-dict helpers shared by the transformers strategies and the model layer.
 
 The strategies own *collection* (how sharded tensors reach host memory), this module owns
-*key semantics* (which names belong to an adapter and how they normalize for checkpoints):
+*key semantics* (which names belong to an adapter, how they normalize for checkpoints, and
+how identifiers remap when a checkpoint crosses name conventions):
 
 - ``is_lora_state_key`` / ``is_saveable_adapter_key`` -- the single source of truth for
   adapter-key filtering. The strategies previously each carried a private copy, and the
@@ -14,10 +15,15 @@ The strategies own *collection* (how sharded tensors reach host memory), this mo
   every adapter/full checkpoint; enumerating ``named_parameters()`` alone loses them.
 - ``normalize_adapter_keys`` -- strips the PEFT wrapper segments under which checkpoint
   consumers expect the keys.
+- ``remap_optimizer_state_names`` -- renames the parameter identifiers inside an optimizer
+  state dict (regular optimizers use numeric IDs, full FSDP states use FQNs; only string
+  identifiers are remapped, so both formats share this path).
+- ``with_tied_weight_aliases`` -- re-expands the checkpoint names omitted for parameters
+  shared by identity (tied weights).
 """
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any, Dict, Mapping
 
 import torch
 
@@ -70,3 +76,43 @@ def normalize_adapter_keys(state: Dict[str, Any], adapter_name: str) -> Dict[str
             normalized = key.replace(adapter_suffix, '.')
         processed[normalized] = value
     return processed
+
+
+def _remap_names(values, name_mapping: Mapping[str, str]):
+    """Remap parameter names while preserving numeric parameter IDs."""
+    return [name_mapping.get(value, value) if isinstance(value, str) else value for value in values]
+
+
+def remap_optimizer_state_names(state_dict: dict[str, Any], name_mapping: Mapping[str, str]) -> None:
+    """Remap parameter identifiers in an optimizer state dict in place."""
+    if not name_mapping:
+        return
+
+    state = state_dict.get('state')
+    if isinstance(state, dict):
+        state_dict['state'] = {
+            name_mapping.get(name, name) if isinstance(name, str) else name: value
+            for name, value in state.items()
+        }
+
+    for group in state_dict.get('param_groups', []):
+        for field in ('params', 'param_names'):
+            values = group.get(field)
+            if isinstance(values, (list, tuple)):
+                group[field] = _remap_names(values, name_mapping)
+
+
+def with_tied_weight_aliases(model, state_dict: dict) -> dict:
+    """Expand omitted checkpoint names only for parameters shared by identity."""
+    aliases = {}
+    for name, parameter in model.named_parameters(remove_duplicate=False):
+        aliases.setdefault(id(parameter), []).append(name)
+    expanded = dict(state_dict)
+    for names in aliases.values():
+        if len(names) < 2:
+            continue
+        source = next((name for name in names if name in state_dict), None)
+        if source is not None:
+            for name in names:
+                expanded.setdefault(name, state_dict[source])
+    return expanded

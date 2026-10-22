@@ -11,10 +11,10 @@ from twinkle import DeviceMesh
 from twinkle.data_format import SampledSequence, SampleResponse, SamplingParams
 from twinkle.infra import _dispatch_args
 from twinkle.server.sampler.twinkle_handlers import _await_generation
-from twinkle_agentic.async_rl.legacy.types import LoraContext
-from twinkle_agentic.async_rl.legacy.types import PartitionAdmission, PromptGroup, RolloutPolicy
-from twinkle.sampler.base import Sampler
-from twinkle_agentic.async_rl.legacy.vllm_sampler_tq import (
+from twinkle_agentic.async_rl import LoraContext
+from twinkle_agentic.async_rl.types import PartitionAdmission, PromptGroup, RolloutPolicy
+from twinkle_agentic.async_rl.generation_submissions import _dispatch_generation
+from twinkle_agentic.async_rl.vllm_sampler_tq import (
     VLLMSamplerTQ,
     _GeneratedSample,
     _PromptGroupRolloutStats,
@@ -101,10 +101,10 @@ def _bare_sampler() -> VLLMSamplerTQ:
 
 
 def test_generation_dispatch_allows_one_prompt_with_multiple_dp_workers() -> None:
-    assert VLLMSamplerTQ.submit_generation._dispatch is Sampler._dispatch_generation
+    assert VLLMSamplerTQ.submit_generation._dispatch is _dispatch_generation
     assert VLLMSamplerTQ.submit_prompt_groups._dispatch == 'slice_dp'
     shards = [
-        Sampler._dispatch_generation(
+        _dispatch_generation(
             3,
             worker_index,
             ('submission', [{

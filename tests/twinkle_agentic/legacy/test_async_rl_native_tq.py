@@ -7,31 +7,23 @@ import pytest
 
 from twinkle.data_format import SampledSequence, SampleResponse
 from twinkle.metric import MetricRecord
-from twinkle_agentic.async_rl.legacy.pipeline import AsyncMultiLoraGRPOPipeline
-from twinkle_agentic.async_rl.legacy.scheduler import (
-    ContextSchedulePolicy,
-    ContextScheduler,
-    ScheduleCandidate,
-    SchedulerConfig,
-)
-from twinkle_agentic.async_rl.legacy.context_manager import ContextStatus, LoraContextManager
-from twinkle_agentic.async_rl.legacy.types import LoraContext
-from twinkle_agentic.async_rl.legacy.data_plane import TQDataPlane
-from twinkle_agentic.async_rl.legacy.workers import TrainerWorker
-from twinkle_agentic.async_rl.legacy.metrics import training_policy_metrics
-from twinkle_agentic.async_rl.legacy.native_tq import ContextGRPOGroupNSampler
-from twinkle_agentic.async_rl.legacy.pipeline import (
+from twinkle_agentic.async_rl import (AsyncMultiLoraGRPOPipeline, ContextSchedulePolicy, ContextScheduler,
+                                      ContextStatus, LoraContext, LoraContextManager, ScheduleCandidate,
+                                      SchedulerConfig, TQDataPlane, TrainerWorker)
+from twinkle_agentic.async_rl.metrics import training_policy_metrics
+from twinkle_agentic.async_rl.native_tq import ContextGRPOGroupNSampler
+from twinkle_agentic.async_rl.pipeline import (
     _collect_adapter_path,
     _require_adapter_path,
     _train_batch,
     create_cpu_actor,
 )
-from twinkle_agentic.async_rl.legacy.types import PartitionAdmission, PreparedPartition
-from twinkle_agentic.async_rl.legacy.utils import (
+from twinkle_agentic.async_rl.types import PartitionAdmission, PreparedPartition
+from twinkle_agentic.async_rl.utils import (
     TrainBatchConfig,
     sample_responses_to_rollout_rows,
 )
-from twinkle_agentic.async_rl.legacy.workers import RolloutWorker
+from twinkle_agentic.async_rl.workers import RolloutWorker
 
 
 class LocalActorHandle:

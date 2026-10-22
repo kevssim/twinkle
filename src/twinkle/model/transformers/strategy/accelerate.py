@@ -5,8 +5,11 @@ from typing import Any, Dict, Literal, Mapping, Optional
 
 from twinkle import DeviceMesh
 from twinkle.model.state_dict_utils import collect_local_state, is_saveable_adapter_key
+from twinkle.utils import get_logger
 from .base import TransformerStrategyBase
-from ..feature_hooks import fsdp_pretrained_load_context
+from .base import fsdp_pretrained_load_context
+
+logger = get_logger()
 
 
 class AccelerateStrategy(TransformerStrategyBase):
@@ -162,16 +165,19 @@ class AccelerateStrategy(TransformerStrategyBase):
 
         fsdp_config = fsdp_config or {}
 
-        sharding_strategy = fsdp_config.pop('sharding_strategy', None)
-        if dp_size > 1 and fsdp_size > 1:
+        requested_strategy = fsdp_config.pop('sharding_strategy', None)
+        if dp_size > 1:
             # HSDP
-            if sharding_strategy not in (FSDPShardingStrategy.HYBRID_SHARD, FSDPShardingStrategy._HYBRID_SHARD_ZERO2):
-                sharding_strategy = FSDPShardingStrategy.HYBRID_SHARD
-        elif fsdp_size > 1:
+            hybrid_strategies = (FSDPShardingStrategy.HYBRID_SHARD, FSDPShardingStrategy._HYBRID_SHARD_ZERO2)
+            sharding_strategy = requested_strategy if requested_strategy in hybrid_strategies else \
+                FSDPShardingStrategy.HYBRID_SHARD
+        else:
             # FSDP
             sharding_strategy = FSDPShardingStrategy.FULL_SHARD
-        elif sharding_strategy is None:
-            sharding_strategy = FSDPShardingStrategy.NO_SHARD
+        if requested_strategy is not None and requested_strategy is not sharding_strategy:
+            logger.warning(
+                f'fsdp_config sharding_strategy={requested_strategy} is overridden with {sharding_strategy} to '
+                f'match the device mesh (dp={dp_size}, fsdp={fsdp_size}).')
 
         fsdp_version = fsdp_config.pop('fsdp_config', 2)
         assert fsdp_version == 2, 'Currently only support fsdp_version = 2'
@@ -246,7 +252,7 @@ class AccelerateStrategy(TransformerStrategyBase):
     def save_optimizer_checkpoint(self, model, optimizer, output_path: str, *, param_name_mapping=None):
         import torch
 
-        from .optimizer_state import remap_optimizer_state_names
+        from twinkle.model.state_dict_utils import remap_optimizer_state_names
         fsdp_plugin = self._get_fsdp_plugin()
         if fsdp_plugin is not None and fsdp_plugin.fsdp_version == 2:
             from torch.distributed.checkpoint.state_dict import get_optimizer_state_dict
@@ -272,7 +278,7 @@ class AccelerateStrategy(TransformerStrategyBase):
     def load_optimizer_checkpoint(self, model, optimizer, input_path: str, *, param_name_mapping=None):
         import torch
 
-        from .optimizer_state import remap_optimizer_state_names
+        from twinkle.model.state_dict_utils import remap_optimizer_state_names
         fsdp_plugin = self._get_fsdp_plugin()
         if fsdp_plugin is not None and fsdp_plugin.fsdp_version == 2:
             from torch.distributed.checkpoint.state_dict import set_optimizer_state_dict
@@ -311,7 +317,7 @@ class AccelerateStrategy(TransformerStrategyBase):
         if fsdp_plugin is not None and fsdp_plugin.fsdp_version == 2:
             from torch.distributed.checkpoint.state_dict import set_model_state_dict
 
-            from .weight_state import with_tied_weight_aliases
+            from twinkle.model.state_dict_utils import with_tied_weight_aliases
             set_model_state_dict(
                 model,
                 with_tied_weight_aliases(self.unwrap_model(model), state_dict),

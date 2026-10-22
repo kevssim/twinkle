@@ -18,8 +18,10 @@ from twinkle.data_format import SampleResponse, SamplingParams, user_data_get
 from twinkle.metric import MetricBuffer, MetricRecord
 from twinkle.sampler.vllm_sampler import vLLMSampler
 from .data_plane import TQDataPlane
+from .generation_submissions import GenerationSubmissionMixin
 from .metrics import rollout_metrics
-from .types import PromptGroup, RLContext, RolloutOutput, RolloutPolicy
+from twinkle_agentic.async_rl.legacy.types import PromptGroup, RolloutOutput
+from twinkle_agentic.async_rl.types import RLContext, RolloutPolicy
 from .utils import resolve_adapter_path, sample_responses_to_rollout_rows
 
 logger = get_logger()
@@ -82,15 +84,16 @@ class _PromptGroupRolloutStats:
 
 
 @remote_class()
-class VLLMSamplerTQ(vLLMSampler):
+class VLLMSamplerTQ(vLLMSampler, GenerationSubmissionMixin):
     """vLLM sampler that writes async RL rollout results directly to TransferQueue.
 
     ``sample()`` is intentionally fire-and-forget: it schedules generation work
     on the sampler actor's vLLM event loop and returns submission metadata
     without waiting for any prompt group to finish.
 
-    The submit/poll/collect/cancel quartet arrives from the async-submission capability attached to
-    ``vLLMSampler`` by ``remote_class``; this class adds only the TransferQueue-specific behavior.
+    ``vLLMSampler`` already mixes in the (re-exported, single-identity) submission mixin, so it MUST stay
+    ahead of the explicit mixin base here: listing the mixin first would repeat a base the other parent
+    already inherits and fail C3 linearisation at import.
     """
 
     def __init__(
@@ -513,7 +516,7 @@ class VLLMSamplerTQ(vLLMSampler):
     ) -> _GeneratedSample:
         """Generate one sample, resuming across aborts via the shared backend-agnostic kernel.
 
-        The retry/resume/merge loop lives in :mod:`~twinkle.sampler.partial_rollout`
+        The retry/resume/merge loop lives in :class:`~twinkle.sampler.partial_rollout.PartialRolloutMixin`
         so vLLM and SGLang share one implementation; what is specific to this TransferQueue path is the
         per-attempt policy pinning, supplied here as ``run_attempt`` -- acquire the rollout policy for this
         context, sample under its (possibly per-version) adapter, then release the pin. Each segment's

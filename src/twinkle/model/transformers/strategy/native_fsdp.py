@@ -11,7 +11,7 @@ from twinkle.model.state_dict_utils import collect_local_state, is_lora_state_ke
 from twinkle.utils import DeviceMesh, Platform, get_logger, torch_util
 from twinkle.utils.torch_utils import clone_state_dict_to_cpu
 from .base import TransformerStrategyBase
-from ..feature_hooks import fsdp_pretrained_load_context
+from .base import fsdp_pretrained_load_context
 
 if TYPE_CHECKING:
     from torch.distributed.fsdp import MixedPrecisionPolicy
@@ -259,7 +259,7 @@ class NativeFSDPStrategy(TransformerStrategyBase):
     def save_optimizer_checkpoint(self, model, optimizer, output_path: str, *, param_name_mapping=None):
         import torch
 
-        from .optimizer_state import remap_optimizer_state_names
+        from twinkle.model.state_dict_utils import remap_optimizer_state_names
         if not self.needs_wrapped_optimizer_state():
             if Platform.is_master():
                 optim_state = optimizer.state_dict()
@@ -281,7 +281,7 @@ class NativeFSDPStrategy(TransformerStrategyBase):
     def load_optimizer_checkpoint(self, model, optimizer, input_path: str, *, param_name_mapping=None):
         import torch
 
-        from .optimizer_state import remap_optimizer_state_names
+        from twinkle.model.state_dict_utils import remap_optimizer_state_names
         if not self.needs_wrapped_optimizer_state():
             optim_state = torch.load(input_path, map_location='cpu', weights_only=False)
             remap_optimizer_state_names(optim_state, param_name_mapping or {})
@@ -327,6 +327,21 @@ class NativeFSDPStrategy(TransformerStrategyBase):
     def unwrap_model(self, model):
         return model
 
+    def _ep_gather_context(self):
+        """Return (ep_group, ep_world_size) for the EP submesh, or (None, 1) when EP is off."""
+        ep_fsdp_mesh = self.ep_fsdp_device_mesh
+        if ep_fsdp_mesh is None:
+            return None, 1
+        return ep_fsdp_mesh['ep'].get_group(), ep_fsdp_mesh['ep'].size()
+
+    @staticmethod
+    def _gather_ep_state_tensor(name, tensor, ep_group, ep_world_size):
+        """All-gather one EP-sharded expert tensor back to the full expert dim-0."""
+        tensor = tensor.contiguous().to(Platform.get_local_device())
+        gathered = [torch.empty_like(tensor) for _ in range(ep_world_size)]
+        dist.all_gather(gathered, tensor, group=ep_group)
+        return torch.cat(gathered, dim=_ep_expert_state_dict_gather_dim(name)).cpu()
+
     def get_full_state_dict(self, model) -> dict:
         """Collect full state dict (with persistent buffers), EP-aware for expert parameters.
 
@@ -340,28 +355,15 @@ class NativeFSDPStrategy(TransformerStrategyBase):
         unwrapped = self.unwrap_model(model)
         state_dict = {}
 
-        ep_fsdp_mesh = self.ep_fsdp_device_mesh
-        ep_group = None
-        ep_world_size = 1
-        if ep_fsdp_mesh is not None:
-            ep_group = ep_fsdp_mesh['ep'].get_group()
-            ep_world_size = ep_fsdp_mesh['ep'].size()
-
+        ep_group, ep_world_size = self._ep_gather_context()
         ep_expert_names = _detect_ep_expert_names(unwrapped) if ep_world_size > 1 else set()
 
         for name, tensor in collect_local_state(unwrapped, include_buffers=True).items():
             local_full = torch_util.to_local_tensor(tensor)
-
-            if name in ep_expert_names and ep_world_size > 1 and ep_group is not None:
-                local_full = local_full.contiguous().to(Platform.get_local_device())
-                gathered = [torch.empty_like(local_full) for _ in range(ep_world_size)]
-                dist.all_gather(gathered, local_full, group=ep_group)
-                local_full = torch.cat(gathered, dim=_ep_expert_state_dict_gather_dim(name))
-                state_dict[name] = local_full.cpu()
-                del gathered, local_full
+            if name in ep_expert_names and ep_group is not None:
+                state_dict[name] = self._gather_ep_state_tensor(name, local_full, ep_group, ep_world_size)
             else:
                 state_dict[name] = local_full.cpu()
-                del local_full
 
         return state_dict
 
@@ -375,7 +377,7 @@ class NativeFSDPStrategy(TransformerStrategyBase):
         if self.device_mesh is not None:
             from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_state_dict
 
-            from .weight_state import with_tied_weight_aliases
+            from twinkle.model.state_dict_utils import with_tied_weight_aliases
             set_model_state_dict(
                 model,
                 with_tied_weight_aliases(self.unwrap_model(model), state_dict),
@@ -390,13 +392,7 @@ class NativeFSDPStrategy(TransformerStrategyBase):
         unwrapped = self.unwrap_model(model)
         state_dict = {}
 
-        ep_fsdp_mesh = self.ep_fsdp_device_mesh
-        ep_group = None
-        ep_world_size = 1
-        if ep_fsdp_mesh is not None:
-            ep_group = ep_fsdp_mesh['ep'].get_group()
-            ep_world_size = ep_fsdp_mesh['ep'].size()
-
+        ep_group, ep_world_size = self._ep_gather_context()
         ep_expert_names = _detect_ep_expert_names(unwrapped) if ep_world_size > 1 else set()
         adapter_suffix = f'.{adapter_name}.'
 
@@ -405,16 +401,10 @@ class NativeFSDPStrategy(TransformerStrategyBase):
                 continue
 
             local_full = torch_util.to_local_tensor(tensor)
-            if name in ep_expert_names and ep_world_size > 1 and ep_group is not None:
-                local_full = local_full.contiguous().to(Platform.get_local_device())
-                gathered = [torch.empty_like(local_full) for _ in range(ep_world_size)]
-                dist.all_gather(gathered, local_full, group=ep_group)
-                local_full = torch.cat(gathered, dim=_ep_expert_state_dict_gather_dim(name))
-                state_dict[name] = local_full.cpu()
-                del gathered, local_full
+            if name in ep_expert_names and ep_group is not None:
+                state_dict[name] = self._gather_ep_state_tensor(name, local_full, ep_group, ep_world_size)
             else:
                 state_dict[name] = local_full.cpu()
-                del local_full
 
         return state_dict
 

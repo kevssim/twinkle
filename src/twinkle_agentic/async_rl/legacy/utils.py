@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from twinkle.data_format import SampleResponse
-from .types import RolloutOutput
+from twinkle_agentic.async_rl.legacy.types import RolloutOutput
 
 
 @dataclass(frozen=True)

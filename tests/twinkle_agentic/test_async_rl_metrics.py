@@ -14,7 +14,7 @@ from twinkle.metric import (
     MetricRecord,
     create_metrics_reporter,
 )
-from twinkle_agentic.async_rl.legacy.metrics import advantage_signal_metrics, rollout_metrics
+from twinkle_agentic.async_rl.metrics import advantage_signal_metrics, rollout_metrics
 from twinkle.metric.reporting import MetricsReporter, _QueuedBackend
 
 

@@ -1,16 +1,4 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""The elasticity contract mounted onto every ``@remote_class`` driver handle.
-
-These methods manage the worker lifecycle of a remote component -- registering existing actors,
-adding replicas on reserved slots, pausing/draining/removing workers, and replaying configuration
-calls on freshly added ones. The code lives here, in infra, so a component class stays a pure
-business class: ``mount_worker_pool`` attaches the methods to the decorated class, and a caller
-just writes ``sampler.add_workers(...)`` like any ordinary method call.
-
-The per-handle state these methods share (``_sampler_workers`` & friends, created by
-``configure_workers``) lives on the handler instance, exactly where the dispatch wrapper and the
-continuous-work bookkeeping already look for it.
-"""
 import threading
 import uuid
 from contextlib import nullcontext
@@ -27,7 +15,7 @@ logger = get_logger()
 
 @dataclass
 class WorkerEntry:
-    """一个完整推理引擎的放置、准入状态及请求负载。"""
+    """Placement, admission state and request load of one full inference engine."""
 
     worker_id: str
     actor: Any
@@ -41,11 +29,12 @@ class WorkerEntry:
 
 
 class WorkerPool:
-    """弹性合同方法集；由 ``mount_worker_pool`` 挂载到 ``@remote_class`` 类上，``self`` 为 driver 侧 handler。
-
-    方法分四组：factory 记录（``_save_worker_factory``）、wrapper 钩子（准入选择、互斥锁、
-    完成记账——由 dispatch 的 wrapper 经 ``getattr`` 探测调用）、生命周期（configure/add/
-    activate/pause/drain/remove/close）、查询（worker_ids/ranks/inflight/idle）。
+    """Elasticity-contract methods mounted onto ``@remote_class`` classes by ``mount_worker_pool``;
+    ``self`` is the driver-side handler.
+    
+    Four groups: factory recording (``_save_worker_factory``), wrapper hooks (admission selection,
+    the mutex, completion bookkeeping -- probed by dispatch's wrapper via ``getattr``), lifecycle
+    (configure/add/activate/pause/drain/remove/close), and queries (worker_ids/ranks/inflight/idle).
     """
 
     def _save_worker_factory(self, cls, args, kwargs, torch_kwargs):
@@ -56,7 +45,8 @@ class WorkerPool:
     def __getstate__(self):
         state = self.__dict__.copy()
         if hasattr(self, '_actors'):
-            # 远程 payload 处理只需要原生 handler 的可序列化元数据；准入和在途状态仍归原 driver。
+            # The remote payload only needs the native handler's serialisable metadata; admission and
+            # in-flight state stay with the original driver.
             for key in ('_worker_lock', '_continous_work_state', '_sampler_workers',
                         '_suspended_workers', '_paused_generation_workers', '_creating_slots', '_worker_factory',
                         '_worker_configurations'):
@@ -66,7 +56,7 @@ class WorkerPool:
         return state
 
     def configure_workers(self, ranks, *, group=None, shared=False, state='WARMING'):
-        """在 driver 上登记已有 actors；不修改训练 mesh 或引擎内部并行规格。"""
+        """Register existing actors on the driver; does not touch the training mesh or the engine's internal parallel layout."""
         if not hasattr(self, '_actors') or getattr(self, '_admission_owned_elsewhere', False):
             raise RuntimeError('Worker lifecycle requires its original Ray driver handler.')
         if hasattr(self, '_sampler_workers'):
@@ -119,7 +109,7 @@ class WorkerPool:
     def _begin_worker_call(self, worker_ids, worker_selector):
         if not hasattr(self, '_sampler_workers'):
             return None
-        # 选择、屏障和 RPC 发送使用同一临界区；普通调用发出后在锁外收集结果。
+        # Selection, barrier and RPC send share one critical section; ordinary calls collect results outside the lock.
         self._worker_lock.acquire()
         try:
             if worker_ids is None and worker_selector is not None:
@@ -143,12 +133,13 @@ class WorkerPool:
                 if worker is not None:
                     worker.dispatching -= 1
 
-    # ---- 控制类调用的 barrier 防死锁豁免（长期机制，非过渡债） ----
-    # 新 pause_generation（sampler/partial_rollout.py）是 gate 挂起可续（非终结）：pause 返回后
-    # gate 仍闭合，停在 gate 上的 sample 是活跃 RPC，等它的 barrier 会死锁（只能由后续
-    # resume_generation 放行）。因此：控制方法自身（controls 名单）不做 barrier 等待；已暂停
-    # worker 上的在途 sample 获同样豁免。若要把业务名名单声明化消除，需给 pause 类方法设计
-    # 通用的完成记账声明（"该方法返回后其目标 worker 处于挂起态"），不能简单删除这三钩子。
+    # ---- Barrier deadlock exemption for control calls (a long-term mechanism, not transitional) ----
+    # pause_generation (sampler/partial_rollout.py) is a suspend-and-resume gate, not a terminator: after
+    # it returns the gate stays closed, and samples parked at the gate are still live RPCs, so a barrier
+    # waiting on them would deadlock (only resume_generation releases them). Hence control methods (the
+    # controls list) skip the barrier wait, and in-flight samples on paused workers get the same
+    # exemption. Removing the name list declaratively would need a generic completion contract for
+    # pause-like methods ("after this returns, its target worker is suspended"); the three hooks stay.
 
     def _worker_call_conflicts(self, current_method, pending_method, worker_id):
         if not hasattr(self, '_sampler_workers') or pending_method != 'sample':
@@ -165,7 +156,7 @@ class WorkerPool:
                 self._paused_generation_workers.difference_update(worker_ids)
 
     def _settle_worker_controls(self, method, submissions):
-        """分派或收集失败后，逐个确认已发出的暂停/恢复 RPC。"""
+        """After a dispatch or collect failure, confirm each already-sent pause/resume RPC one by one."""
         if method not in ('pause_generation', 'resume_generation'):
             return
         import ray
@@ -174,17 +165,17 @@ class WorkerPool:
             try:
                 ray.get(ref)
             except BaseException:
-                logger.warning('worker %s 的 %s 未成功完成。', worker_id, method, exc_info=True)
+                logger.warning('%s on worker %s did not complete successfully.', method, worker_id, exc_info=True)
             else:
                 self._worker_call_completed(method, (worker_id,))
 
     def _record_worker_configuration(self, method, args, kwargs):
-        """记录一次配置调用，供新加 worker 重放；触发条件（replay 声明）由 dispatch 的 wrapper 判定。"""
+        """Record one configuration call for replay onto newly added workers; the trigger (the replay declaration) is decided by dispatch's wrapper."""
         with self._worker_lock:
             self._worker_configurations.append((method, tuple(args), dict(kwargs)))
 
     def add_workers(self, group, ranks, *, worker_slots=None, shared=False, engine_args=None):
-        """从已预留的完整 slot 创建 actors；完成配置后仍不接收新请求。"""
+        """Create actors from reserved full slots; still admits no new requests until configured."""
         from ._ray import RayHelper
         from twinkle.utils import DeviceMesh
 
@@ -230,7 +221,7 @@ class WorkerPool:
                     self._sampler_workers[worker_id] = WorkerEntry(
                         worker_id, actor, group, physical_ranks, shared=shared)
                 self._worker_ready(_worker_ids=worker_ids)
-                # 全量配置调用与新 actor 的安装/重放互斥，避免漏放或重复执行 patch。
+                # Full-configuration calls and new-actor install/replay are mutually exclusive, to avoid missed or duplicated patches.
                 for method, args, kwargs in self._worker_configurations:
                     result = getattr(self, method)(*args, _worker_ids=worker_ids, **kwargs)
                     if callable(result):
@@ -240,7 +231,7 @@ class WorkerPool:
             try:
                 self._discard_workers(actors)
             except Exception:
-                logger.warning('构造失败后未能完整关闭 workers。', exc_info=True)
+                logger.warning('Failed to fully shut down workers after a construction error.', exc_info=True)
             raise
         finally:
             with self._worker_lock:
@@ -291,7 +282,7 @@ class WorkerPool:
         return sum(self.worker_inflight(self.worker_ids()))
 
     def workers_idle(self, worker_ids):
-        """只检查控制状态，不通过读取生成输出判断 actor 是否可以退役。"""
+        """Check control state only -- an actor is retired without reading generation output."""
         import ray
         worker_ids = tuple(worker_ids)
         with self._worker_lock:
@@ -320,18 +311,23 @@ class WorkerPool:
             workers = [self._sampler_workers[worker_id] for worker_id in worker_ids]
             if any(worker.state == 'ACTIVE' for worker in workers):
                 raise RuntimeError('Drain or pause workers before removing them.')
-            if not self.workers_idle(worker_ids):
-                return False
-            self._discard_workers(tuple(worker.actor for worker in workers))
-            return True
+        # Remote probes and the discard's ray.kill run OUTSIDE the pool lock: a hung worker RPC must
+        # never freeze the whole pool (every submit takes this lock to choose workers).
+        if not self.workers_idle(worker_ids):
+            return False
+        self._discard_workers(tuple(worker.actor for worker in workers))
+        return True
 
     def add_replicas(self, group):
-        """为模型类组件扩副本（区别于 add_workers 的引擎 worker 池：无记账/准入/配置重放）。
-
-        对象是组件自身的 actor 副本——冻结前向类（RM/reference/teacher）的 scale-up：新 actor 由
-        构造时记录的 factory 复刻（从 checkpoint 直接加载，无权重同步），``_actors`` 与跨副本
-        device_mesh 同步增长后，slice_dp 分派与 collect 立即把新副本纳入分片。资源放置由 group
-        的预留 slot 决定（与构造时同源），不逐一校验 slot 占用。
+        """Add model-component replicas (unlike add_workers' engine pool: no bookkeeping, admission
+        or config replay).
+        
+        The targets are the component's own actor replicas -- scale-up for frozen forward classes
+        (RM/reference/teacher): each new actor is cloned from the factory recorded at construction
+        (loaded straight from the checkpoint, no weight sync); after ``_actors`` and the cross-replica
+        device_mesh grow together, slice_dp dispatch and collect immediately include the new replica.
+        Placement follows the group's reserved slots (same source as construction); slot occupancy is
+        not re-validated.
         """
         from ._ray import RayHelper
         from twinkle.utils import DeviceMesh
@@ -354,7 +350,7 @@ class WorkerPool:
         return tuple(get_worker_id(actor) for actor in actors)
 
     def remove_replicas(self, worker_ids):
-        """按 id 退役模型副本：actor 表收缩、mesh 同步收缩，ray.kill 终止（镜像 add_replicas）。"""
+        """Retire model replicas by id: shrink the actor table and mesh in step, terminate via ray.kill (mirror of add_replicas)."""
         import ray
 
         worker_ids = tuple(worker_ids)
@@ -383,7 +379,7 @@ class WorkerPool:
         return True
 
     def _discard_workers(self, actors):
-        """终止引擎与 actors；即使某个关闭失败，也继续清理其余成员。"""
+        """Terminate engines and actors; keep cleaning the remaining members even if one close fails."""
         import ray
 
         actors = tuple(actors)
@@ -428,7 +424,7 @@ class WorkerPool:
             raise error
 
     def close_workers(self):
-        """仅在终止整个组件时使用；关闭准入、取消请求并清理所有引擎。"""
+        """Use only when terminating the whole component: close admission, cancel requests, clean up all engines."""
         if getattr(self, '_admission_owned_elsewhere', False):
             raise RuntimeError('Worker lifecycle belongs to its original driver handler.')
         if not hasattr(self, '_actors'):
@@ -457,11 +453,11 @@ _POOL_METHODS = (
 
 
 def mount_worker_pool(cls) -> None:
-    """把弹性合同方法挂载到 ``@remote_class`` 装饰的类上。
+    """Mount the elasticity-contract methods onto a ``@remote_class`` decorated class.
 
-    方法体住 infra（本模块），组件类本体零这些方法、零 RayHelper；调用方写
-    ``component.add_workers(...)`` 与普通方法调用无异。类体已定义同名方法时 raise，
-    防止无声遮蔽组件自己的语义。
+    The bodies live in infra (this module); the component class itself has none of these methods and
+    no RayHelper. Callers write ``component.add_workers(...)`` like any plain method. A same-named
+    method already on the class raises, so it cannot silently shadow the component's own semantics.
     """
     for name in _POOL_METHODS:
         if name in cls.__dict__:

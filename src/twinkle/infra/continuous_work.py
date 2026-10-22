@@ -1,13 +1,4 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Continuous-work protocol: least-loaded routing, in-flight bookkeeping and the drain barrier.
-
-A method declared with ``enable_continous_work`` on a ``max_concurrency`` actor runs several of
-its requests side by side in the worker's engine. The helpers here track which refs are still
-running on which worker (``_cw_state``), route new requests to the least busy worker
-(``_run_continous_work``), and let any *other* method wait for those refs before touching the
-same workers (``_cw_barrier``). Worker identity (``get_worker_id``) and worker-list resolution
-(``_select_workers``) live here too, being shared by the barrier, the pool and dispatch.
-"""
 import functools
 import os
 import threading
@@ -32,7 +23,7 @@ def _get_workers(workers, execute):
 
 
 def get_worker_id(worker) -> str:
-    """返回 Ray actor 的稳定身份，与它在 handler 中的位置无关。"""
+    """Return the Ray actor's stable identity, independent of its position in the handler."""
     return worker._actor_id.hex()
 
 
@@ -332,6 +323,9 @@ def _resolve_sticky_key(sticky_key, func, args, kwargs):
             parameters = list(inspect.signature(func).parameters)
         except (TypeError, ValueError):
             return None
+        if parameters and parameters[0] == 'self':
+            # func is the unbound class-body function; the wrapper's args exclude self.
+            parameters = parameters[1:]
         if param_name not in parameters:
             return None
         position = parameters.index(param_name)

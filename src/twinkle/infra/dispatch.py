@@ -1,12 +1,4 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Remote-call declaration and dispatch: the ``remote_class``/``remote_function`` decorators.
-
-The wrapper decides, from the decorator's declaration and the process mode, whether a call runs
-locally, is re-dispatched inside a worker, or fans out from the driver to the actors; it also
-applies collect semantics and the lazy-collect policy. Process-level knobs (_mode, _lazy_collect,
-notifier...) stay in ``twinkle.infra`` and are read through the module object at call time, so a
-later ``initialize`` is always honoured -- a ``from``-import would freeze the value at import time.
-"""
 import functools
 import inspect
 import os
@@ -595,8 +587,8 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
             pinned worker instead of re-routing.
         replay: Record the call so newly added workers replay it on mount
             (configuration replay: template/adapter/patch setup).
-        worker_selector: 可选的实例方法名，返回本次调用的稳定 actor ID 子集；
-            显式传入的内部参数 ``_worker_ids`` 优先于该选择方法。
+        worker_selector: optional instance-method name returning the stable actor-ID subset for this
+            call; the internal ``_worker_ids`` parameter, when passed explicitly, takes precedence.
     """ # noqa
     if sticky and sticky_key is None:
         raise ValueError('remote_function(sticky=True) requires sticky_key (a field-path string or a callable).')
@@ -721,7 +713,10 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
                             args, kwargs = self._normalize_sampling_args(args, kwargs)
                         _dispatch = (getattr(self, '_dispatch_sampling_inputs', 'slice')
                                      if _subset and dispatch == 'slice_dp' else dispatch)
-                        _mesh = None if _subset else device_mesh
+                        # Read the mesh only after the worker set is chosen (inside the pool lock's
+                        # dispatch window) so an add/remove replica cannot interleave a stale mesh with a
+                        # new actor list.
+                        _mesh = None if _subset else getattr(self, 'device_mesh', None)
                         _concurrent_actor = bool(getattr(self, '_max_concurrency', None))
                         _track_calls = (_concurrent_actor or _subset or _worker_reservation is not None
                                         or _sticky_key_value is not None)
@@ -763,7 +758,7 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
                                 _sticky_bind(self, _sticky_key_value, get_worker_id(worker))
                             _tracked_refs.extend(_cw_register(self, func.__name__, [result], [worker]))
 
-                        # 配置后的 sampler 不持有选择锁等待同步 RPC 的结果。
+                        # A configured sampler does not hold the selection lock while waiting for a sync RPC's result.
                         _sync_sampler = sync and _worker_reservation is not None
                         if _sync_sampler:
                             execute_method = RayHelper.execute_all_async
@@ -809,7 +804,7 @@ def remote_function(dispatch: Union[Literal['slice', 'all', 'slice_dp', 'last_pp
                             _local_lazy_collect = False
                         if _local_lazy_collect:
                             if _subset or _worker_reservation is not None:
-                                # 子集调用的载荷跨 Ray 流转时，不捕获 driver handler 的锁与生命周期状态。
+                                # When a subset call's payload crosses Ray, it must not capture the driver handler's locks or lifecycle state.
                                 return result_func
                             _orig_result_func = result_func
 

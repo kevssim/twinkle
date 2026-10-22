@@ -55,6 +55,7 @@ class PolicyProvider:
 
 class GenerationHarness:
     _merge_partial_responses = VLLMSamplerTQ._merge_partial_responses
+    _run_partial_rollout = VLLMSamplerTQ._run_partial_rollout
 
     def __init__(self, policies, responses):
         self.context_manager = LocalActorHandle(PolicyProvider(policies))
@@ -76,7 +77,7 @@ def _context(name: str = 'adapter') -> LoraContext:
     return LoraContext('tenant', f'run_{name}', 'model', name)
 
 
-def _sample_response(tokens, stop_reason, input_ids):
+def _sample_response(tokens, stop_reason, input_ids, *, new_state=None):
     return SampleResponse(
         prompt_token_ids=[1, 2],
         sequences=[
@@ -88,6 +89,7 @@ def _sample_response(tokens, stop_reason, input_ids):
                     'input_ids': input_ids,
                     'labels': [-100, -100, *tokens],
                 },
+                new_state=new_state,
             )
         ],
     )
@@ -395,8 +397,8 @@ def test_aborted_generation_continues_from_partial_tokens_when_enabled():
     sampler = GenerationHarness(
         policies,
         [
-            _sample_response([7], 'abort', [1, 2, 7]),
-            _sample_response([8], 'stop', [1, 2, 7, 8]),
+            _sample_response([7], 'abort', [1, 2, 7], new_state='state-1'),
+            _sample_response([8], 'stop', [1, 2, 7, 8], new_state='state-2'),
         ],
     )
     generated = asyncio.run(
@@ -415,6 +417,7 @@ def test_aborted_generation_continues_from_partial_tokens_when_enabled():
 
     assert sampler.calls == [([1, 2], 4, 3), ([1, 2, 7], 3, 4)]
     assert generated.response.sequences[0].tokens == [7, 8]
+    assert generated.response.sequences[0].new_state == 'state-2'
     assert [policy.version for policy in generated.policies] == [3, 4]
     assert generated.initial_policy.version == 3
     assert generated.final_policy.version == 4

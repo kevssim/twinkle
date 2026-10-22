@@ -1,13 +1,4 @@
-"""The generic scoring worker: the ONE remote boundary that orchestrates reward scoring.
-
-Algorithm-agnostic scoring orchestration for the streaming RL driver: resolve rollout-sample
-refs where the data lives, rebuild the scoring rows, run every ORM scorer, and return small
-sample-major reward rows -- the driver never materializes token-scale data. Both scoring
-CHANNELS (ORM outcome rows, PRM per-token process rewards) are protocol here and live in this
-base; algorithm-specific halves (advantage fusion, teacher reweighting) stay in the caller's
-subclass. The PRM step SEGMENTATION is an injected plugin callable (``prm_step_scorer``):
-the caller's object, executed inside this actor.
-"""
+# Copyright (c) ModelScope Contributors. All rights reserved.
 from __future__ import annotations
 
 import json

@@ -1,4 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import importlib
 import inspect
 from copy import copy, deepcopy
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, TypeVar
@@ -11,6 +12,31 @@ if TYPE_CHECKING:
 
 logger = get_logger()
 _T = TypeVar('_T')
+
+
+def construct_template(template_cls, **kwargs):
+    template_spec = kwargs.pop('template_spec', None)
+    if template_spec is None:
+        import twinkle.template
+        from twinkle.template.base import Template
+        from twinkle.utils import construct_class
+
+        return construct_class(template_cls, Template, twinkle.template, **kwargs)
+    if kwargs:
+        raise TypeError(f'Unexpected TemplateSpec construction arguments: {sorted(kwargs)}')
+    if isinstance(template_cls, str):
+        module, separator, name = template_cls.rpartition('.')
+        if not separator:
+            raise ValueError('A TemplateSpec factory must be a dotted class path.')
+        template_cls = getattr(importlib.import_module(module), name)
+    from twinkle.template.contract import TemplateSpec
+
+    if isinstance(template_spec, dict):
+        template_spec = TemplateSpec.from_dict(template_spec)
+    factory = getattr(template_cls, 'from_spec', None)
+    if factory is None:
+        raise TypeError(f'{template_cls!r} does not implement from_spec().')
+    return factory(template_spec)
 
 
 def _coerce_ids_to_list(ids: Any) -> List[int]:

@@ -266,7 +266,7 @@ class RayHelper:
             remote_call = getattr(worker, method_name)
             result = remote_call.remote(*args, **kwargs)
             output.append(result)
-            # 逐个登记，后续 RPC 发送失败也不能丢失已发出的 refs。
+            # Register one by one so already-sent refs are never lost if a later RPC send fails.
             if on_submit is not None:
                 on_submit(worker, result)
         return output

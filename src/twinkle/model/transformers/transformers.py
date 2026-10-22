@@ -48,6 +48,7 @@ from twinkle.patch import Patch, apply_context, apply_patch
 from twinkle.perf import timed
 from twinkle.processor import InputProcessor
 from twinkle.template import Template
+from twinkle.template.utils import construct_template
 from twinkle.utils import (construct_class, get_logger, prepare_replayed_selective_log_softmax,
                            replayed_selective_log_softmax, selective_log_softmax, torch_util)
 from twinkle.utils.framework import Torch
@@ -2645,9 +2646,9 @@ class TransformersModel(TrainableModel, PreTrainedModel, CheckpointEngineMixin, 
         """
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
-        kwargs['model_id'] = self.tokenizer_id
-        template = construct_class(template_cls, Template, twinkle.template, **kwargs)
-        optimizer_config.template = template
+        if 'template_spec' not in kwargs:
+            kwargs['model_id'] = self.tokenizer_id
+        optimizer_config.template = construct_template(template_cls, **kwargs)
 
     @remote_function()
     def set_processor(self, processor_cls: Union[Type[InputProcessor], str, InputProcessor, Callable], **kwargs):

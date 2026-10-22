@@ -14,14 +14,16 @@ from twinkle.data_format import (InputFeature, PoolingParams, PoolingResponse, S
 from twinkle.patch import Patch
 from twinkle.sampler import generation
 from twinkle.template import Template
-from twinkle.utils import construct_class
+from twinkle.template.utils import construct_template
 
 
 def _dispatch_request(worker_count: int, worker_index: int, args: tuple, kwargs: dict, **_):
-    """submit 的路由策略：单条请求按 request_id 哈希定向唯一 worker，其余 worker 收空。
+    """submit's routing policy: one request hashed by request_id onto exactly one worker, the rest
+    receive an empty batch.
 
-    确定性、零状态、分布均匀：同一 request_id 永远落同一 worker（与 sticky 归属叠加时，
-    有归属的调用已被 wrapper 定向到唯一 worker，此处 target 恒为 0，二者自洽）。
+    Deterministic, stateless, evenly spread: the same request_id always lands on the same worker
+    (when combined with sticky ownership the wrapper already pins the call to a single worker, so
+    target is always 0 there -- the two stay consistent).
     """
     trajectory = args[0] if args else kwargs.get('trajectory')
     request_id = trajectory.get('request_id') if isinstance(trajectory, dict) else None
@@ -50,7 +52,7 @@ class Sampler(ABC):
 
     @staticmethod
     def _dispatch_sampling_inputs(worker_count, worker_index, args, kwargs, **_):
-        """仅切分顶层 inputs，保留每条输入内部的 token、tensor 和多模态字段。"""
+        """Slice only the top-level inputs, keeping each input's tokens, tensors and multimodal fields intact."""
         args, kwargs = list(args), dict(kwargs)
         inputs = args[0] if args else kwargs['inputs']
         batch = list(inputs) if isinstance(inputs, (list, tuple)) else [inputs]
@@ -170,33 +172,34 @@ class Sampler(ABC):
 
     @remote_function(dispatch='all', collect='first', lazy_collect=False, exclusive=True, replay=True)
     def set_template(self, template_cls: Union[Template, Type[Template], str], **kwargs):
-        if 'model_id' not in kwargs and hasattr(self, 'model_id'):
+        if 'template_spec' not in kwargs and 'model_id' not in kwargs and hasattr(self, 'model_id'):
             kwargs['model_id'] = self.model_id
-        template = construct_class(template_cls, Template, twinkle.template, **kwargs)
-        self.template = template
+        self.template = construct_template(template_cls, **kwargs)
 
     @remote_function(dispatch='all', collect='first', lazy_collect=False, exclusive=True, replay=True)
     def add_adapter_to_sampler(self, adapter_name: str, config: PeftConfig) -> None:
         raise NotImplementedError
 
     # ------------------------------------------------------------------
-    # 异步三件套：submit / pause / stop
+    # Async trio: submit / pause / stop
     # ------------------------------------------------------------------
     def _submit_in_loop(self, coro) -> Future:
-        """把协程挂到引擎后台事件循环，交回本线程可等待的 Future。
-
-        引擎侧异步簿记（事件循环调度与 Future 传递），不是跨调用状态：请求结束 Future 即完成。
+        """Schedule the coroutine on the engine's background event loop, returning a Future waitable
+        from this thread.
+        
+        Engine-side async bookkeeping (loop scheduling and Future hand-off), not cross-call state:
+        the Future completes as soon as the request finishes.
         """
         return asyncio.run_coroutine_threadsafe(coro, self._async_loop)
 
     @staticmethod
     async def _gather_generation_tasks(coroutines):
-        """一个输入失败或取消后，等同批次的全部生成协程结束再释放 submission。"""
+        """After one input fails or is cancelled, wait for the whole batch's generation coroutines to end before releasing the submission."""
         tasks = []
         try:
             for coroutine in coroutines:
                 tasks.append(asyncio.create_task(coroutine))
-            # 父任务取消不自动再次取消正在执行清理的子任务。
+            # A cancelled parent task does not re-cancel child tasks that are already running cleanup.
             return await asyncio.shield(asyncio.gather(*tasks))
         except BaseException:
             for task in tasks:
@@ -222,18 +225,22 @@ class Sampler(ABC):
         token_only: bool = False,
         allow_partial_rollout: bool = False,
     ) -> Future:
-        """提交单条轨迹的生成，立即返回 Future（done/result/exception/ready 同一合同）。
-
-        本地返回本线程 Future（生成在引擎后台循环上跑）；远程返回 lazy 引用（引用在生成真正
-        完成时才就绪，可整体直传下游）。request_id 在提交前建立：无则就地生成并写回轨迹。
-        生成结果（自然完成或被 pause/stop 终结后的 partial）一律从该 Future 取：单元素列表
-        （与 sample 的批量返回约定同构）。``allow_partial_rollout`` 与 sample 同语义：在途
-        生成被权重发布 abort 后由引擎从自身 token 续跑（深缓冲模式）；该模式下不与
-        pause/stop 携手（后者是终结语义，二者是互斥的部署形态选择）。
+        """Submit one trajectory's generation and return a Future immediately (done/result/exception/
+        ready share one contract).
+        
+        Locally this is a same-thread Future (generation runs on the engine's background loop);
+        remotely it is a lazy reference that becomes ready only when the generation truly finishes and
+        can be passed whole to downstream actors. request_id is established before submission: minted
+        in place and written back onto the trajectory when absent. Every result (natural completion or
+        the partial after a pause/stop termination) is read from that Future: a single-element list
+        (same shape as sample's batch return). ``allow_partial_rollout`` matches sample's semantics:
+        an in-flight generation aborted by a weight publish resumes from its own tokens (deep-buffer
+        mode); that mode does not pair with pause/stop (the latter are terminal semantics -- the two
+        are mutually exclusive deployment choices).
         """
-        if not hasattr(self, '_async_loop'):
-            raise NotImplementedError(f'{type(self).__name__} does not support async submission; '
-                                      'async RL uses the vLLM/SGLang samplers.')
+        if not hasattr(self, '_generate_inputs'):
+            raise NotImplementedError(f'{type(self).__name__} does not support async submission: it has no '
+                                      '_generate_inputs engine coroutine; async RL uses the vLLM/SGLang samplers.')
         if 'request_id' not in trajectory:
             trajectory['request_id'] = uuid.uuid4().hex
         return self._submit(trajectory, sampling_params, adapter_name, adapter_path,
@@ -253,10 +260,12 @@ class Sampler(ABC):
         token_only: bool = False,
         allow_partial_rollout: bool = False,
     ):
-        """worker 半区：把生成挂到引擎后台循环并交回 Future。
+        """Worker half: schedule the generation on the engine's background loop and return the Future.
 
-        infra 在 worker 侧展开等待（调用方引用在生成完成时就绪），本地则原样返回 Future——
-        组件体不感知部署形态。哈希路由的非目标 worker 收到 None，立即空批返回。
+        infra unwraps the wait on the worker side (the caller's reference comes ready when the
+        generation finishes); locally the Future is returned as is -- the component body never senses
+        the deployment form. Non-target workers of the hash routing receive None and return an empty
+        batch immediately.
         """
         if trajectory is None:
             return []
@@ -266,25 +275,26 @@ class Sampler(ABC):
                                   allow_partial_rollout=allow_partial_rollout))
 
     def pause(self, trajectory: Trajectory) -> bool:
-        """终结在途请求并等收尾；返回 True 后 submit 的 Future 必然就绪。
-
-        partial（stop_reason='abort' + 已生成 token）在 submit 的 Future 里，续接轨迹的组装
-        归调用方（multiturnrollout/driver，多轮状态层）。
+        """Terminate the in-flight request and wait for the settle; once True returns, submit's Future
+        is necessarily done.
+        
+        The partial (stop_reason='abort' + generated tokens) lives in submit's Future; assembling the
+        resumed trajectory belongs to the caller (multiturnrollout/driver, the multi-turn state layer).
         """
         return self._pause(trajectory['request_id'])
 
     @remote_function(dispatch='all', collect='first', lazy_collect=False, control=True,
                      sticky_key='request_id', enable_continous_work=True)
     def _pause(self, request_id: str) -> bool:
-        """worker 半区：abort 引擎请求并轮询在途注册表至注销（收尾确认）。"""
+        """Worker half: abort the engine request and poll the in-flight registry until it is unregistered (settle confirmation)."""
         return self._terminate_request(request_id).result()
 
     def stop(self, trajectory: Trajectory) -> bool:
-        """终结请求；引擎操作与 pause 相同，语义差别由调用方对 partial 的处置表达（stop 后丢弃）。"""
+        """Terminate the request; the engine operation equals pause's -- the semantic difference is the caller's disposal of the partial (dropped after stop)."""
         return self._pause(trajectory['request_id'])
 
     def _terminate_request(self, request_id: str) -> Future:
-        """engine 侧终结：挂后台循环执行 abort + 收尾轮询，交回 Future。"""
+        """Engine-side termination: run abort + settle polling on the background loop, return a Future."""
 
         async def _terminate():
             await self.engine.abort_request(request_id)

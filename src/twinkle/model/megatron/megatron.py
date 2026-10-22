@@ -36,6 +36,7 @@ from twinkle.patch import Patch, apply_context, apply_patch
 from twinkle.perf import timed
 from twinkle.processor import InputProcessor
 from twinkle.template import Template
+from twinkle.template.utils import construct_template
 from twinkle.utils import construct_class, get_logger, selective_log_softmax
 from .moe.router_replay import RouterReplay
 from .mtp.mtp import MtpTrainingState
@@ -1981,8 +1982,9 @@ class MegatronModel(TrainableModel, nn.Module, CheckpointEngineMixin):
         """
         adapter_name = kwargs.pop('adapter_name', self._get_default_group())
         optimizer_config = self.optimizer_group[adapter_name]
-        kwargs['model_id'] = self.tokenizer_id
-        optimizer_config.template = construct_class(template_cls, Template, twinkle.template, **kwargs)
+        if 'template_spec' not in kwargs:
+            kwargs['model_id'] = self.tokenizer_id
+        optimizer_config.template = construct_template(template_cls, **kwargs)
 
     @remote_function(dispatch='all')
     def set_processor(self, processor_cls: Union[InputProcessor, Type[InputProcessor], str, Callable], **kwargs):

@@ -1,28 +1,4 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Engine-agnostic partial rollout (interrupt/resume) for the core samplers.
-
-Deep-buffer async RL republishes the policy weights while generations are still in flight. With in-place
-weight sync the sampler holds a single live weight copy, so an in-flight generation would otherwise decode
-its second half under half-updated weights -- its logprobs then match no consistent policy version and
-importance-sampling correction cannot repair them. Partial rollout fixes this: on republish the driver
-aborts every in-flight request (:meth:`PartialRolloutMixin.abort_all_inflight`), each aborted generation
-comes back with ``stop_reason='abort'`` plus the tokens it produced so far, and the resume loop below
-continues it from ``new_input_feature`` on the fresh weights, merging the segments at the end.
-
-The abort/resume *data contract* is already engine-agnostic -- ``SampledSequence`` carries ``stop_reason``
-and ``new_input_feature``, and both the vLLM and SGLang engines map an aborted request to
-``stop_reason='abort'`` -- so this mixin holds the one shared resume/merge loop plus the in-flight request
-registry, and each backend supplies only two engine hooks: ``_sample_single`` (already present) and an
-``async def abort_request(request_id)`` on its engine wrapper. It lives here in the core ``twinkle.sampler``
-package so the plain :class:`~twinkle.sampler.vllm_sampler.vLLMSampler` /
-:class:`~twinkle.sampler.sglang_sampler.SGLangSampler` and the higher-level ``twinkle_agentic``
-TransferQueue samplers share one implementation, so a resume-logic fix never has to be mirrored across
-backends or layers.
-
-Contract for a concrete subclass: be decorated with ``@remote_class()``, own a running background event
-loop at ``self._async_loop``, initialise ``self._inflight_request_ids`` to a set, expose ``self.engine``
-with an ``async def abort_request(request_id)``, and implement ``async def _sample_single(...)``.
-"""
 from __future__ import annotations
 
 import asyncio
@@ -96,7 +72,7 @@ class PartialRolloutMixin:
         await self.engine.abort_request(request_id)
 
     async def _sample_engine_request(self, request_id: str, coroutine) -> SampleResponse:
-        """取消调用方时显式 abort，并等真实引擎调用结束后才注销请求。"""
+        """On caller cancellation abort explicitly, and unregister the request only after the real engine call ends."""
         try:
             await self._wait_generation_gate()
             task = asyncio.create_task(coroutine)
@@ -111,7 +87,7 @@ class PartialRolloutMixin:
                 try:
                     await self._abort_request(request_id)
                 except BaseException as error:
-                    logger.warning('取消引擎请求 %s 失败，等待请求自然结束：%s', request_id, error)
+                    logger.warning('Failed to abort engine request %s; waiting for it to end naturally: %s', request_id, error)
                 await asyncio.gather(task, return_exceptions=True)
 
             cleanup_task = asyncio.create_task(cleanup())
@@ -247,6 +223,7 @@ class PartialRolloutMixin:
                     logprobs=logprobs,
                     decoded=self.template.decode(tokens),
                     new_input_feature=final_sequence.new_input_feature,
+                    new_state=final_sequence.new_state,
                     routed_experts=final_sequence.routed_experts,
                 )
             ],
@@ -257,7 +234,8 @@ class PartialRolloutMixin:
         original_input: dict[str, Any],
         sampling_params: SamplingParams,
         *,
-        run_attempt: Callable[[Any, SamplingParams, int], Awaitable[tuple[SampleResponse, Any]]],
+        run_attempt: Callable[[Any, Any, SamplingParams, int], Awaitable[tuple[SampleResponse, Any]]],
+        original_state: Any = None,
         allow_partial_rollout: bool = False,
         max_retries: int = 0,
         retry_delay_s: float = 0.0,
@@ -274,6 +252,7 @@ class PartialRolloutMixin:
         stop ends the loop, merging any accumulated segments first.
         """
         current_input = original_input
+        current_state = original_state
         partial_responses: list[SampleResponse] = []
         partial_states: list[Any] = []
         generated_tokens = 0
@@ -294,7 +273,7 @@ class PartialRolloutMixin:
                 attempts += 1
                 handover_abort = False
                 try:
-                    response, attempt_state = await run_attempt(current_input, attempt_params, attempt)
+                    response, attempt_state = await run_attempt(current_input, current_state, attempt_params, attempt)
                     sequence = response.sequences[0]
                 except Exception as exc:
                     last_error = exc
@@ -318,12 +297,14 @@ class PartialRolloutMixin:
                         partial_states.append(attempt_state)
                         generated_tokens += len(sequence.tokens)
                         current_input = sequence.new_input_feature
+                        current_state = sequence.new_state or current_state
                         if sampling_params.max_tokens is not None and generated_tokens >= sampling_params.max_tokens:
                             return PartialRolloutOutcome(
                                 self._merge_partial_responses(partial_responses, stop_reason='length'),
                                 tuple(partial_states), attempts, was_aborted, resumed_partial_output)
                     elif not allow_partial_rollout:
                         current_input = original_input
+                        current_state = original_state
 
                 # Resource handover is not a generation failure and does not consume the ordinary retry budget.
                 if handover_abort:

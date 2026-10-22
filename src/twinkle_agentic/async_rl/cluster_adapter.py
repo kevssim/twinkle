@@ -1,27 +1,4 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Cluster elasticity for online RL: estimate a resource plan, and adaptively move sampler replicas.
-
-The trainer world is immutable: runtime changes always move one COMPLETE replica (add/remove the
-sampler's Ray actors) and never alter training collectives or batch geometry. Three capabilities live
-here, one per recipe seam:
-
-* :func:`estimate_plan` -- pure static planning from the HF config + prompt lengths + card memory
-  ('manual' returns None; 'estimate'/'adaptive' produce an :class:`RLResourcePlan` and write the
-  derived parallel sizes back into the caller's configs). Runs BEFORE twinkle.initialize, so the
-  device groups and engine args are built from the planned sizes.
-* :class:`ClusterAdapter` -- the 'adaptive' runtime: observes trainer-idle / sampler-busy windows at
-  publish boundaries and moves whole replicas between a dedicated pool, a shared (borrowed-GPU) pool
-  and a pre-reserved flex pool. What dev split across an ``AdaptiveResourceController`` plus an
-  ``AdaptiveColocateHandover`` that pointed at each other is ONE object here.
-* :meth:`ClusterAdapter.publish` -- the whole weight-publication barrier as one call: quiesce
-  admission, run the controller's prepare/finish phases around the dedicated NCCL sync, borrow the
-  shared engines, and restore everything on failure. The recipe's visible loop body is
-  ``adapter.publish() if adapter else engine.sync_weights()``.
-
-Scale safety invariants kept from the dev original: a frozen model's rank count comes from its OWN
-parallel spec (never a hard-coded single GPU); flex GPUs are reserved at initialization and must hold
-one complete sampler replica; the plan's non-shared + flex ranks form a contiguous range from zero.
-"""
 from __future__ import annotations
 
 import math

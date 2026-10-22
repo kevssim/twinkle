@@ -1,35 +1,4 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Weight-publication strategies for the async-RL trainer.
-
-When a training partition finishes, the trainer must make the just-trained
-policy visible to the sampler before the next rollout.  How that happens is
-model- and deployment-specific, so the training caller receives it as an injected
-``save_adapter`` callable (the archived TQ runtime's TrainerWorker shaped this seam;
-the streaming driver's publish push is the current caller) instead of hard-coding
-one mechanism.  The strategies here are the concrete, named forms of that callable:
-
-* :class:`AdapterSnapshotSync` -- save a LoRA adapter to disk and let the sampler
-  load that snapshot.  Every version is a distinct path, so several can stay
-  resident at once and ``max_staleness`` may exceed 1.
-* :class:`InPlaceWeightSync` -- overwrite the sampler's single live copy of the
-  weights (twinkle's ``CheckpointEngineManager``).  The transport is a deployment
-  choice, not a separate strategy: ``mode='colocate'`` pushes over CUDA IPC on a
-  shared GPU, ``mode='standalone'`` pushes over NCCL to a disaggregated sampler
-  (verl's checkpoint-engine approach).  How much staleness this allows follows
-  from the deployment, not from there being one copy: a colocated sampler must
-  sit idle while it is overwritten, so at most one batch can be in flight
-  (``max_staleness <= 1``); a disaggregated sampler keeps generating on its own
-  GPUs between sparse syncs, so queued samples may be several versions old
-  (``max_staleness > 1``), exactly verl's fully-async regime.
-
-A strategy is callable with the ``(admission) -> handle`` signature the
-``save_adapter`` seam expects, so it drops into that call site unchanged.  The handle is the version-pinning token: a disk path for
-:class:`AdapterSnapshotSync`, ``None`` for :class:`InPlaceWeightSync` (its single
-live copy needs no pinning).  Both are plain objects holding one callback, so
-they cross the Ray actor boundary exactly like the ``partial`` callables the
-pipeline injects today.
-"""
-
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
@@ -82,41 +51,16 @@ class AdapterSnapshotSync(WeightSyncStrategy):
 
 
 class InPlaceWeightSync(WeightSyncStrategy):
-    """Overwrite the sampler's single live copy of the weights; keep no snapshot.
+    """Overwrite the sampler's single live copy of the weights; ``publish`` returns ``None``.
 
-    ``sync_fn`` is the in-place weight-sync callback -- in dev, the rollout
-    engine's ``sync_weights``, backed by twinkle's ``CheckpointEngineManager``
-    (CUDA IPC when colocated, NCCL when the sampler is disaggregated).  It leaves
-    the sampler generating from the just-trained policy, so ``publish`` returns
-    ``None``: there is no per-version path to pin.
-
-    ``abort_fn`` is the abort-on-publish hook that makes overwriting a single live
-    copy sound for a deep buffer.  A disaggregated sampler is still generating when
-    the trainer publishes, so overwriting its weights mid-decode would produce the
-    rest of that generation's tokens under half-updated weights, whose recorded
-    logprobs then match no consistent policy version and importance sampling cannot
-    correct.  ``publish`` therefore calls ``abort_fn`` BEFORE ``sync_fn``: it
-    interrupts every in-flight generation (twinkle's ``abort_all_inflight``), each
-    of which returns the tokens it produced so far with ``stop_reason='abort'`` and
-    a resume point, and the partial-rollout loop then re-submits it from that point
-    ON THE NEW WEIGHTS.  No generation decodes across the overwrite, so each
-    segment's logprobs match a single consistent version (the pre-abort segment the
-    old one, the resumed segment the new one) and the off-policy correction stays
-    valid.  ``abort_fn`` is optional and a no-op when nothing is in flight -- a
-    strictly synchronous sampler is idle at the sync point (nothing admitted ahead),
-    so a strategy built without it is still correct there; any streaming driver that
-    admits a lookahead window has a generation in flight when it publishes, which is
-    why ``dev.config.validate._check_streaming_publication`` refuses in_place under
-    the streaming regimes unless partial rollout supplies the abort.
-
-    The staleness this permits is a property of the deployment, not of keeping one
-    copy.  Colocated, the sampler shares the trainer's GPUs and must be idle to be
-    overwritten, so at most one batch is in flight against an older policy
-    (``max_staleness <= 1``).  Disaggregated, the sampler generates on its own GPUs
-    while the trainer advances, and a sparse sync cadence lets queued samples age
-    several versions (``max_staleness > 1``) -- verl's fully-async regime.
-    ``dev.config.validate._check_async_mode`` bounds ``max_staleness`` by the
-    deployment in use.
+    ``sync_fn`` is the in-place weight-sync callback (in dev, the rollout engine's ``sync_weights`` via
+    ``CheckpointEngineManager``); ``abort_fn`` is called BEFORE ``sync_fn`` so no generation decodes across
+    the overwrite: each in-flight generation is interrupted, returns its partial tokens with a resume
+    point, and is re-submitted on the new weights, keeping every segment's logprobs on one consistent
+    policy version. ``abort_fn`` may be None only when the sampler is provably idle at the sync point
+    (strictly synchronous regime); a streaming regime with a lookahead window needs it, which
+    ``dev.config.validate._check_streaming_publication`` enforces. Whether staleness can exceed 1 is a
+    property of the deployment (colocated forces idle, disaggregated allows verl-style fully-async).
     """
 
     def __init__(self, sync_fn: Callable[[], None], abort_fn: Callable[[], Any] | None = None):

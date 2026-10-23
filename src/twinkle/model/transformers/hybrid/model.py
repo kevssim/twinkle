@@ -81,11 +81,6 @@ class SpectralHybridTransformersModel(MultiLoraTransformersModel):
         finally:
             self._restore_preallocated_lora_grad()
 
-    def _restore_preallocated_lora_grad(self) -> None:
-        for name, parameter in self.multi_adapter.module.named_parameters():
-            if 'lora_' in name and not parameter.requires_grad:
-                parameter.requires_grad_(True)
-
     @remote_function()
     def add_adapter_to_model(self, adapter_name: str, config_or_dir: Union[PeftConfig, str], **kwargs):
         adapter_mode = kwargs.pop('adapter_mode', 'lora')

@@ -141,8 +141,23 @@ class MultiLoraTransformersModel(TransformersModel, PreTrainedModel):
     @contextmanager
     def _adapter_context(self, adapter_name: str, disable_lora: bool = False):
         """Activate one LoRA tenant for a model operation."""
-        with self.multi_adapter.adapter(adapter_name, disable_lora=disable_lora) as slot_name:
-            yield slot_name
+        try:
+            with self.multi_adapter.adapter(adapter_name, disable_lora=disable_lora) as slot_name:
+                self._restore_preallocated_lora_grad()
+                yield slot_name
+        finally:
+            # Leaving a disable_lora context re-enables adapter layers, which flips the flags again.
+            self._restore_preallocated_lora_grad()
+
+    def _restore_preallocated_lora_grad(self) -> None:
+        # PEFT's set_adapter / disable_adapter_layers mark every inactive slot requires_grad=False,
+        # but FSDP2 captures each parameter's trainable state at lazy init. If that state drifts,
+        # gradient reduction for a slot other than the one active at wrap time breaks (e.g. fp32
+        # grads assigned to bf16 params on NPU). Inactive slots still get no gradient because the
+        # patched LoRA forward only runs active adapters.
+        for name, parameter in self.multi_adapter.module.named_parameters():
+            if 'lora_' in name and not parameter.requires_grad:
+                parameter.requires_grad_(True)
 
     @remote_function(dispatch='slice_dp', collect=collect_tensor_dict)
     def forward(self, *, inputs: Union[InputFeature, List[InputFeature], Trajectory, List[Trajectory]], **kwargs):

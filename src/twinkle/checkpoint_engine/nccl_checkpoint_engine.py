@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Any, AsyncGenerator, Generator
 
 from twinkle import get_logger
+from twinkle.comm import Communicator
 from twinkle.utils.network import find_free_port
 from .base import CheckpointEngine, TensorMeta
 from .zmq_auth import generate_auth_key, recv_auth_pyobj, send_auth_pyobj
@@ -28,14 +29,18 @@ class MasterMetadata:
     auth_key: str = ''  # HMAC shared secret for authenticating ZMQ control messages
 
 
-def _pg_broadcast(pg: dist.ProcessGroup, tensor: torch.Tensor, src: int = 0):
-    """Broadcast *tensor* using a raw (unregistered) ProcessGroupNCCL.
+def _pg_broadcast(pg, tensor: torch.Tensor, src: int = 0):
+    """Broadcast *tensor* from *src* over an unregistered group.
 
-    ``dist.broadcast()`` requires a *registered* process group.  Since we
-    create the PG directly via ``ProcessGroupNCCL(store, rank, world_size)``
-    (which is NOT registered with the default ``_World``), we fall back to
-    the low-level C++ ``pg.broadcast([tensor], opts)`` API.
+    Accepts either a raw (unregistered) ``ProcessGroup`` -- for which we must use the
+    low-level ``pg.broadcast([tensor], opts)`` API, since ``dist.broadcast()`` requires
+    a group registered with the default ``_World`` -- or a
+    :class:`twinkle.comm.Communicator`, which the XPU engine installs in place of a raw
+    ``ProcessGroupNCCL`` (a directly built one deadlocks when two ranks share a device).
     """
+    if isinstance(pg, Communicator):
+        pg.broadcast(tensor, src)
+        return
     opts = dist.BroadcastOptions()
     opts.rootRank = src
     work = pg.broadcast([tensor], opts)

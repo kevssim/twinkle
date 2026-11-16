@@ -22,8 +22,8 @@ class CheckpointEngineMixin:
     def _select_checkpoint_engine(self, backend: str, channel: str, auth_key: str = '') -> None:
         if not isinstance(channel, str) or not channel:
             raise ValueError(f'checkpoint channel must be a non-empty string, got {channel!r}.')
-        if backend not in {'ipc', 'nccl', 'hccl'}:
-            raise ValueError(f'checkpoint backend must be ipc/nccl/hccl, got {backend!r}.')
+        if backend not in {'ipc', 'nccl', 'hccl', 'xccl'}:
+            raise ValueError(f'checkpoint backend must be ipc/nccl/hccl/xccl, got {backend!r}.')
         self._checkpoint_engine_backend = backend
         self._checkpoint_engine_key = (backend, channel)
         if auth_key:
